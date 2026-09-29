@@ -93,6 +93,8 @@ private:
     void showDiskDestinationChooser(const juce::File& waveSetup);
     void showSaveDiskAsChooser();
     void showDiskError(const juce::String& title, const juce::Result& result);
+    void setWindowScale(float scale);
+    void setKeyboardVisible(bool visible);
 
     WaveEmulationAudioProcessor& ownerProcessor;
     std::unique_ptr<WaveLookAndFeel> lookAndFeel;
@@ -143,6 +145,7 @@ private:
     std::array<float, 3> performanceWheelValues { 0.5f, 0.0f, 0.5f };
     std::array<bool, 13> keyboardNotes{};
     bool computerShiftDown = false;
+    bool keyboardVisible = true;
     bool performanceMode = true;
     int selectedLfo = 0;
     int waveEnvelopePage = 0;

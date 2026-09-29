@@ -57,6 +57,10 @@ public:
     void prepare(double hostSampleRate);
     void reset(double startPhase = 0.0) noexcept;
     void setFrequency(float frequencyHz) noexcept;
+    [[nodiscard]] float frequencyHz() const noexcept
+    {
+        return static_cast<float>(phaseIncrementPerTick * modelClockRate());
+    }
 
     [[nodiscard]] float process(const WavetableBank& bank, int table, float position,
                                 bool smoothPosition = true) noexcept;

@@ -18,6 +18,8 @@ its [legacy Wave page](https://waldorfmusic.com/legacy-wave/).
 
 The editor embeds `media/WaldorfWaveUI_NOLOGO.svg` as its 2338 x 1042 source artwork. JUCE controls are transparent hit regions aligned to the artwork coordinates, and the live framebuffer is rendered only inside the LCD rectangle at `(939, 237, 448, 70)`. Additional panel switch, rotary, and fader regions are derived at runtime from the circles and rounded rectangles already in that SVG. The eight Performance faders use relative mouse dragging, retain their physical positions across Performance changes, and apply the destination/parameter assignments stored in each native factory Performance record only after a fader is moved. A playable 61-note keyboard spans C2 through C7 in the lower black keyboard bed, with pressed-key feedback and drag glissando.
 
+Use **Cmd/Ctrl + =** and **Cmd/Ctrl + -** to zoom the editor in and out, **Cmd/Ctrl + 0** for actual size, and **Cmd/Ctrl + K** to show or hide the lower keyboard and controller area. The same actions are in the System menu. Hiding the lower area shortens the window while keeping the upper panel at the same scale.
+
 ## Installing the macOS release
 
 Builds target macOS Ventura 13.0 or later on Apple Silicon and Intel Macs.
@@ -31,6 +33,17 @@ Quit any older standalone instance, then launch `/Applications/Wave Emulation.ap
 Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
+
+Version 0.1.8 preserves saved Sound parameters, including oscillator octave,
+when switching Performances and layers. It also prevents a display refresh
+from replacing a Performance name during Store, clears inactive destination
+layers when overwriting a Performance, and handles brief Store Cancel clicks.
+Store also keeps mode buttons and their LEDs in sync with the firmware page.
+Instrument Edit faders follow the firmware's current page so a tuning change
+cannot write to Transpose or another page's parameter. The TuneTable slider's
+choices now follow the displayed positions, and HMT changes preserve the pitch
+of held and newly played notes. Window zoom and keyboard visibility shortcuts
+are available in the System menu.
 
 Version 0.1.7 fixes repeated or missed front-panel actions in Disk, Store, and
 Instrument Edit, including name cursors and Load-menu stepping. It also keeps

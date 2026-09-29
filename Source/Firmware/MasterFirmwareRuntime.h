@@ -124,6 +124,7 @@ public:
     [[nodiscard]] std::optional<uint32_t> currentPerformanceRecordOffset() const noexcept;
     [[nodiscard]] std::optional<int> currentPerformanceInstrument() const noexcept;
     [[nodiscard]] std::optional<int> currentInstrumentEditTarget() const noexcept;
+    [[nodiscard]] std::optional<int> currentInstrumentEditPage() const noexcept;
     [[nodiscard]] std::optional<uint32_t> currentSoundRecordOffset() const noexcept;
     [[nodiscard]] std::optional<uint32_t> performanceInstrumentSoundRecordOffset(
         int instrument) const noexcept;

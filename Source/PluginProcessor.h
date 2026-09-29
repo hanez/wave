@@ -323,6 +323,7 @@ private:
     int scheduledInstrumentPageSelection = -1;
     int scheduledInstrumentPageDelayBlocks = 0;
     std::atomic<int> pendingFirmwareSoftButton { -1 };
+    std::atomic<bool> pendingStoreCancel { false };
     std::atomic<bool> cancelFirmwareSoftButtonEvents { false };
     int activeSoftButtonDiagnosticCode = -1;
     bool activeSoftButtonPressSent = false;
@@ -488,7 +489,7 @@ private:
     void runFirmwareTimeline(const juce::MidiBuffer& midi, int sampleCount);
     void sendPendingPerformanceFadersToFirmware();
     void sendPendingInstrumentFadersToFirmware();
-    void synchroniseCurrentPerformanceInstrumentFromFirmware() noexcept;
+    void synchronisePerformanceInstrumentsFromFirmware() noexcept;
     void sendPendingPanelEncodersToFirmware();
     void sendPendingPanelGlideSwitchesToFirmware();
     void sendPendingPanelStepButtonsToFirmware();

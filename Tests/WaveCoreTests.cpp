@@ -451,6 +451,146 @@ void testPerformanceTuningTables()
     engine.render(audio, {}, performance);
     require(std::abs(heldPitch(60) - 67.25f) < 1.0e-5f,
             "Wave SET User table 1 could not be selected directly");
+
+    // HMT retunes a held chord as notes arrive. The oscillator must keep that
+    // pitch after the next voice-board control update, including when changing
+    // back to HMT while the chord is already sounding.
+    wave::dsp::WaldorfEngine hmtEngine;
+    hmtEngine.prepare(48000.0, 32);
+    wave::dsp::WaldorfEngine::PerformanceSnapshot hmtPerformance;
+    auto& hmtLayer = hmtPerformance.layers[0];
+    hmtLayer.enabled = true;
+    hmtLayer.source = 2;
+    hmtLayer.tuningTable = 2;
+    hmtLayer.sound.attackSeconds = 0.001f;
+    hmtLayer.sound.detuneCents = 0.0f;
+
+    const auto playHmtNote = [&](int midiNote) {
+        juce::MidiBuffer event;
+        event.addEvent(juce::MidiMessage::noteOn(1, midiNote, 0.9f), 0);
+        audio.clear();
+        hmtEngine.render(audio, event, hmtPerformance);
+    };
+    const auto oscillatorPitch = [&](int triggerNote) {
+        for (const auto& state : hmtEngine.voiceStates())
+            if (state.active && state.keyDown && state.triggerNote == triggerNote)
+                return state.oscillator1FrequencyHz;
+        throw std::runtime_error("Expected HMT test voice is not active");
+    };
+    const auto frequencyForNote = [](float midiNote) {
+        return 440.0f * std::exp2((midiNote - 69.0f) / 12.0f);
+    };
+    const auto requireOscillatorPitch = [&](int triggerNote, float tunedNote,
+                                            const char* message) {
+        const auto expected = frequencyForNote(tunedNote);
+        require(std::abs(oscillatorPitch(triggerNote) - expected) < expected * 1.0e-4f,
+                message);
+    };
+
+    playHmtNote(60);
+    playHmtNote(64);
+    audio.clear();
+    hmtEngine.render(audio, {}, hmtPerformance);
+    requireOscillatorPitch(64, 63.86314f,
+                           "New HMT chord note reverted to equal temperament");
+
+    hmtLayer.tuningTable = 1;
+    audio.clear();
+    hmtEngine.render(audio, {}, hmtPerformance);
+    requireOscillatorPitch(64, 64.0f,
+                           "Changing from HMT did not retune a held note");
+
+    hmtLayer.tuningTable = 2;
+    audio.clear();
+    hmtEngine.render(audio, {}, hmtPerformance);
+    requireOscillatorPitch(64, 63.86314f,
+                           "Switching to HMT retuned only until the next control update");
+
+    // A held note started in Linear- can be dozens of semitones below its HMT
+    // pitch. Retuning the voice must also retune its layer glide history, or
+    // every later note with Glide enabled starts down at the old pitch.
+    wave::dsp::WaldorfEngine glideEngine;
+    glideEngine.prepare(48000.0, 32);
+    auto glidePerformance = hmtPerformance;
+    auto& glideLayer = glidePerformance.layers[0];
+    glideLayer.tuningTable = 3;
+    glideLayer.sound.glideEnabled = true;
+    glideLayer.sound.glideRateValue = 50.0f;
+    juce::MidiBuffer highNote;
+    highNote.addEvent(juce::MidiMessage::noteOn(1, 84, 0.9f), 0);
+    glideEngine.render(audio, highNote, glidePerformance);
+    glideLayer.tuningTable = 2;
+    glideEngine.render(audio, {}, glidePerformance);
+    juce::MidiBuffer nextNote;
+    nextNote.addEvent(juce::MidiMessage::noteOn(1, 86, 0.9f), 0);
+    glideEngine.render(audio, nextNote, glidePerformance);
+    auto nextPitch = -1.0f;
+    for (const auto& state : glideEngine.voiceStates())
+        if (state.active && state.keyDown && state.triggerNote == 86)
+            nextPitch = state.glidePitch;
+    require(nextPitch > 83.0f && nextPitch < 86.1f,
+            "Changing to HMT left later Glide notes at the previous low tuning");
+
+    // With Glide disabled, changing tuning under a held key must not leave
+    // subsequent notes at the pitch of the old table.
+    wave::dsp::WaldorfEngine directEngine;
+    directEngine.prepare(48000.0, 32);
+    auto directPerformance = hmtPerformance;
+    auto& directLayer = directPerformance.layers[0];
+    directLayer.sound.glideEnabled = false;
+    directLayer.sound.oscillatorOctaves[0] = -1;
+    for (const auto table : { 3, 2, 1, 2, 3, 1 })
+    {
+        directLayer.tuningTable = table;
+        juce::MidiBuffer heldNote;
+        heldNote.addEvent(juce::MidiMessage::noteOn(1, 72, 0.9f), 0);
+        directEngine.render(audio, heldNote, directPerformance);
+        const auto nextTable = table == 3 ? 2 : 3;
+        directLayer.tuningTable = nextTable;
+        directEngine.render(audio, {}, directPerformance);
+        juce::MidiBuffer releaseAndPlay;
+        releaseAndPlay.addEvent(juce::MidiMessage::noteOff(1, 72), 0);
+        releaseAndPlay.addEvent(juce::MidiMessage::noteOn(1, 60, 0.9f), 1);
+        directEngine.render(audio, releaseAndPlay, directPerformance);
+        auto freshFrequency = 0.0f;
+        for (const auto& state : directEngine.voiceStates())
+            if (state.active && state.keyDown && state.triggerNote == 60)
+                freshFrequency = state.oscillator1FrequencyHz;
+        const auto expectedFrequency
+            = 0.5f * frequencyForNote(nextTable == 3 ? 68.0f : 60.0f);
+        require(std::abs(freshFrequency - expectedFrequency)
+                    < expectedFrequency * 1.0e-4f,
+                "Changing a tuning table under a held key left a new note subsonic without Glide");
+        juce::MidiBuffer release;
+        release.addEvent(juce::MidiMessage::noteOff(1, 60), 0);
+        directEngine.render(audio, release, directPerformance);
+    }
+
+    wave::dsp::WaldorfEngine chordEngine;
+    chordEngine.prepare(48000.0, 32);
+    auto chordPerformance = directPerformance;
+    auto& chordLayer = chordPerformance.layers[0];
+    chordLayer.tuningTable = 1;
+    chordLayer.sound.oscillatorSemitones[0] = 3.0f;
+    juce::MidiBuffer firstKey;
+    firstKey.addEvent(juce::MidiMessage::noteOn(1, 72, 0.9f), 0);
+    chordEngine.render(audio, firstKey, chordPerformance);
+    chordLayer.tuningTable = 2;
+    chordEngine.render(audio, {}, chordPerformance);
+    juce::MidiBuffer secondKey;
+    secondKey.addEvent(juce::MidiMessage::noteOn(1, 60, 0.9f), 0);
+    chordEngine.render(audio, secondKey, chordPerformance);
+    chordEngine.render(audio, {}, chordPerformance);
+    for (const auto& state : chordEngine.voiceStates())
+    {
+        if (!state.active || !state.keyDown)
+            continue;
+        const auto expected
+            = frequencyForNote(static_cast<float>(state.triggerNote) - 9.0f);
+        require(std::abs(state.oscillator1FrequencyHz - expected)
+                    < expected * 1.0e-4f,
+                "Second key pressed while holding HMT chord has incorrect pitch");
+    }
 }
 
 void testFreeRunningEngineLfo()

@@ -11,6 +11,9 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+#if JUCE_MAC
+#include <CoreFoundation/CoreFoundation.h>
+#endif
 
 namespace
 {
@@ -892,6 +895,214 @@ void testStoreRequesterStepButtonsChooseDestination()
                 && processor->getPanelLed(51)
                 && !processor->getPanelLed(87),
             "Store LED remained lit after leaving the Store page");
+}
+
+void testPerformanceStoreNameAcrossBanks(int commitSamples, int commitOffset)
+{
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int count) {
+        for (int block = 0; block < count; ++block) {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+        }
+    };
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        require(processor->setPanelButton(button, true), "Performance Store rejected an input");
+        process(8);
+        processor->setPanelButton(button, false);
+        process(64);
+    };
+    process(64);
+    processor->setCurrentProgram(255);
+    process(128);
+    const auto& runtime = processor->getMasterFirmwareRuntime();
+    const auto nameAt = [&](uint32_t offset, bool local) {
+        std::string result;
+        for (uint32_t index = 0; index < 16; ++index)
+            result += static_cast<char>(local ? runtime.localByte(offset + index)
+                                             : runtime.sharedProgramByte(offset + index));
+        return result;
+    };
+    click(57); // Store directly from Performance, retaining its drawing callback.
+    click(25); // Perf.
+    require(processor->isFirmwareRequesterActive(), "Performance Store name dialog did not open");
+    const std::string expected = "SAW2 Pad        ";
+    for (size_t character = 0; character < expected.size(); ++character) {
+        for (int attempt = 0; attempt < 4; ++attempt) {
+            const auto value = runtime.localByte(0x56000u + static_cast<uint32_t>(character));
+            if (value == static_cast<uint8_t>(expected[character]))
+                break;
+            processor->turnPanelEncoder(8, static_cast<int>(expected[character]) - value);
+            process(48);
+        }
+        require(runtime.localByte(0x56000u + static_cast<uint32_t>(character))
+                    == static_cast<uint8_t>(expected[character]), "Performance name entry did not accept a character");
+        if (character + 1 < expected.size())
+            click(23);
+    }
+    const auto minus = wave::panel::matrixIndexForDiagnosticCode(69);
+    for (int index = 0; index < 255; ++index)
+        processor->setPanelButton(minus, true);
+    process(300);
+    processor->setPanelButton(minus, false);
+    process(64);
+    require(nameAt(0x56000u, true) == expected, "Changing Store destination replaced the entered name");
+    audio.setSize(2, commitSamples);
+    process(commitOffset);
+    click(70);
+    process(2048 / commitSamples);
+    require(nameAt(0x28000u + 32u, false) == expected,
+            "Storing B128 to A001 replaced the Performance name");
+    require(runtime.currentPerformanceId() == 0,
+            "Performance Store did not select its A001 destination");
+    require(runtime.currentPerformanceRecordOffset().has_value(), "Stored Performance record is unavailable");
+    require(nameAt(*runtime.currentPerformanceRecordOffset() + 32u, false) == expected,
+            "The current Performance name differs from the stored name");
+}
+
+void testStoreModeButtonExitAfterSave()
+{
+    juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int count) {
+        for (int block = 0; block < count; ++block) {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+#if JUCE_MAC
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0001, true);
+#endif
+        }
+    };
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        require(processor->setPanelButton(button, true),
+                "Store mode exit rejected a required panel button");
+        process(8);
+        processor->setPanelButton(button, false);
+        process(96);
+    };
+    process(96);
+    click(57); // Store.
+    click(25); // Performance.
+    require(processor->isFirmwareRequesterActive(),
+            "Performance Store requester did not open");
+    const auto requesterScreen
+        = processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
+    const auto instrumentButton
+        = wave::panel::matrixIndexForDiagnosticCode(36);
+    require(!processor->setPanelButton(instrumentButton, true),
+            "Instrument Edit displaced the open Store requester");
+    processor->setPanelButton(instrumentButton, false);
+    process(96);
+    require(processor->isFirmwareRequesterActive()
+                && processor->getPanelLed(87),
+            "Blocked Instrument Edit altered the Store requester or its lamp");
+
+    click(70); // Save and close the requester.
+    process(512);
+    require(!processor->isFirmwareRequesterActive()
+                && processor->getPanelSelectedMode() == 57
+                && processor->getPanelLed(87),
+            "Store did not return to its page after saving");
+    click(36); // The firmware accepts a mode change after the save.
+    process(512);
+    require(processor->getPanelSelectedMode() == 36
+                && processor->getPanelLed(22)
+                && !processor->getPanelLed(87)
+                && !processor->isFirmwareRequesterActive()
+                && processor->getMasterFirmwareRuntime().lcdVideoSnapshot()
+                       != requesterScreen,
+            "Instrument Edit after saving retained Store's light or requester");
+}
+
+void testPerformanceOverwriteClearsInactiveSlots(int blockSize)
+{
+    juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int count) {
+        for (int block = 0; block < count; ++block) {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+#if JUCE_MAC
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0001, true);
+#endif
+        }
+    };
+    const auto click = [&](int code) {
+        processor->setPanelButton(code, true);
+        process(8);
+        processor->setPanelButton(code, false);
+        process(96);
+    };
+    auto& runtime = const_cast<wave::firmware::MasterFirmwareRuntime&>(processor->getMasterFirmwareRuntime());
+    process(96);
+    std::vector<uint8_t> bank(256u * 512u);
+    for (size_t byte = 0; byte < bank.size(); ++byte)
+        bank[byte] = runtime.sharedProgramByte(0x28000u + static_cast<uint32_t>(byte));
+    for (const auto program : { 2u, 3u }) {
+        std::copy_n(bank.begin(), 512, bank.begin() + program * 512u);
+        bank[program * 512u + 24u] = 0;
+        for (size_t layer = 0; layer < 8; ++layer) {
+            const auto slot = program * 512u + 64u + layer * 32u;
+            bank[slot + 3u] = layer < (program == 2u ? 3u : 1u) ? 3u : 0u;
+            bank[slot + 13u] = 0;
+        }
+    }
+    require(runtime.installPerformanceBank(bank), "Could not install overwrite fixture");
+    processor->setCurrentProgram(3);
+    process(128);
+    click(57);
+    click(25);
+    require(processor->isFirmwareRequesterActive(), "Performance Store requester did not open");
+    click(69);
+    require(runtime.localByte(0x4b1b3u) == 2, "Store destination did not reach A003");
+    audio.setSize(2, blockSize);
+    click(70);
+    process(512);
+    for (uint32_t layer = 0; layer < 8; ++layer) {
+        const auto actual = runtime.sharedProgramByte(0x28400u + 64u + layer * 32u + 3u);
+        if (actual != (layer == 0 ? 3u : 0u))
+            std::cerr << "Overwrite block " << blockSize << " layer " << layer << " source " << int(actual) << '\n';
+        require(actual == (layer == 0 ? 3u : 0u), "Performance Store retained destination layer settings");
+    }
+    for (int layer = 0; layer < 8; ++layer)
+        require(processor->isPerformanceInstrumentActive(layer) == (layer == 0),
+                "Performance Store left destination layers active in the engine");
+    processor->setPanelButton(71, true);
+    processor->setPanelButton(71, false); // Mouse click between audio callbacks.
+    process(512);
+    require(!processor->isFirmwareRequesterActive(), "Cancel did not close Performance Store requester");
+    require(processor->getPanelSelectedMode() == 39
+                && processor->getPanelLed(51)
+                && !processor->getPanelLed(87),
+            "Store Cancel did not restore the Performance mode lamp");
+    audio.setSize(2, 512);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        click(57);
+        click(25);
+        require(processor->isFirmwareRequesterActive(), "Repeated Performance Store did not open");
+        processor->setPanelButton(71, true);
+        processor->setPanelButton(71, false);
+        process(128);
+        require(!processor->isFirmwareRequesterActive(), "A brief Cancel left repeated Performance Store open");
+    }
+    processor->setCurrentProgram(0);
+    process(128);
+    processor->setCurrentProgram(2);
+    process(128);
+    for (int layer = 0; layer < 8; ++layer)
+        require(processor->isPerformanceInstrumentActive(layer) == (layer == 0),
+                "Recalling the overwritten Performance reactivated empty slots");
 }
 
 void testRepeatedSoundStoreCursor()
@@ -2167,10 +2378,17 @@ void requireInstrumentSelectionDoesNotChangeSound(int program,
             for (const auto instrument : active)
             {
                 const auto index = static_cast<size_t>(instrument);
-                require(std::memcmp(
-                            &selectedSnapshot.layers[index],
-                            &baselineSnapshot.layers[index],
-                            sizeof(wave::dsp::WaldorfEngine::PerformanceLayer)) == 0,
+                const auto& originalLayer = baselineSnapshot.layers[index];
+                const auto& selectedLayer = selectedSnapshot.layers[index];
+                // Compare values, not struct padding: Snapshot contains bools
+                // whose adjacent padding can differ after an equivalent decode.
+                require(selectedLayer.sound.panAmount == originalLayer.sound.panAmount
+                            && selectedLayer.sound.panModulationMode == originalLayer.sound.panModulationMode
+                            && selectedLayer.sound.wavetableIndex == originalLayer.sound.wavetableIndex
+                            && selectedLayer.sound.oscillatorOctaves == originalLayer.sound.oscillatorOctaves
+                            && selectedLayer.gain == originalLayer.gain
+                            && selectedLayer.transposeSemitones == originalLayer.transposeSemitones
+                            && selectedLayer.detuneCents == originalLayer.detuneCents,
                         "Instrument selection mutated a stored Performance layer");
                 const auto after = processor->probeCurrentLayerVoice(
                     7, instrument, 60, 0.8f, 24000, 42);
@@ -3302,6 +3520,11 @@ void testOscillatorOctaveButtonsDriveFirmwareSoundRecord()
             processBlocks(48);
             const auto after = processor->getFirmwareOscillatorOctave(
                 static_cast<int>(oscillator));
+            const auto savedOctave = static_cast<int>(
+                processor->getMasterFirmwareRuntime().currentSoundRecordByte(
+                    oscillator == 0 ? 0u : 12u)) / 16 - 2;
+            require(savedOctave == after,
+                    "Oscillator octave changed audibly but was not written into the Sound for Store");
             require(after != before,
                     "An oscillator Octave switch did not change the genuine firmware sound record");
 
@@ -3320,6 +3543,114 @@ void testOscillatorOctaveButtonsDriveFirmwareSoundRecord()
             }
             require(illuminated == 1,
                     "An oscillator Octave bank illuminated more than one position");
+        }
+    }
+
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        require(processor->setPanelButton(button, true), "Stored octave test rejected a panel input");
+        processBlocks(8);
+        processor->setPanelButton(button, false);
+        processBlocks(64);
+    };
+    click(0);
+    const auto expectedOctave = processor->getFirmwareOscillatorOctave(0);
+    click(57); // Store.
+    click(79); // Sound.
+    click(22); // Instrument 1.
+    require(processor->isFirmwareRequesterActive(), "Sound Store did not open for octave recall");
+    click(70);
+    click(71);
+    // A host program change first loads the original SET's parameter mirror.
+    // Returning must recover the octave just stored in the native Sound bank.
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        processor->setCurrentProgram(1);
+        processBlocks(128);
+        processor->setCurrentProgram(0);
+        processBlocks(128);
+        const auto recalledOctave = static_cast<int>(
+            processor->getMasterFirmwareRuntime().currentSoundRecordByte(0)) / 16 - 2;
+        require(recalledOctave == expectedOctave,
+                "Changing Performance modified the octave in the stored Sound");
+        require(processor->getFirmwareOscillatorOctave(0) == expectedOctave,
+                "Changing Performance and returning lost the stored oscillator octave");
+    }
+}
+
+void testStoredSoundParametersSurvivePerformanceRecall()
+{
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int count) {
+        for (int block = 0; block < count; ++block) {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+        }
+    };
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        processor->setPanelButton(button, true);
+        process(8);
+        processor->setPanelButton(button, false);
+        process(64);
+    };
+    process(96);
+    click(22);
+    auto& runtime = const_cast<wave::firmware::MasterFirmwareRuntime&>(
+        processor->getMasterFirmwareRuntime());
+    // Distinct edits to detune, wave position, filter cutoff and wave envelope.
+    constexpr std::array<std::pair<uint32_t, uint8_t>, 4> edits {{
+        { 2u, 73u }, { 26u, 31u }, { 79u, 19u }, { 135u, 57u }
+    }};
+    for (const auto [offset, value] : edits)
+        require(runtime.writeCurrentSoundRecordByte(offset, value), "Could not edit Sound fixture");
+    process(8);
+    click(57);
+    click(79);
+    click(22);
+    require(processor->isFirmwareRequesterActive(), "Sound Store requester is missing");
+    click(70);
+    click(71);
+    for (const auto [offset, value] : edits)
+        require(runtime.sharedProgramByte(0x18100u + offset) == value,
+                "Sound Store did not persist the edited parameter");
+    // Model two saved Performances referring to the same Sound, independently
+    // of Store's user-interface flow. Preserve the rest of the native bank.
+    std::vector<uint8_t> bank(256u * 512u);
+    for (size_t byte = 0; byte < bank.size(); ++byte)
+        bank[byte] = runtime.sharedProgramByte(0x28000u + static_cast<uint32_t>(byte));
+    std::copy_n(bank.begin(), 512, bank.begin() + 512);
+    require(runtime.installPerformanceBank(bank), "Could not create shared-Sound Performance fixture");
+    processor->setCurrentProgram(1);
+    process(128);
+    for (const auto [offset, value] : edits)
+        require(runtime.currentSoundRecordByte(offset) == value,
+                "A second Performance recalled outdated saved Sound parameters");
+    require(processor->getCurrentPerformanceSnapshot().layers[0].sound.oscillatorDetuneCents[0] == 9.0f,
+            "A second Performance played the imported detune instead of the saved value");
+    processor->setCurrentProgram(0);
+    process(128);
+    // A001 has two Instruments assigned to a002. Both must start from the
+    // newly stored Sound on recall, retaining independent edits thereafter.
+    const auto recalled = processor->getCurrentPerformanceSnapshot();
+    for (const auto instrument : { 0u, 1u }) {
+        const auto& sound = recalled.layers[instrument].sound;
+        require(sound.oscillatorDetuneCents[0] == 9.0f
+                    && sound.wavePosition == 31.0f
+                    && sound.waveEnvelopeTimes[0] == 57.0f,
+                "An unselected layer's DSP retained the original SET parameters after recall");
+    }
+    for (const auto code : { 22, 25, 22, 25 }) {
+        click(code);
+        for (const auto [offset, value] : edits) {
+            if (runtime.currentSoundRecordByte(offset) != value)
+                std::cerr << "Recalled parameter " << offset << " expected " << int(value)
+                          << " got " << int(runtime.currentSoundRecordByte(offset)) << '\n';
+            require(runtime.currentSoundRecordByte(offset) == value,
+                    "Instrument selection restored an outdated Sound parameter after Performance recall");
         }
     }
 }
@@ -4806,8 +5137,8 @@ void testExclusiveModesRejectOtherModeLeds()
     constexpr std::array modeLeds {
         64, 69, 21, 74, 26, 10, 22, 51, 52, 87
     };
-    constexpr std::array exclusiveModes { 34, 32, 58, 57 };
-    constexpr std::array exclusiveLeds { 74, 26, 52, 87 };
+    constexpr std::array exclusiveModes { 34, 32, 58 };
+    constexpr std::array exclusiveLeds { 74, 26, 52 };
     for (size_t exclusive = 0; exclusive < exclusiveModes.size(); ++exclusive)
     {
         require(click(exclusiveModes[exclusive]),
@@ -4841,6 +5172,39 @@ int main(int argc, char** argv)
 {
     try
     {
+        if (argc > 1 && std::string_view(argv[1]) == "--performance-overwrite")
+        {
+            testPerformanceOverwriteClearsInactiveSlots(16);
+            testPerformanceOverwriteClearsInactiveSlots(512);
+            std::cout << "Performance overwrite regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--store-mode-exit")
+        {
+            testStoreModeButtonExitAfterSave();
+            std::cout << "Store mode exit regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--stored-octave")
+        {
+            testStoredSoundParametersSurvivePerformanceRecall();
+            testSelectedInstrumentSoundRecordOverridesOldPanelSnapshot();
+            testOutgoingInstrumentIsSavedFromFirmwareNotPanelMirror();
+            testFactoryStereoInstrumentSelectionDoesNotChangeSound();
+            testProgramRecallRejectsPreviousHostPanelEcho();
+            testOscillatorOctaveButtonsDriveFirmwareSoundRecord();
+            testInstrumentButtonsDoNotRewriteLayerOctaves();
+            testA001DuplicateSoundAssignmentsHavePrivateInstrumentEdits();
+            std::cout << "Stored Sound parameter regressions passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--performance-store-name")
+        {
+            for (const auto samples : { 16, 512 })
+                testPerformanceStoreNameAcrossBanks(samples, 0);
+            std::cout << "Performance Store name regression passed\n";
+            return 0;
+        }
         if (argc > 1 && std::string_view(argv[1]) == "--disk-step")
         {
             testDiskLoadStepDoesNotRepeat();
@@ -4866,6 +5230,12 @@ int main(int argc, char** argv)
             testPerformanceMuteAndSolo();
             testSelectedInstrumentSoftkeyFlashesOrangeOff();
             std::cout << "Mode selection regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--exclusive-modes")
+        {
+            testExclusiveModesRejectOtherModeLeds();
+            std::cout << "Exclusive mode regression passed\n";
             return 0;
         }
         if (argc > 1 && std::string_view(argv[1]) == "--disk-total-recall")
@@ -4902,6 +5272,11 @@ int main(int argc, char** argv)
         testFirmwarePerformanceStepButtonsRefreshLcd();
         testStoreButtonReachesFirmwareMenu();
         testStoreRequesterStepButtonsChooseDestination();
+        testPerformanceStoreNameAcrossBanks(16, 0);
+        testPerformanceStoreNameAcrossBanks(512, 0);
+        testPerformanceOverwriteClearsInactiveSlots(16);
+        testPerformanceOverwriteClearsInactiveSlots(512);
+        testStoreModeButtonExitAfterSave();
         testRepeatedSoundStoreCursor();
         testStoreCancelRestoresNumericPerformancePreview();
         testKeyboardControllerShiftReachesFirmware();
@@ -4921,6 +5296,7 @@ int main(int argc, char** argv)
         testSelectedInstrumentSoundRecordOverridesOldPanelSnapshot();
         testOutgoingInstrumentIsSavedFromFirmwareNotPanelMirror();
         testFactoryStereoInstrumentSelectionDoesNotChangeSound();
+        testStoredSoundParametersSurvivePerformanceRecall();
         testA001DuplicateSoundAssignmentsHavePrivateInstrumentEdits();
         testInstrumentButtonsDoNotRewriteLayerOctaves();
         testInstrumentEditLayerSelection();

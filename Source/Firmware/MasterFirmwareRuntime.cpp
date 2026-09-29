@@ -25,6 +25,27 @@ constexpr uint32_t osFileClose = 0x02d234;
 constexpr uint32_t osFileRead = 0x02d23a;
 constexpr uint16_t initSoundHandle = 0x7001;
 constexpr uint16_t initPerformanceHandle = 0x7002;
+
+class ScopedDisplayTextBuffer
+{
+public:
+    explicit ScopedDisplayTextBuffer(SharedFirmwareMemory& memory) noexcept
+        : text(memory.mainRam.data() + 0x56000u)
+    {
+        std::copy_n(text, saved.size(), saved.begin());
+    }
+
+    ~ScopedDisplayTextBuffer()
+    {
+        std::copy(saved.begin(), saved.end(), text);
+    }
+
+private:
+    // OS 1.700 shares this formatting workspace with Store's name editor.
+    // The panel dispatch table begins immediately after it at $56070.
+    uint8_t* text;
+    std::array<uint8_t, 0x70> saved{};
+};
 } // namespace
 
 void MasterFirmwareRuntime::Acia6850::reset() noexcept
@@ -302,6 +323,10 @@ bool MasterFirmwareRuntime::redrawCurrentScreenWithFirmware()
     // Its temporary stack occupies the Wave's reserved upper stack area and is
     // restored afterwards, leaving the continuously running OS CPU untouched.
     // All display writes and all drawing decisions still come from w2sys.bin.
+    // The main CPU may be suspended between selecting a Store destination
+    // and copying its edited name. Drawing fader labels uses the same text
+    // buffer, so preserve it as well as the stack during this extra redraw.
+    const ScopedDisplayTextBuffer preserveText(*sharedMemory);
     std::array<uint8_t, localRamSize - temporaryStackBottom> savedStack{};
     std::copy(ram.begin() + temporaryStackBottom, ram.end(), savedStack.begin());
     ram[temporaryStackPointer] = static_cast<uint8_t>(returnSentinel >> 24u);
@@ -497,6 +522,7 @@ bool MasterFirmwareRuntime::redrawPerformanceFaderWithFirmware(int faderIndex)
     // $18D6C is the handler that OS 1.700 installs for each of the eight
     // Performance faders. Invoke that genuine routine with D0 equal to the
     // fader index; it chooses and rasterises the displayed value itself.
+    const ScopedDisplayTextBuffer preserveText(*sharedMemory);
     std::array<uint8_t, localRamSize - temporaryStackBottom> savedStack{};
     std::copy(ram.begin() + temporaryStackBottom, ram.end(), savedStack.begin());
     ram[temporaryStackPointer] = static_cast<uint8_t>(returnSentinel >> 24u);
@@ -913,6 +939,23 @@ std::optional<int> MasterFirmwareRuntime::currentInstrumentEditTarget() const no
         return currentPerformanceInstrument();
     const auto target = static_cast<int>(sharedMemory->mainRam[0x56eeau]);
     return target < 8 ? std::optional<int>(target) : std::nullopt;
+}
+
+std::optional<int> MasterFirmwareRuntime::currentInstrumentEditPage() const noexcept
+{
+    if (!loaded || sharedMemory == nullptr)
+        return std::nullopt;
+    const auto& ram = sharedMemory->mainRam;
+    const auto callback = (static_cast<uint32_t>(ram[0x56bb0u]) << 24u)
+                          | (static_cast<uint32_t>(ram[0x56bb1u]) << 16u)
+                          | (static_cast<uint32_t>(ram[0x56bb2u]) << 8u)
+                          | ram[0x56bb3u];
+    // OS 1.700's Instrument renderer $13F78 uses this persistent page index.
+    // Re-entering Instrument Edit preserves it; the mode key does not reset
+    // it. Group/External Edit have different fader destinations.
+    if (callback != 0x13f78u || ram[0x56ee8u] != 0x49u || ram[0x56ed8u] != 0u)
+        return std::nullopt;
+    return static_cast<int>(ram[0x56ee9u] & 3u);
 }
 
 std::optional<uint32_t> MasterFirmwareRuntime::currentSoundRecordOffset() const noexcept
@@ -1602,6 +1645,18 @@ bool MasterFirmwareRuntime::releasePanelEventLatch(int buttonId) noexcept
 {
     if (sharedMemory == nullptr || buttonId < 0 || buttonId >= 87)
         return false;
+
+    // OK/CANCEL share a chord latch and execute on release ($28416-$28474).
+    // A missed scanner release can leave the panic state at $FF indefinitely.
+    // Once both physical contacts are up, clear only that stale held state
+    // before a new explicit response transaction.
+    if ((buttonId == 70 || buttonId == 71)
+        && !panelButtonRequestedDown(70) && !panelButtonRequestedDown(71)
+        && !panelButtonPressed(70) && !panelButtonPressed(71))
+    {
+        sharedMemory->mainRam[0x58feau] = 0;
+        return true;
+    }
 
     // OS 1.700's event dispatcher maps panel serials through $2850E and keeps
     // the active auto-repeat action at $58FE4. Mirror its release branch at

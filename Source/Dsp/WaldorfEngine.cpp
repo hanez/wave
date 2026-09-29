@@ -1,5 +1,4 @@
 #include "WaldorfEngine.h"
-#include "DspMath.h"
 
 #include <juce_dsp/juce_dsp.h>
 
@@ -309,6 +308,24 @@ float WaldorfEngine::tunedNoteForLayer(const PerformanceLayer& layer,
 void WaldorfEngine::synchroniseActiveVoiceTuning(
     const PerformanceSnapshot& performance) noexcept
 {
+    for (size_t layerIndex = 0; layerIndex < layerGlideTrajectories.size(); ++layerIndex)
+    {
+        auto& trajectory = layerGlideTrajectories[layerIndex];
+        if (!trajectory.initialised || lastPlayedNotesByLayer[layerIndex] < 0)
+            continue;
+        const auto desiredTarget = tunedNoteForLayer(
+            performance.layers[layerIndex], lastPlayedNotesByLayer[layerIndex],
+            trajectory.triggerId, static_cast<int>(layerIndex));
+        const auto tuningDelta = desiredTarget - trajectory.targetNote;
+        if (std::abs(tuningDelta) > 1.0e-6f)
+        {
+            // Portamento is owned by the layer. Retuning only its active
+            // voices leaves the next note gliding from the old temperament.
+            trajectory.currentNote += tuningDelta;
+            trajectory.targetNote = desiredTarget;
+        }
+    }
+
     for (auto& voice : voices)
     {
         if (!voice.active || voice.layerIndex < 0 || voice.layerIndex >= 8)
@@ -635,15 +652,19 @@ void WaldorfEngine::Voice::release(bool allowSustain)
     }
 }
 
+float WaldorfEngine::Voice::baseFrequencyHz() const noexcept
+{
+    const auto pitchNote = glideQuantised
+                               ? std::round(currentGlideNote)
+                               : currentGlideNote;
+    return 440.0f * std::exp2((pitchNote - 69.0f) / 12.0f);
+}
+
 void WaldorfEngine::Voice::updatePitch(const parameters::Snapshot& parameters, float pitchBend)
 {
     if (note < 0)
         return;
-    const auto pitchNote = glideQuantised
-                               ? std::round(currentGlideNote)
-                               : currentGlideNote;
-    const auto baseFrequency
-        = 440.0f * std::exp2((pitchNote - 69.0f) / 12.0f);
+    const auto baseFrequency = baseFrequencyHz();
     const auto bend1 = pitchBend * parameters.oscillatorBendRanges[0] / 2.0f;
     const auto bend2Range = parameters.oscillatorLinkEnabled
                                 ? parameters.oscillatorBendRanges[0]
@@ -876,7 +897,10 @@ Cem3387::StereoSample WaldorfEngine::Voice::process(
                                waveEnvelopeValue, currentLfoValues, modWheel,
                                channelPressure, pitchBend);
         currentPitchModulations = { pitch1 - bend1, pitch2 - bend2 };
-        const auto baseFrequency = math::midiFrequency(note);
+        // The control interrupt must use the same live tuned/gliding pitch as
+        // Voice::updatePitch. Using the original MIDI key here alternated HMT
+        // (or a User tuning) with equal temperament about once per millisecond.
+        const auto baseFrequency = baseFrequencyHz();
         const auto performanceRatio = std::exp2(performanceDetuneCents / 1200.0f);
         auto detune = parameters.oscillatorDetuneCents;
         if (detune[0] == 0.0f && detune[1] == 0.0f && parameters.detuneCents != 0.0f)
@@ -1346,6 +1370,7 @@ void WaldorfEngine::handleMidi(const juce::MidiMessage& message,
             glideTrajectory.targetNote = voice.targetGlideNote;
             glideTrajectory.stepPerSample = voice.glideStepPerSample;
             glideTrajectory.samplesRemaining = voice.glideSamplesRemaining;
+            glideTrajectory.triggerId = triggerId;
             glideTrajectory.initialised = true;
             lastPlayedNotesByLayer[layerIndex] = translatedNote;
             voice.updatePitch(layer.sound, pitchBendSemitones);
@@ -1712,7 +1737,8 @@ WaldorfEngine::voiceStates() const noexcept
             voice.circuit.currentCutoffCv(), voice.circuit.cutoffCalibrationCode(),
             voice.glideQuantised ? std::round(voice.currentGlideNote)
                                   : voice.currentGlideNote,
-            voice.active, voice.keyDown
+            voice.active, voice.keyDown,
+            voice.oscillator1.frequencyHz()
         };
     }
     return states;

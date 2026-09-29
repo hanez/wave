@@ -100,6 +100,7 @@ public:
         float glidePitch = 0.0f;
         bool active = false;
         bool keyDown = false;
+        float oscillator1FrequencyHz = 0.0f;
     };
 
     WaldorfEngine();
@@ -176,6 +177,7 @@ private:
                    float channelPressure, float pitchBend);
         void release(bool allowSustain = true);
         void updatePitch(const parameters::Snapshot& parameters, float pitchBend);
+        [[nodiscard]] float baseFrequencyHz() const noexcept;
         [[nodiscard]] Cem3387::StereoSample process(const WavetableBank& bank,
                                                     const parameters::Snapshot& parameters,
                                                     float modWheel, float channelPressure,
@@ -297,6 +299,7 @@ private:
         float targetNote = 0.0f;
         float stepPerSample = 0.0f;
         int samplesRemaining = 0;
+        uint64_t triggerId = 0;
         bool initialised = false;
     };
 

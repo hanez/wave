@@ -7,7 +7,7 @@
 # are stored in this script.
 #
 # Common overrides:
-#   VERSION=0.1.7
+#   VERSION=0.1.8
 #   BUILD_JOBS=8
 #   SKIP_PLUGIN_BUILD=1
 #   SKIP_WRAP=1
@@ -45,7 +45,7 @@ PACKAGES_DIR="$WORK_DIR/packages"
 RESOURCES_DIR="$WORK_DIR/resources"
 DMG_STAGING_DIR="$WORK_DIR/dmg"
 
-VERSION="${VERSION:-0.1.7}"
+VERSION="${VERSION:-0.1.8}"
 TEAM_ID="${TEAM_ID:-}"
 BUILD_CONFIG="${BUILD_CONFIG:-Release}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-$BUILD_CONFIG}"
