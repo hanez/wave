@@ -993,7 +993,10 @@ bool WaveEmulationAudioProcessor::selectPerformanceInstrument(int instrument)
         return false;
     const auto current = std::atomic_load_explicit(
         &factoryPerformance, std::memory_order_acquire);
-    if (current == nullptr || !current->layers[static_cast<size_t>(instrument)].enabled)
+    if (current == nullptr
+        || (!current->layers[static_cast<size_t>(instrument)].enabled
+            && (panelSelectedMode.load(std::memory_order_acquire) != 36
+                || masterFirmware.currentInstrumentEditTarget() != instrument)))
         return false;
     static constexpr std::array instrumentCodes { 22, 25, 26, 27,
                                                    79, 28, 29, 30 };
@@ -1008,8 +1011,11 @@ bool WaveEmulationAudioProcessor::selectPerformanceInstrument(int instrument)
         if (physicalSelectionInFlight || !masterFirmware.isLoaded())
             return;
         cancelActiveInstrumentSelection.store(true, std::memory_order_release);
+        const auto firmwareTarget = panelSelectedMode.load(std::memory_order_acquire) == 36
+            ? masterFirmware.currentInstrumentEditTarget()
+            : masterFirmware.currentPerformanceInstrument();
         pendingFirmwareInstrument.store(
-            masterFirmware.currentPerformanceInstrument() == instrument
+            firmwareTarget == instrument
                 ? -1 : instrument,
             std::memory_order_release);
     };
@@ -1849,6 +1855,26 @@ void WaveEmulationAudioProcessor::advanceFirmware(int samples)
             && selected < wave::presets::WaveFactorySet::programCount)
         {
             pendingDiskSetActivation.store(false, std::memory_order_release);
+            if (diskSetImportConfirmationPending.exchange(
+                    false, std::memory_order_acq_rel)
+                && diskMenuActive.exchange(false, std::memory_order_acq_rel))
+            {
+                // Disk/Load needs more than one OK: the first opens the file
+                // selector, and the next starts Total Recall. Only the SET
+                // transfer proves the operation has finished.
+                panelSelectedMode.store(39, std::memory_order_release);
+                panelSelectedEdit.store(-1, std::memory_order_release);
+                panelModeDisplayTransitionActive.store(true,
+                                                       std::memory_order_release);
+                panelModeDisplayAwaitingDispatch.store(true,
+                                                       std::memory_order_release);
+                pendingFirmwareModeButton.store(39, std::memory_order_release);
+            }
+            if (const auto set = currentPerformanceSet(); set != nullptr)
+            {
+                masterFirmware.installSoundBank(set->soundBank());
+                masterFirmware.installPerformanceBank(set->performanceBank());
+            }
             pendingEngineProgram.store(selected, std::memory_order_release);
             triggerAsyncUpdate();
             refreshSelectedPerformancePage = true;
@@ -2179,7 +2205,7 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
             const auto instrument = (packedEdit >> 8) & 0x07;
             const auto firmwarePerformance = masterFirmware.currentPerformanceId();
             const auto firmwareInstrument
-                = masterFirmware.currentPerformanceInstrument();
+                = masterFirmware.currentInstrumentEditTarget();
             const auto record = masterFirmware.currentPerformanceRecordOffset();
             if (firmwarePerformance.has_value()
                 && firmwareInstrument.has_value() && record.has_value()
@@ -2266,8 +2292,8 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
         std::memory_order_release);
     // Requesters replace the otherwise inert CANCEL and OK action callbacks
     // in the OS-owned front-panel action table. This is the firmware's modal
-    // state, independent of LCD text or editor state. While either callback
-    // is installed, the physical panel accepts only those two contacts.
+    // state, independent of LCD text or editor state. The requester owns
+    // the panel; name editors also retain their cursor controls.
     const auto installedCancelAction
         = readFirmwareLong(cancelActionCallback);
     const auto installedOkAction = readFirmwareLong(okActionCallback);
@@ -2277,6 +2303,12 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
     // closes. This is the genuine firmware modal level, not an LCD heuristic.
     firmwareRequesterActive.store(
         installedCancelAction != installedOkAction,
+        std::memory_order_release);
+    // OS 1.700 installs these Page callbacks for DOS name entry (including
+    // Format's Diskname). Detect the actual editor, independent of panel mode.
+    firmwareDiskNameEditorActive.store(
+        readFirmwareLong(0x56698u) == 0x00013c1cu
+            && readFirmwareLong(0x566a8u) == 0x00013c34u,
         std::memory_order_release);
     if (cancelInstrumentPanelEvents.exchange(false, std::memory_order_acq_rel))
     {
@@ -2414,7 +2446,9 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
                      0x80u,
                      static_cast<uint8_t>(activeInstrumentPanelDiagnosticCode),
                      1u)
-                 && masterFirmware.currentPerformanceInstrument()
+                 && (panelSelectedMode.load(std::memory_order_acquire) == 36
+                         ? masterFirmware.currentInstrumentEditTarget()
+                         : masterFirmware.currentPerformanceInstrument())
                  == activeInstrumentPanelTarget)
         {
             masterFirmware.releasePanelActionBit(
@@ -2615,9 +2649,9 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
             -1, std::memory_order_acq_rel);
         requestedPageButton >= 0)
     {
-        // OS 1.700 installs a pair of native callbacks for each direction on
-        // the current screen. Invoke that pair once instead of entering the
-        // unusually fast Page-key auto-repeat scheduler.
+        // OS 1.700 installs a pair of native callbacks for each direction,
+        // including name-cursor movement in Store. Invoke the pair once so
+        // a brief host click cannot be lost in the key-repeat scheduler.
         masterFirmware.navigatePageWithFirmware(requestedPageButton == 23);
     }
     if (activeSoftButtonDiagnosticCode >= 0)
@@ -2847,9 +2881,13 @@ void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& mi
                     false, std::memory_order_release);
         }
     }
-    if (panelSelectedMode.load(std::memory_order_acquire) == 36)
+    if (panelSelectedMode.load(std::memory_order_acquire) == 36
+        && instrumentPageReady.load(std::memory_order_acquire))
     {
-        const auto firmwareInstrument = masterFirmware.currentPerformanceInstrument();
+        // The page target still belongs to the preceding visit until the
+        // queued Instrument selection is acknowledged. Reading it during
+        // mode entry changes the engine's layer (and Sound) behind the LCD.
+        const auto firmwareInstrument = masterFirmware.currentInstrumentEditTarget();
         if (firmwareInstrument.has_value()
             && *firmwareInstrument != getSelectedPerformanceInstrument())
             selectPerformanceInstrument(*firmwareInstrument);
@@ -2918,7 +2956,7 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
         &factoryPerformance, std::memory_order_acquire);
     std::shared_ptr<wave::dsp::WaldorfEngine::PerformanceSnapshot> changed;
     const auto firmwarePerformance = masterFirmware.currentPerformanceId();
-    const auto firmwareInstrument = masterFirmware.currentPerformanceInstrument();
+    const auto firmwareInstrument = masterFirmware.currentInstrumentEditTarget();
 
     for (size_t fader = 0; fader < pendingInstrumentFaderEdits.size(); ++fader)
     {
@@ -3049,7 +3087,7 @@ void WaveEmulationAudioProcessor::sendPendingInstrumentFadersToFirmware()
         const auto currentFirmwarePerformance
             = masterFirmware.currentPerformanceId();
         const auto currentFirmwareInstrument
-            = masterFirmware.currentPerformanceInstrument();
+            = masterFirmware.currentInstrumentEditTarget();
         if (currentFirmwarePerformance.has_value()
             && currentFirmwareInstrument.has_value()
             && *currentFirmwarePerformance == instrumentFaderBaselinePerformance
@@ -3081,12 +3119,13 @@ void WaveEmulationAudioProcessor::synchroniseCurrentPerformanceInstrumentFromFir
     const auto current = std::atomic_load_explicit(
         &factoryPerformance, std::memory_order_acquire);
     const auto firmwarePerformance = masterFirmware.currentPerformanceId();
-    const auto firmwareInstrument = masterFirmware.currentPerformanceInstrument();
+    const auto firmwareInstrument = panelSelectedMode.load(std::memory_order_acquire) == 36
+        ? masterFirmware.currentInstrumentEditTarget()
+        : masterFirmware.currentPerformanceInstrument();
     const auto performanceRecord = masterFirmware.currentPerformanceRecordOffset();
     if (current == nullptr || !firmwarePerformance.has_value()
         || !firmwareInstrument.has_value() || !performanceRecord.has_value()
         || *firmwarePerformance != currentProgram.load(std::memory_order_acquire)
-        || *firmwareInstrument != current->editableLayer
         || *firmwareInstrument < 0 || *firmwareInstrument >= 8)
         return;
 
@@ -3139,6 +3178,12 @@ void WaveEmulationAudioProcessor::synchroniseCurrentPerformanceInstrumentFromFir
     auto changed
         = std::make_shared<wave::dsp::WaldorfEngine::PerformanceSnapshot>(*current);
     auto& layer = changed->layers[static_cast<size_t>(*firmwareInstrument)];
+    if (enabled && !existing.enabled)
+    {
+        const auto set = currentPerformanceSet();
+        if (set != nullptr && set->isLoaded())
+            layer.sound = decodeFactorySound(set->sound(byte(1), byte(0)));
+    }
     layer.enabled = enabled;
     layer.source = source;
     layer.midiChannel = midiChannel;
@@ -3308,6 +3353,11 @@ void WaveEmulationAudioProcessor::sendPendingPanelStepButtonsToFirmware()
 
     if (queuedPanelStepButtonEvents == 0)
         return;
+    if (masterFirmware.stepDiskMenuWithFirmware(queuedPanelStepButtonEvents > 0))
+    {
+        queuedPanelStepButtonEvents += queuedPanelStepButtonEvents < 0 ? 1 : -1;
+        return;
+    }
     activePanelStepButtonDiagnosticCode
         = queuedPanelStepButtonEvents < 0 ? 69 : 72;
     activePanelStepButtonWaitBlocks = 0;
@@ -3518,12 +3568,18 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
     const auto storeDestinationStep
         = requesterActive && storeMenuActive.load(std::memory_order_acquire)
           && (diagnosticCode == 69 || diagnosticCode == 72);
+    const auto nameCursorStep
+        = requesterActive
+          && (storeMenuActive.load(std::memory_order_acquire)
+              || firmwareDiskNameEditorActive.load(std::memory_order_acquire))
+          && (diagnosticCode == 21 || diagnosticCode == 23);
     if (pressed && requesterActive && diagnosticCode != 70
-        && diagnosticCode != 71 && !storeDestinationStep)
+        && diagnosticCode != 71 && !storeDestinationStep
+        && !nameCursorStep)
     {
         // A genuine OS requester owns the front panel until CANCEL or OK. The
-        // Store requester additionally accepts the physical -/+ contacts to
-        // choose its destination location. Reject every other contact before
+        // Store requester additionally accepts -/+ for its destination, and
+        // Store/DOS name editors accept Page arrows. Reject other contacts before
         // any local mode/edit/LED state is changed; the UI receives this
         // result as engine feedback and never infers modal state from pixels.
         if (buttonId >= 0 && buttonId < static_cast<int>(panelButtonDown.size()))
@@ -3565,14 +3621,14 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
             = diagnosticCode == 71
               && diskMenuActive.exchange(false, std::memory_order_acq_rel);
         const auto leavingStore
-            = storeMenuActive.load(std::memory_order_acquire);
+            = diagnosticCode == 71
+              && storeMenuActive.load(std::memory_order_acquire);
         const auto selectedMode
             = panelSelectedMode.load(std::memory_order_acquire);
         const auto diskImportAwaitingConfirmation
             = diskSetImportConfirmationPending.load(std::memory_order_acquire);
         const auto diskImportWorkspace
-            = diskWorkspaceActive || selectedMode == 34
-              || selectedMode == 32 || selectedMode == 58;
+            = !diskWorkspaceActive && (selectedMode == 34 || selectedMode == 32);
         const auto completingDiskImport
             = diagnosticCode == 70
               && diskImportAwaitingConfirmation && diskImportWorkspace;
@@ -3589,9 +3645,13 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
         }
         else if (diagnosticCode == 71)
         {
-            if (diskImportAwaitingConfirmation && diskImportWorkspace)
+            if (diskImportAwaitingConfirmation
+                && (diskImportWorkspace || diskWorkspaceActive))
+            {
                 diskSetImportConfirmationPending.store(
                     false, std::memory_order_release);
+                pendingDiskSetActivation.store(false, std::memory_order_release);
+            }
             returnToPerformanceAfterDiskImport.store(
                 false, std::memory_order_release);
         }
@@ -3610,15 +3670,17 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
             // installed until the next operating-page serial action.  Merely
             // changing the engine's LED state makes '?' render every numeric
             // candidate with the current Performance name.  Defer the real
-            // Performance contact until OK/Cancel has physically released.
+            // Performance contact until Cancel has physically released.
             returnToPerformanceAfterStoreExit.store(
                 true, std::memory_order_release);
         }
 
-        // The Store requester is itself the Store page's final operation.
-        // Either response leaves that page, so its page lamp must be retired
-        // with the same firmware-facing OK/CANCEL edge.
-        storeMenuActive.store(false, std::memory_order_release);
+        // Sound Store OK returns to "Select Sound to store". Keep Store's
+        // display-key and name-cursor routing for the next Sound; switching
+        // to Performance here makes the next requester reject its Page keys.
+        // CANCEL explicitly leaves the Store workspace.
+        if (leavingStore)
+            storeMenuActive.store(false, std::memory_order_release);
     }
     const auto schedulePerformanceAfterDiskOkRelease
         = !pressed && diagnosticCode == 70
@@ -3769,9 +3831,11 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
         const auto instrument = std::find(instrumentCodes.begin(),
                                           instrumentCodes.end(),
                                           diagnosticCode);
-        if (performanceMode && hasPerformanceSet && diagnosticCode == 24)
+        const auto instrumentControlsActive
+            = performanceMode || selectedPanelMode == 36;
+        if (instrumentControlsActive && hasPerformanceSet && diagnosticCode == 24)
             togglePerformanceMuteMode();
-        else if (performanceMode && hasPerformanceSet && diagnosticCode == 78)
+        else if (instrumentControlsActive && hasPerformanceSet && diagnosticCode == 78)
             togglePerformanceSoloMode();
         else if (selectedPanelMode == 36 && hasPerformanceSet
                  && instrument != instrumentCodes.end())
@@ -3808,6 +3872,18 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
                         pendingInstrumentPageSelection.store(
                             selectedInstrument, std::memory_order_release);
                     }
+                }
+                else
+                {
+                    // An OFF Instrument must still reach the OS: its Source
+                    // fader is how the Wave activates it. The engine will
+                    // mirror the native record after Source is changed.
+                    cancelInstrumentPageSelection.store(
+                        true, std::memory_order_release);
+                    cancelActiveInstrumentSelection.store(
+                        true, std::memory_order_release);
+                    pendingFirmwareInstrument.store(
+                        selectedInstrument, std::memory_order_release);
                 }
             }
         }
@@ -5078,6 +5154,11 @@ wave::firmware::Bundle::Report WaveEmulationAudioProcessor::startLoadedFirmware(
         if (firmware.getDirectory().isDirectory())
             discoverWavetableRom(firmware.getDirectory());
         seedFilterCalibrationTable();
+        if (const auto set = currentPerformanceSet(); set != nullptr)
+        {
+            masterFirmware.installSoundBank(set->soundBank());
+            masterFirmware.installPerformanceBank(set->performanceBank());
+        }
     }
     return report;
 }

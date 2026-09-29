@@ -6,7 +6,7 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
         "Minimum supported macOS version" FORCE)
 endif()
 
-project(WaveEmulationSample VERSION 0.1.6 LANGUAGES C CXX)
+project(WaveEmulationSample VERSION 0.1.7 LANGUAGES C CXX)
 
 include(FetchContent)
 
@@ -215,12 +215,18 @@ else()
     target_compile_options(WaveCore PRIVATE -Wall -Wextra -Wpedantic -Wconversion -Wshadow)
 endif()
 
+if(APPLE)
+    set(WAVE_PLUGIN_FORMATS AU VST3 AAX Standalone)
+else()
+    set(WAVE_PLUGIN_FORMATS VST3 Standalone)
+endif()
+
 juce_add_plugin(WaveEmulation
     COMPANY_NAME "DJW"
     BUNDLE_ID "com.DJW.WaveEmulation"
     PLUGIN_MANUFACTURER_CODE Djwh
     PLUGIN_CODE WvSm
-    FORMATS AU VST3 AAX Standalone
+    FORMATS ${WAVE_PLUGIN_FORMATS}
     PRODUCT_NAME "Wave Emulation"
     DESCRIPTION "Firmware-aware Waldorf Wave hardware modelling research sample"
     AAX_CATEGORY AAX_ePlugInCategory_SWGenerators

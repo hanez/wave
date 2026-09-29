@@ -317,6 +317,7 @@ private:
     std::atomic<bool> instrumentZoningPageActive { false };
     std::atomic<int> instrumentEditPage { 0 };
     std::atomic<bool> firmwareRequesterActive { false };
+    std::atomic<bool> firmwareDiskNameEditorActive { false };
     std::atomic<bool> instrumentPageReady { false };
     std::atomic<bool> startInstrumentPageSelectionDelay { false };
     int scheduledInstrumentPageSelection = -1;

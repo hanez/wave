@@ -13,3 +13,27 @@ jobs:
         run: cmake --build build --parallel 3
       - name: Test
         run: ctest --test-dir build --output-on-failure
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure without private data
+        run: cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 -DWAVE_EMBED_PRIVATE_ASSETS=OFF -DWAVE_BUILD_TESTS=ON
+      - name: Build
+        run: cmake --build build-windows --config Release --parallel 3
+      - name: Test
+        run: ctest --test-dir build-windows -C Release --output-on-failure
+      - name: Check Windows artifacts
+        shell: pwsh
+        run: |
+          $output = "build-windows/WaveEmulation_artefacts/Release"
+          if (-not (Test-Path "$output/Standalone/Wave Emulation.exe")) { throw "Standalone app is missing" }
+          if (-not (Test-Path "$output/VST3/Wave Emulation.vst3")) { throw "VST3 bundle is missing" }
+      - name: Upload Windows app and VST3
+        uses: actions/upload-artifact@v4
+        with:
+          name: wave-emulation-windows-x64
+          path: |
+            build-windows/WaveEmulation_artefacts/Release/Standalone/
+            build-windows/WaveEmulation_artefacts/Release/VST3/
+          if-no-files-found: error

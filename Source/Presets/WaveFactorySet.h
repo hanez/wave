@@ -33,6 +33,8 @@ public:
     [[nodiscard]] bool isLoaded() const noexcept { return report.validLayout; }
     [[nodiscard]] const Report& getReport() const noexcept { return report; }
     [[nodiscard]] std::span<const uint8_t, soundSize> sound(int bank, int program) const noexcept;
+    [[nodiscard]] std::span<const uint8_t> performanceBank() const noexcept { return performances; }
+    [[nodiscard]] std::span<const uint8_t> soundBank() const noexcept { return sounds; }
     [[nodiscard]] std::span<const uint8_t, performanceSize> performance(
         int bank, int program) const noexcept;
     [[nodiscard]] std::string soundName(int bank, int program) const;

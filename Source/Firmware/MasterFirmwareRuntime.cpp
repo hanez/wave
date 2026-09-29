@@ -216,6 +216,41 @@ bool MasterFirmwareRuntime::installEditRecords(
     return true;
 }
 
+bool MasterFirmwareRuntime::installSoundBank(
+    std::span<const uint8_t> sounds) noexcept
+{
+    constexpr size_t editableBank = 0x8000u;
+    constexpr size_t storedBank = 0x18000u;
+    constexpr size_t bankBytes = 256u * 256u;
+    if (!loaded || sounds.size() != bankBytes
+        || storedBank + bankBytes > sharedMemory->program.size())
+        return false;
+
+    // The OS can resolve a Sound through either bank according to its edit
+    // registry. Populate both from the loaded SET so the native browser and
+    // subsequent selection see the same 256 distinct programs as the engine.
+    std::copy(sounds.begin(), sounds.end(),
+              sharedMemory->program.begin() + editableBank);
+    std::copy(sounds.begin(), sounds.end(),
+              sharedMemory->program.begin() + storedBank);
+    return true;
+}
+
+bool MasterFirmwareRuntime::installPerformanceBank(
+    std::span<const uint8_t> performances) noexcept
+{
+    constexpr uint32_t bankOffset = 0x28000u;
+    constexpr size_t bankBytes = 256u * 512u;
+    if (!loaded || sharedMemory == nullptr || performances.size() != bankBytes)
+        return false;
+
+    // The native bank at $128000 crosses into work SRAM at $140000.
+    for (size_t index = 0; index < bankBytes; ++index)
+        write8(sharedProgramBase + bankOffset + static_cast<uint32_t>(index),
+               performances[index]);
+    return true;
+}
+
 bool MasterFirmwareRuntime::requestPerformanceSelection(int programIndex) noexcept
 {
     if (!loaded || programIndex < 0 || programIndex >= 256)
@@ -295,8 +330,36 @@ bool MasterFirmwareRuntime::navigatePageWithFirmware(bool forwards) noexcept
     // scheduler, which makes a host mouse click liable either to be missed or
     // to repeat several times inside one audio block. Run the callbacks that
     // the current screen installed, in their exact firmware order, once.
-    constexpr uint32_t backwardsCallbacks = 0x56698u;
-    constexpr uint32_t forwardsCallbacks = 0x566a8u;
+    const auto completed = runPanelCallbacksWithFirmware(forwards ? 0x566a8u : 0x56698u);
+    sharedMemory->mainRam[0x59890u] = 0u;
+    releasePanelEventLatch(21);
+    releasePanelEventLatch(23);
+    return completed;
+}
+
+bool MasterFirmwareRuntime::stepDiskMenuWithFirmware(bool forwards) noexcept
+{
+    if (!loaded || sharedMemory == nullptr)
+        return false;
+    const auto code = forwards ? 72u : 69u;
+    const auto action = sharedMemory->mainRam[0x2850eu + code];
+    const auto callbacks = 0x56618u + static_cast<uint32_t>(action) * 16u;
+    const auto& ram = sharedMemory->mainRam;
+    const auto callback = (static_cast<uint32_t>(ram[callbacks]) << 24u)
+                          | (static_cast<uint32_t>(ram[callbacks + 1u]) << 16u)
+                          | (static_cast<uint32_t>(ram[callbacks + 2u]) << 8u)
+                          | ram[callbacks + 3u];
+    // OS menu selectors do not arm the +/- repeat latch. Calling their
+    // installed selector once avoids mistaking successful input for a retry.
+    if (callback != (forwards ? 0x2dcaau : 0x2dce6u))
+        return false;
+    discardPendingPanelButtonEvents(static_cast<int>(code));
+    releasePanelEventLatch(static_cast<int>(code));
+    return runPanelCallbacksWithFirmware(callbacks);
+}
+
+bool MasterFirmwareRuntime::runPanelCallbacksWithFirmware(uint32_t callbackTable) noexcept
+{
     constexpr uint32_t displayService = 0x0010b6u;
     constexpr uint32_t temporaryStackBottom = 0x0f0000u;
     constexpr uint32_t trampolineAddress = temporaryStackBottom + 0x10u;
@@ -309,7 +372,6 @@ bool MasterFirmwareRuntime::navigatePageWithFirmware(bool forwards) noexcept
                | (static_cast<uint32_t>(ram[address + 2u]) << 8u)
                | static_cast<uint32_t>(ram[address + 3u]);
     };
-    const auto callbackTable = forwards ? forwardsCallbacks : backwardsCallbacks;
     const std::array entries { readLong(callbackTable), displayService,
                                readLong(callbackTable + 4u), displayService };
     for (const auto entry : entries)
@@ -346,12 +408,6 @@ bool MasterFirmwareRuntime::navigatePageWithFirmware(bool forwards) noexcept
     displayRefreshActive = false;
     std::copy(savedStack.begin(), savedStack.end(), ram.begin() + temporaryStackBottom);
 
-    // Both page keys are electrically released after the one-shot callback.
-    // This also recovers an emulator session left in the firmware's Help-key
-    // chord state by an earlier interrupted click.
-    ram[0x59890u] = 0u;
-    releasePanelEventLatch(21);
-    releasePanelEventLatch(23);
     return displayRefreshComplete;
 }
 
@@ -769,7 +825,10 @@ uint8_t MasterFirmwareRuntime::localByte(uint32_t address) const noexcept
 
 uint8_t MasterFirmwareRuntime::sharedProgramByte(uint32_t offset) const noexcept
 {
-    return offset < sharedMemory->program.size() ? sharedMemory->program[offset] : 0xffu;
+    if (offset < sharedMemory->program.size())
+        return sharedMemory->program[offset];
+    offset -= static_cast<uint32_t>(sharedMemory->program.size());
+    return offset < sharedMemory->work.size() ? sharedMemory->work[offset] : 0xffu;
 }
 
 bool MasterFirmwareRuntime::writePerformanceInstrumentByte(
@@ -786,9 +845,7 @@ bool MasterFirmwareRuntime::writePerformanceInstrumentByte(
     const auto address = *performance + instrumentTable
                          + static_cast<uint32_t>(instrument) * instrumentRecordSize
                          + offset;
-    if (address >= sharedMemory->program.size())
-        return false;
-    sharedMemory->program[address] = value;
+    write8(sharedProgramBase + address, value);
     return true;
 }
 
@@ -807,12 +864,11 @@ std::optional<int> MasterFirmwareRuntime::currentPerformanceId() const noexcept
 std::optional<int> MasterFirmwareRuntime::currentPerformanceInstrument() const noexcept
 {
     const auto performanceOffset = currentPerformanceRecordOffset();
-    if (!performanceOffset.has_value() || sharedMemory == nullptr
-        || *performanceOffset + 24u >= sharedMemory->program.size())
+    if (!performanceOffset.has_value() || sharedMemory == nullptr)
         return std::nullopt;
 
     return static_cast<int>(
-        sharedMemory->program[*performanceOffset + 24u] & 0x0fu);
+        sharedProgramByte(*performanceOffset + 24u) & 0x0fu);
 }
 
 std::optional<uint32_t>
@@ -838,13 +894,25 @@ MasterFirmwareRuntime::currentPerformanceRecordOffset() const noexcept
                   == readProgramWord(specialPerformanceIdOffset)
               ? specialPerformanceOffset
               : performanceBankOffset
-                    + static_cast<uint32_t>(*performanceId) * 0x200u;
-    if (performanceOffset + 0x200u > program.size()
-        || program[performanceOffset + 48u] != 0x55u)
+                    + (static_cast<uint32_t>(*performanceId) & 0xffu) * 0x200u;
+    if (sharedProgramByte(performanceOffset + 48u) != 0x55u)
         performanceOffset = fallbackPerformanceOffset;
-    if (performanceOffset + 0x200u > program.size())
-        return std::nullopt;
     return performanceOffset;
+}
+
+std::optional<int> MasterFirmwareRuntime::currentInstrumentEditTarget() const noexcept
+{
+    if (!loaded || sharedMemory == nullptr)
+        return std::nullopt;
+    // OS 1.700's Instrument Edit fader handler ($14122) reads this page
+    // target. Performance byte 24 can change when an Instrument is disabled
+    // or its Performance is promoted to the edit buffer.
+    // Group Edit reuses that byte as a parameter selector ($14142), so it
+    // retains the Performance's selected Instrument for single-layer feedback.
+    if (sharedMemory->mainRam[0x56ed8u] != 0u)
+        return currentPerformanceInstrument();
+    const auto target = static_cast<int>(sharedMemory->mainRam[0x56eeau]);
+    return target < 8 ? std::optional<int>(target) : std::nullopt;
 }
 
 std::optional<uint32_t> MasterFirmwareRuntime::currentSoundRecordOffset() const noexcept
@@ -862,7 +930,6 @@ MasterFirmwareRuntime::performanceInstrumentSoundRecordOffset(
     if (!loaded || sharedMemory == nullptr)
         return std::nullopt;
 
-    const auto& ram = sharedMemory->mainRam;
     const auto& program = sharedMemory->program;
     const auto readProgramWord = [&program](uint32_t offset) {
         if (offset + 1u >= program.size())
@@ -874,11 +941,6 @@ MasterFirmwareRuntime::performanceInstrumentSoundRecordOffset(
     // These are the same record-resolution tables used by OS 1.700 at
     // $A8A2/$A8D4/$AE38/$AB7C. The firmware edits the selected Instrument's
     // live Sound record, which is not necessarily the $5300 startup record.
-    constexpr uint32_t currentPerformanceAddress = 0x54b40u;
-    constexpr uint32_t specialPerformanceIdOffset = 0x5184u;
-    constexpr uint32_t specialPerformanceOffset = 0x5600u;
-    constexpr uint32_t fallbackPerformanceOffset = 0x5400u;
-    constexpr uint32_t performanceBankOffset = 0x28000u;
     constexpr uint32_t soundCacheIdsOffset = 0x5186u;
     constexpr uint32_t soundRegistryOffset = 0x5200u;
     constexpr uint32_t soundCacheOffset = 0x5800u;
@@ -887,17 +949,10 @@ MasterFirmwareRuntime::performanceInstrumentSoundRecordOffset(
     constexpr uint32_t fallbackSoundOffset = 0x5300u;
     constexpr uint32_t soundRecordSize = 0x100u;
 
-    const auto performanceId = static_cast<uint16_t>(
-        (static_cast<uint16_t>(ram[currentPerformanceAddress]) << 8u)
-        | ram[currentPerformanceAddress + 1u]);
-    auto performanceOffset
-        = performanceId == readProgramWord(specialPerformanceIdOffset)
-              ? specialPerformanceOffset
-              : performanceBankOffset
-                    + static_cast<uint32_t>(performanceId) * 0x200u;
-    if (performanceOffset + 0x200u > program.size()
-        || program[performanceOffset + 48u] != 0x55u)
-        performanceOffset = fallbackPerformanceOffset;
+    const auto performance = currentPerformanceRecordOffset();
+    if (!performance.has_value())
+        return std::nullopt;
+    const auto performanceOffset = *performance;
 
     if (requestedInstrument < 0 || requestedInstrument >= 8)
         return std::nullopt;
@@ -906,11 +961,9 @@ MasterFirmwareRuntime::performanceInstrumentSoundRecordOffset(
         = instrument < 8u
               ? performanceOffset + 64u + instrument * 32u
               : performanceOffset + 64u + 256u + (instrument & 7u) * 24u;
-    if (instrumentOffset + 2u > program.size())
-        return std::nullopt;
     const auto soundId = static_cast<uint32_t>(
-        (static_cast<uint32_t>(program[instrumentOffset + 1u]) << 7u
-         | static_cast<uint32_t>(program[instrumentOffset]))
+        (static_cast<uint32_t>(sharedProgramByte(instrumentOffset + 1u)) << 7u
+         | static_cast<uint32_t>(sharedProgramByte(instrumentOffset)))
         & 0xffu);
 
     for (int slot = 7; slot >= 0; --slot)
@@ -978,11 +1031,11 @@ bool MasterFirmwareRuntime::installCurrentPerformanceRecord(
     std::span<const uint8_t, 512> performance) noexcept
 {
     const auto record = currentPerformanceRecordOffset();
-    if (!record.has_value() || sharedMemory == nullptr
-        || *record + performance.size() > sharedMemory->program.size())
+    if (!record.has_value() || sharedMemory == nullptr)
         return false;
-    std::copy(performance.begin(), performance.end(),
-              sharedMemory->program.begin() + *record);
+    for (size_t index = 0; index < performance.size(); ++index)
+        write8(sharedProgramBase + *record + static_cast<uint32_t>(index),
+               performance[index]);
     return true;
 }
 

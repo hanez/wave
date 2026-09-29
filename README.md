@@ -32,6 +32,10 @@ Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
 
+Version 0.1.7 fixes repeated or missed front-panel actions in Disk, Store, and
+Instrument Edit, including name cursors and Load-menu stepping. It also keeps
+Performance program names and layered sounds consistent when switching modes.
+
 [Version 0.1.6](https://github.com/mo0kid/wave/releases/tag/v0.1.6) targets
 macOS Ventura 13.0 and later in universal Apple Silicon/Intel builds of the
 standalone app, AU, VST3 and AAX plugins. The installer checks the minimum OS,
@@ -166,6 +170,24 @@ The Standalone, Audio Unit, VST3, and AAX artifacts are written below
 `WAVE_SIGN_RELEASE_ARTIFACTS=ON` and `WAVE_CODESIGN_IDENTITY` when configuring CMake. Distribution to normal Pro Tools systems additionally
 requires PACE wrapping with a Wave-specific WCGUID; the CMake AAX bundle is
 deliberately left unwrapped for use as the input to `wraptool`.
+
+### Windows x64 build
+
+Install Visual Studio 2022 with Desktop development with C++ and CMake 3.25 or
+newer. From a PowerShell terminal, build the standalone app and VST3 plugin:
+
+```powershell
+cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 -DWAVE_EMBED_PRIVATE_ASSETS=OFF
+cmake --build build-windows --config Release --parallel 3
+ctest --test-dir build-windows -C Release --output-on-failure
+```
+
+The `.exe` and `.vst3` bundle are under
+`build-windows/WaveEmulation_artefacts/Release`. Copy the VST3 bundle to
+`C:\Program Files\Common Files\VST3` to use it in a VST3 host. The standalone
+app can run directly from its build folder. Windows builds do not include AU or
+AAX. The public source CI workflow builds and tests Windows x64 and uploads
+the app and VST3 as a downloadable workflow artifact.
 
 To build the distributable macOS installer and DMG, including PACE wrapping
 with the Wave product WCGUID, Developer ID signing, notarization and stapling:

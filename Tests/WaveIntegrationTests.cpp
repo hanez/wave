@@ -8,6 +8,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -86,6 +87,20 @@ void testAutomaticBootAudioAndState()
                 && processor.getFactorySetReport().validSounds == 256
                 && processor.getFactorySetReport().validPerformances == 256,
             "Embedded Wave factory SET did not load its two native banks");
+    constexpr uint32_t storedSoundBank = 0x18000u;
+    constexpr uint32_t soundSize = 0x100u;
+    const auto nativeSoundName = [&](uint32_t soundIndex) {
+        std::string name;
+        for (uint32_t i = 0; i < 16; ++i)
+            name.push_back(static_cast<char>(
+                processor.getMasterFirmwareRuntime().sharedProgramByte(
+                    storedSoundBank + soundIndex * soundSize + 240u + i)));
+        return name;
+    };
+    require(nativeSoundName(0) == "sitar           "
+                && nativeSoundName(1) == "DROOPOLYFLANGE  "
+                && nativeSoundName(128) == "WoodOrgan    WMF",
+            "Firmware Sound browser bank does not contain distinct SET names");
     require(processor.getNumPrograms() == 256
                 && processor.getProgramName(0) == "drooSyn 1 oo DN"
                 && processor.getProgramName(128) == "WoodOrgan    WMF",
@@ -850,11 +865,128 @@ void testStoreRequesterStepButtonsChooseDestination()
             "Store Minus did not restore the preceding firmware destination");
     require(processor->getPanelLed(87),
             "Store LED did not remain lit throughout its requester");
-    click(71); // Cancel / ESC exits Store.
+    const auto& runtime = processor->getMasterFirmwareRuntime();
+    const auto cursorBefore = runtime.localByte(0x57005u);
+    click(23); // The naming dialog accepts Page Right.
+    require(runtime.localByte(0x57005u) == cursorBefore + 1,
+            "Performance name Page Right did not advance the firmware cursor");
+    click(21); // And Page Left, while retaining the Store requester.
+    require(runtime.localByte(0x57005u) == cursorBefore,
+            "Performance name Page Left did not restore the firmware cursor");
+    require(processor->isFirmwareRequesterActive(),
+            "Page cursor keys closed the Store requester");
+    click(71); // Cancel / ESC leaves Store.
+    click(33);
+    click(57);
+    click(25);
+    require(processor->isFirmwareRequesterActive(),
+            "A second Store requester did not open");
+    const auto reopenedCursor = runtime.localByte(0x57005u);
+    click(23);
+    require(processor->isFirmwareRequesterActive(),
+            "Page Right closed the second Store requester");
+    require(runtime.localByte(0x57005u) == reopenedCursor + 1,
+            "Page Right did not move the cursor in the reopened Store requester");
+    click(71); // Leave the second requester without writing again.
     require(processor->getPanelSelectedMode() == 39
                 && processor->getPanelLed(51)
                 && !processor->getPanelLed(87),
             "Store LED remained lit after leaving the Store page");
+}
+
+void testRepeatedSoundStoreCursor()
+{
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int count) {
+        for (int block = 0; block < count; ++block) {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+        }
+    };
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        require(processor->setPanelButton(button, true), "Sound Store rejected a button");
+        process(8);
+        processor->setPanelButton(button, false);
+        process(48);
+    };
+    process(64);
+    click(33);
+    click(57);
+    click(79); // Sound opens the Instrument chooser.
+    for (int pass = 0; pass < 3; ++pass) {
+        click(pass % 2 == 0 ? 22 : 25);
+        require(processor->isFirmwareRequesterActive(), "Sound Store requester did not open");
+        const auto& runtime = processor->getMasterFirmwareRuntime();
+        const auto cursor = runtime.localByte(0x57005u);
+        click(23);
+        require(runtime.localByte(0x57005u) == cursor + 1,
+                "Sound name Page Right did not advance the actual firmware cursor");
+        click(21);
+        require(runtime.localByte(0x57005u) == cursor,
+                "Sound name Page Left did not restore the actual firmware cursor");
+        const auto character = runtime.localByte(0x56000u + cursor);
+        for (int step = 0; step < 8 && runtime.localByte(0x56000u + cursor) == character; ++step)
+        {
+            processor->turnPanelEncoder(8, 1);
+            process(48);
+        }
+        require(runtime.localByte(0x56000u + cursor) != character,
+                "Data dial did not edit the selected Sound name character");
+        click(70);
+        require(!processor->isFirmwareRequesterActive(),
+                "One OK press did not close the Sound naming requester");
+        require(processor->getPanelSelectedMode() == 57 && processor->getPanelLed(87),
+                "Sound Store OK retired Store while the firmware still owns the chooser");
+    }
+    click(71);
+    require(processor->getPanelSelectedMode() == 39 && !processor->getPanelLed(87),
+            "Cancel did not leave the Sound Store chooser");
+}
+
+void testPerformanceBrowserHasDistinctStoredRecords()
+{
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int count) {
+        for (int block = 0; block < count; ++block)
+        {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+        }
+    };
+    process(64);
+    const auto& firmware = processor->getMasterFirmwareRuntime();
+    const auto verifyNames = [&]() {
+        for (int program = 0; program < 256; ++program)
+        {
+            const auto offset = 0x28000u + static_cast<uint32_t>(program) * 512u;
+            require(firmware.sharedProgramByte(offset + 48u) == 0x55u,
+                    "Firmware browser Performance bank contains an uninitialised record");
+            juce::String name;
+            for (uint32_t character = 0; character < 16; ++character)
+                name += juce::String::charToString(static_cast<juce::juce_wchar>(
+                    firmware.sharedProgramByte(offset + 32u + character)));
+            require(name.trim() == processor->getProgramName(program).trim(),
+                    "Firmware browser Performance name differs from its stored program");
+        }
+    };
+    verifyNames();
+    for (int pass = 0; pass < 3; ++pass)
+        for (const int code : {36, 39})
+        {
+            const auto matrix = wave::panel::matrixIndexForDiagnosticCode(code);
+            require(processor->setPanelButton(matrix, true), "Mode switch rejected");
+            process(8);
+            processor->setPanelButton(matrix, false);
+            process(96);
+            verifyNames();
+        }
 }
 
 void testStoreCancelRestoresNumericPerformancePreview()
@@ -1392,7 +1524,7 @@ void testFactoryA001CapturedChordSequenceKeepsEveryVcaOpen()
             "Captured A001 sequence collapsed five held voice VCAs");
 }
 
-void testDiskSetSerialSelectionUpdatesDsp()
+void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true)
 {
     constexpr size_t soundBankOffset = 0x12e7cu;
     constexpr size_t performanceBankOffset = 0x22e7cu;
@@ -1491,6 +1623,13 @@ void testDiskSetSerialSelectionUpdatesDsp()
             processor->processBlock(audio, noMidi);
         }
     };
+    clickAndSettle(58); // Disk / Load menu.
+    clickAndSettle(70); // Open its next step; the SET has not transferred.
+    require(processor->getPanelSelectedMode() == 58,
+            "First Disk OK prematurely closed the Total Recall workspace");
+    clickAndSettle(71); // Leave Disk before testing Option/Import separately.
+    require(processor->mountDiskImage(imageFile).wasOk(),
+            "Could not remount SET after cancelling Disk selection");
     clickAndSettle(34); // Option / Import workspace.
     require(processor->getPanelSelectedMode() == 34,
             "Mounted SET did not enter the Option/Import workspace");
@@ -1506,6 +1645,13 @@ void testDiskSetSerialSelectionUpdatesDsp()
     require(processor->getPanelSelectedMode() == 39
                 && !processor->isPanelModeDisplayTransitionActive(),
             "Successful SET import left Performance mode or its LCD transaction frozen");
+    constexpr uint32_t storedSoundBank = 0x18000u;
+    constexpr uint32_t bankBSound1Name = storedSoundBank + 128u * 256u + 240u;
+    require(processor->getMasterFirmwareRuntime().sharedProgramByte(
+                bankBSound1Name) == static_cast<uint8_t>('W')
+                && processor->getMasterFirmwareRuntime().sharedProgramByte(
+                       bankBSound1Name + 256u) == static_cast<uint8_t>('S'),
+            "Imported SET did not populate distinct firmware Sound names");
 
     const auto lcdWritesBeforeStep
         = processor->getMasterFirmwareRuntime().lcdVideoWriteCount();
@@ -1589,6 +1735,12 @@ void testDiskSetSerialSelectionUpdatesDsp()
     require(!restoredHostStateDirectory.exists(),
             "Destroying a plugin instance retained its private restored disk directory");
 
+    if (!checkColdStart)
+    {
+        require(directory.deleteRecursively(),
+                "Could not remove disk/DSP regression directory");
+        return;
+    }
     processor->resetToColdStart();
     require(!processor->hasMountedDiskImage()
                 && processor->getNumPrograms() == 1
@@ -2250,6 +2402,118 @@ void testInstrumentEditLayerSelection()
                            .currentPerformanceInstrument() == expected,
                 "Repeated Instrument Edit selection lost firmware synchronization");
     }
+}
+
+void testInstrumentSourceKeepsOtherLayers()
+{
+    const auto configuredSet = juce::SystemStats::getEnvironmentVariable(
+        "WAVE_FACTORY_SET", {});
+    const auto sourceSet = configuredSet.isNotEmpty()
+        ? juce::File(configuredSet)
+        : juce::File::getCurrentWorkingDirectory().getChildFile("wave.set");
+    juce::MemoryBlock setup;
+    require(sourceSet.loadFileAsData(setup), "Source test could not read SET");
+    auto* bytes = static_cast<uint8_t*>(setup.getData());
+    constexpr size_t performanceOffset = 0x22e7cu + 41u * 512u;
+    constexpr size_t layerTable = performanceOffset + 64u;
+    std::array<uint8_t, 32> firstLayer {};
+    std::copy_n(bytes + layerTable, firstLayer.size(), firstLayer.begin());
+    for (int layer = 0; layer < 3; ++layer)
+    {
+        auto* destination = bytes + layerTable + static_cast<size_t>(layer) * 32u;
+        std::copy(firstLayer.begin(), firstLayer.end(), destination);
+        destination[3] = 3; // Keys and MIDI; all three share the same Sound.
+        destination[13] = 0;
+    }
+    const auto directory = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                               .getNonexistentChildFile("wave-source-test", {}, true);
+    require(directory.createDirectory().wasOk(), "Source test directory failed");
+    const auto setFile = directory.getChildFile("SOURCE.SET");
+    const auto imageFile = directory.getChildFile("SOURCE.IMG");
+    require(setFile.replaceWithData(setup.getData(), setup.getSize())
+                && wave::firmware::DosFloppyImage::createWithWaveSetup(
+                       imageFile, setFile).wasOk(),
+            "Source test disk creation failed");
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    require(processor->mountDiskImage(imageFile).wasOk(),
+            "Source test disk mount failed");
+    processor->setCurrentProgram(41); // A042 has three active Instruments.
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto processBlocks = [&](int count) {
+        for (int block = 0; block < count; ++block)
+        {
+            audio.clear();
+            juce::MidiBuffer midi;
+            processor->processBlock(audio, midi);
+        }
+    };
+    processBlocks(96);
+    for (int layer = 0; layer < 3; ++layer)
+        require(processor->isPerformanceInstrumentActive(layer),
+                "Source test did not initialise three active layers");
+    const auto& firmware = processor->getMasterFirmwareRuntime();
+    const auto record = firmware.currentPerformanceRecordOffset();
+    require(record.has_value(), "Source test has no Performance record");
+    std::array<int, 8> originalSources {};
+    for (int layer = 0; layer < 8; ++layer)
+        originalSources[static_cast<size_t>(layer)]
+            = firmware.sharedProgramByte(*record + 64u
+                                         + static_cast<uint32_t>(layer) * 32u + 3u) & 0x7f;
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        processor->setPanelButton(button, true);
+        processBlocks(8);
+        processor->setPanelButton(button, false);
+        processBlocks(96);
+    };
+    click(36); // Instrument Edit.
+    click(26); // Instrument 3.
+    require(firmware.currentPerformanceInstrument() == 2,
+            "Source test did not select Instrument 3");
+    for (int layer = 0; layer < 8; ++layer)
+    {
+        const auto selectedRecord = firmware.currentPerformanceRecordOffset();
+        require(selectedRecord.has_value(), "Selection lost Performance record");
+        const auto source = firmware.sharedProgramByte(
+                                *selectedRecord + 64u
+                                + static_cast<uint32_t>(layer) * 32u + 3u) & 0x7f;
+        require(source == originalSources[static_cast<size_t>(layer)],
+                "Selecting Instrument 3 changed another Instrument Source");
+    }
+    constexpr auto sourceChannel = wave::panel::performanceFaderAdcChannels[7];
+    for (const auto position : { 0.0f, 1.0f, 0.0f, 1.0f })
+    {
+        processor->setPanelFader(7, sourceChannel, position, false);
+        processBlocks(96);
+        const auto liveRecord = firmware.currentPerformanceRecordOffset();
+        require(liveRecord.has_value(), "Source edit lost its Performance record");
+        require(firmware.currentInstrumentEditTarget() == 2
+                    && processor->getSelectedPerformanceInstrument() == 2,
+                "Source change moved the Instrument Edit target");
+        require((firmware.sharedProgramByte(*liveRecord + 64u + 2u * 32u + 3u) & 0x7f)
+                    == (position == 0.0f ? 0 : 3)
+                    && processor->isPerformanceInstrumentActive(2) == (position > 0.0f),
+                "Source change did not update Instrument 3 in firmware and engine");
+        for (int layer = 0; layer < 8; ++layer)
+        {
+            if (layer == 2)
+                continue;
+            const auto source = firmware.sharedProgramByte(
+                                    *liveRecord + 64u
+                                    + static_cast<uint32_t>(layer) * 32u + 3u) & 0x7f;
+            if (source != originalSources[static_cast<size_t>(layer)])
+                throw std::runtime_error("Changing Instrument 3 Source changed native Source for Instrument "
+                                         + std::to_string(layer + 1) + ": "
+                                         + std::to_string(originalSources[static_cast<size_t>(layer)])
+                                         + " -> " + std::to_string(source)
+                                         + " at fader " + std::to_string(position));
+            require(processor->isPerformanceInstrumentActive(layer)
+                        == (source != 0),
+                    "Instrument Source engine state disagreed with native record");
+        }
+    }
+    require(directory.deleteRecursively(), "Source test cleanup failed");
 }
 
 void testPerformanceMuteAndSolo()
@@ -4175,6 +4439,96 @@ void testGroupEditUsesFirmwareSerialPageAndLed()
             "Group Edit LED remained latched after leaving its page");
 }
 
+void testInstrumentModeRoundTripsKeepSelectionAndSolo()
+{
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    processor->setCurrentProgram(41);
+    juce::AudioBuffer<float> audio(2, 512);
+    int expectedDuringTransition = -1;
+    const auto process = [&](int count) {
+        for (int block = 0; block < count; ++block)
+        {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+            if (expectedDuringTransition >= 0)
+                require(processor->getSelectedPerformanceInstrument() == expectedDuringTransition,
+                        "A mode transition temporarily selected a different Instrument");
+        }
+    };
+    const auto click = [&](int code) {
+        if (code == 36 || code == 39)
+            expectedDuringTransition = processor->getSelectedPerformanceInstrument();
+        const auto matrix = wave::panel::matrixIndexForDiagnosticCode(code);
+        require(processor->setPanelButton(matrix, true), "Mode-cycle button rejected");
+        process(8);
+        processor->setPanelButton(matrix, false);
+        process(96);
+        expectedDuringTransition = -1;
+    };
+    process(128);
+    click(25); // Select Instrument 2.
+    require(processor->getSelectedPerformanceInstrument() == 1,
+            "Mode-cycle setup did not select Instrument 2");
+    const auto& firmware = processor->getMasterFirmwareRuntime();
+    std::array<uint8_t, 192> originalSound {};
+    for (size_t byte = 0; byte < originalSound.size(); ++byte)
+        originalSound[byte] = firmware.currentSoundRecordByte(static_cast<uint32_t>(byte));
+    const auto baselineVoice = processor->probeCurrentLayerVoice(7, 1, 60, 0.8f, 24000, 42);
+    for (int round = 0; round < 3; ++round)
+    {
+        click(78); // Enter Solo in Performance.
+        require(processor->getPanelLed(59), "Solo LED did not light in Performance");
+        click(25); // Solo Instrument 2.
+        click(36);
+        click(26); // Select Instrument 3 for editing while Solo remains active.
+        require(processor->getSelectedPerformanceInstrument() == 2
+                    && firmware.currentInstrumentEditTarget() == 2,
+                "Solo prevented Instrument Edit from selecting another layer");
+        click(25); // Return to the original Sound before comparing its record.
+        click(78); // Leave Solo from Instrument Edit.
+        require(!processor->getPanelLed(59)
+                    && processor->getInstrumentButtonMode()
+                           == WaveEmulationAudioProcessor::InstrumentButtonMode::normal,
+                "Solo did not switch off after entering Instrument Edit");
+        require(processor->getSelectedPerformanceInstrument() == 1
+                    && firmware.currentInstrumentEditTarget() == 1
+                    && processor->isPerformanceInstrumentActive(1),
+                "Mode cycling lost the selected active Instrument");
+        click(39);
+        require(processor->getSelectedPerformanceInstrument() == 1
+                    && firmware.currentPerformanceInstrument() == 1,
+                "Returning to Performance lost the selected Instrument");
+        for (size_t byte = 0; byte < originalSound.size(); ++byte)
+            require(firmware.currentSoundRecordByte(static_cast<uint32_t>(byte))
+                        == originalSound[byte],
+                    "Mode cycling changed the selected Sound record");
+        const auto voice = processor->probeCurrentLayerVoice(7, 1, 60, 0.8f, 24000, 42);
+        require(std::abs(voice.rmsOutput - baselineVoice.rmsOutput)
+                        <= std::max(1.0e-8, baselineVoice.rmsOutput * 1.0e-4)
+                    && std::abs(voice.meanCutoffHz - baselineVoice.meanCutoffHz)
+                        <= std::max(1.0e-5, baselineVoice.meanCutoffHz * 1.0e-5),
+                "Mode cycling changed the selected layer's rendered Sound");
+    }
+    click(36);
+    bool sawOrange = false;
+    bool sawOff = false;
+    const auto deadline = juce::Time::getMillisecondCounterHiRes() + 900.0;
+    while (juce::Time::getMillisecondCounterHiRes() < deadline
+           && !(sawOrange && sawOff))
+    {
+        process(1);
+        const auto green = processor->getPanelLed(98);
+        const auto red = processor->getPanelLed(99);
+        sawOrange = sawOrange || (green && red);
+        sawOff = sawOff || (!green && !red);
+        juce::Thread::sleep(1);
+    }
+    require(sawOrange && sawOff,
+            "Selected Instrument LED stopped flashing after mode cycling");
+}
+
 void testSelectedInstrumentSoftkeyFlashesOrangeOff()
 {
     auto processor = std::make_unique<WaveEmulationAudioProcessor>();
@@ -4289,6 +4643,99 @@ void testSequencerKeyDoesNotTrapPerformanceMode()
             "The reserved Sequencer key trapped subsequent Performance controls");
 }
 
+void testDiskLoadStepDoesNotRepeat()
+{
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int blocks) {
+        for (int block = 0; block < blocks; ++block) {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+        }
+    };
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        require(processor->setPanelButton(button, true), "Disk Load rejected a panel contact");
+        process(8);
+        processor->setPanelButton(button, false);
+        process(8);
+    };
+    process(64);
+    click(58); // Disk.
+    click(22); // Open the Load choices.
+    process(64);
+    const auto& runtime = processor->getMasterFirmwareRuntime();
+    const auto initial = runtime.lcdVideoSnapshot();
+    click(72);
+    process(64);
+    const auto advanced = runtime.lcdVideoSnapshot();
+    require(advanced != initial, "Load + did not move the selection");
+    process(500);
+    require(runtime.lcdVideoSnapshot() == advanced,
+            "Load selection kept scrolling after releasing +");
+    click(69);
+    process(64);
+    require(runtime.lcdVideoSnapshot() == initial,
+            "Load +/- did not move by exactly one menu entry");
+    process(500);
+    require(runtime.lcdVideoSnapshot() == initial,
+            "Load selection kept scrolling after releasing -");
+}
+
+void testDiskFormatNameCursor()
+{
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    processor->prepareToPlay(48000.0, 512);
+    const juce::TemporaryFile temporaryDisk(".img");
+    const auto disk = temporaryDisk.getFile();
+    require(wave::firmware::DosFloppyImage::createEmpty(disk).wasOk(), "Test disk creation failed");
+    require(processor->mountDiskImage(disk).wasOk(), "Test disk mount failed");
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int blocks) {
+        for (int block = 0; block < blocks; ++block) {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+        }
+    };
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        require(processor->setPanelButton(button, true), "Disk naming rejected a panel contact");
+        process(8);
+        processor->setPanelButton(button, false);
+        process(64);
+    };
+    process(64);
+    click(58); // Disk.
+    click(79); // Format.
+    click(70); // Choose the format operation.
+    click(70); // Confirm the test medium to reach its name editor.
+    process(3000); // Let the emulated floppy finish formatting the temporary medium.
+    const auto& runtime = processor->getMasterFirmwareRuntime();
+    require(processor->isFirmwareRequesterActive(), "Format name requester did not open");
+    const auto cursor = runtime.localByte(0x5705fu);
+    const auto character = runtime.localByte(0x56f30u + cursor);
+    for (int step = 0; step < 8 && runtime.localByte(0x56f30u + cursor) == character; ++step)
+    {
+        processor->turnPanelEncoder(8, 1);
+        process(48);
+    }
+    require(runtime.localByte(0x56f30u + cursor) != character,
+            "Data dial did not edit the selected disk-name character");
+    // The DOS editor skips padding on Right; enter a character first so
+    // this checks movement by one actual name position.
+    click(23);
+    require(runtime.localByte(0x5705fu) == cursor + 1,
+            "Disk name Page Right did not advance the firmware cursor");
+    click(21);
+    require(runtime.localByte(0x5705fu) == cursor,
+            "Disk name Page Left did not restore the firmware cursor");
+    click(71); // Cancel naming the temporary medium.
+    processor.reset();
+}
+
 void testDiskCancelReturnsPerformanceModeLed()
 {
     auto processor = std::make_unique<WaveEmulationAudioProcessor>();
@@ -4390,10 +4837,58 @@ void testExclusiveModesRejectOtherModeLeds()
 
 } // namespace
 
-int main()
+int main(int argc, char** argv)
 {
     try
     {
+        if (argc > 1 && std::string_view(argv[1]) == "--disk-step")
+        {
+            testDiskLoadStepDoesNotRepeat();
+            std::cout << "Disk Load step regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--disk-name")
+        {
+            testDiskFormatNameCursor();
+            std::cout << "Disk naming regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--program-names")
+        {
+            testPerformanceBrowserHasDistinctStoredRecords();
+            std::cout << "Performance browser names regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--mode-selection")
+        {
+            testInstrumentModeRoundTripsKeepSelectionAndSolo();
+            testInstrumentEditLayerSelection();
+            testPerformanceMuteAndSolo();
+            testSelectedInstrumentSoftkeyFlashesOrangeOff();
+            std::cout << "Mode selection regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--disk-total-recall")
+        {
+            testDiskSetSerialSelectionUpdatesDsp(false);
+            std::cout << "Disk Total Recall regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--instrument-source")
+        {
+            testInstrumentSourceKeepsOtherLayers();
+            testInstrumentEditLayerSelection();
+            std::cout << "Instrument Source regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--store-name")
+        {
+            testRepeatedSoundStoreCursor();
+            testStoreRequesterStepButtonsChooseDestination();
+            testStoreCancelRestoresNumericPerformancePreview();
+            std::cout << "Store Page-key routing regression passed\n";
+            return 0;
+        }
         testAutomaticBootAudioAndState();
         testFactoryA092ChoirVibratoUsesCallerScale();
         testFactoryB057UsesMeasuredVcaAttackOne();
@@ -4402,10 +4897,12 @@ int main()
         testLegacyStartupStateReloadsExactFactoryPerformance();
         testFactoryVcaReleaseTail();
         testFactoryPerformanceLayering();
+        testPerformanceBrowserHasDistinctStoredRecords();
         testRapidPerformanceLcdRefreshIsAtomic();
         testFirmwarePerformanceStepButtonsRefreshLcd();
         testStoreButtonReachesFirmwareMenu();
         testStoreRequesterStepButtonsChooseDestination();
+        testRepeatedSoundStoreCursor();
         testStoreCancelRestoresNumericPerformancePreview();
         testKeyboardControllerShiftReachesFirmware();
         testLowerKeyboardAssignableButtonsDriveFirmware();
@@ -4427,6 +4924,7 @@ int main()
         testA001DuplicateSoundAssignmentsHavePrivateInstrumentEdits();
         testInstrumentButtonsDoNotRewriteLayerOctaves();
         testInstrumentEditLayerSelection();
+        testInstrumentSourceKeepsOtherLayers();
         testPerformanceMuteAndSolo();
         testA013ComparatorAutoPan();
         testFactoryMultimodeFilterLoading();
@@ -4456,8 +4954,11 @@ int main()
         testEditSectionLedsAreMutuallyExclusive();
         testGroupEditUsesFirmwareSerialPageAndLed();
         testSelectedInstrumentSoftkeyFlashesOrangeOff();
+        testInstrumentModeRoundTripsKeepSelectionAndSolo();
         testModeLcdRedrawIsOneDisplayTransaction();
         testSequencerKeyDoesNotTrapPerformanceMode();
+        testDiskLoadStepDoesNotRepeat();
+        testDiskFormatNameCursor();
         testDiskCancelReturnsPerformanceModeLed();
         testExclusiveModesRejectOtherModeLeds();
         std::cout << "WaveIntegrationTests: all checks passed\n";

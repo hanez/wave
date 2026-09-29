@@ -35,6 +35,8 @@ public:
     }
     bool installEditRecords(std::span<const uint8_t> sound,
                             std::span<const uint8_t> performance) noexcept;
+    bool installPerformanceBank(std::span<const uint8_t> performances) noexcept;
+    bool installSoundBank(std::span<const uint8_t> sounds) noexcept;
     bool requestPerformanceSelection(int programIndex) noexcept;
     bool refreshCurrentScreenFromFirmware()
     {
@@ -72,6 +74,7 @@ public:
                                          uint8_t data2) const noexcept;
     bool releasePanelEventLatch(int buttonId) noexcept;
     bool navigatePageWithFirmware(bool forwards) noexcept;
+    bool stepDiskMenuWithFirmware(bool forwards) noexcept;
     bool stepStoreDestinationWithFirmware(bool forwards) noexcept;
     [[nodiscard]] bool panelActionBitActive(int buttonId) const noexcept;
     bool releasePanelActionBit(int buttonId) noexcept;
@@ -120,6 +123,7 @@ public:
     [[nodiscard]] std::optional<int> currentPerformanceId() const noexcept;
     [[nodiscard]] std::optional<uint32_t> currentPerformanceRecordOffset() const noexcept;
     [[nodiscard]] std::optional<int> currentPerformanceInstrument() const noexcept;
+    [[nodiscard]] std::optional<int> currentInstrumentEditTarget() const noexcept;
     [[nodiscard]] std::optional<uint32_t> currentSoundRecordOffset() const noexcept;
     [[nodiscard]] std::optional<uint32_t> performanceInstrumentSoundRecordOffset(
         int instrument) const noexcept;
@@ -168,6 +172,7 @@ public:
     [[nodiscard]] LcdVideoSnapshot lcdVideoSnapshot() const noexcept;
 
 private:
+    bool runPanelCallbacksWithFirmware(uint32_t callbackTable) noexcept;
     struct VirtualInitialisationFile
     {
         bool open = false;
