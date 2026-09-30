@@ -228,12 +228,30 @@ PPG_WAVETABLE_ROM=/path/to/ppg-eprom.bin \
 ctest --test-dir build --output-on-failure
 ```
 
+### macOS bundles and installer DMG
+
 On macOS, the Standalone, Audio Unit, VST3, and AAX artifacts are written below
 `build/WaveEmulation_artefacts`. macOS Release bundles are universal
 `arm64`/`x86_64` binaries and are unsigned by default. To sign a local release, explicitly set
 `WAVE_SIGN_RELEASE_ARTIFACTS=ON` and `WAVE_CODESIGN_IDENTITY` when configuring CMake. Distribution to normal Pro Tools systems additionally
 requires PACE wrapping with a Wave-specific WCGUID; the CMake AAX bundle is
 deliberately left unwrapped for use as the input to `wraptool`.
+
+To build the distributable macOS installer and DMG, including PACE wrapping
+with the Wave product WCGUID, Developer ID signing, notarization and stapling:
+
+```sh
+./Installer/build_installer.sh
+```
+
+Set `TEAM_ID`, `PACE_ACCOUNT`, and `PACE_WCGUID` for your release accounts.
+You can store shell assignments in `Installer/.env.local`, which is loaded
+automatically and ignored by Git. Use `${VARIABLE:-default}` assignments to
+preserve command-line environment overrides. Keep passwords in the keychain.
+The script uses the `wave-notary` keychain profile by default and accepts
+environment overrides documented at its top. For a local packaging check that
+does not contact PACE or Apple, use `SKIP_WRAP=1 SKIP_SIGN=1
+SKIP_NOTARIZE=1 SKIP_DMG=1`.
 
 ### Windows x64 build
 
@@ -331,21 +349,7 @@ a tested release, use a Windows VM or a Windows tester to check a VST3 DAW,
 audio/MIDI devices, loading locally obtained firmware, and preset save/recall.
 Review the uploaded editor PNGs for rendering problems as well.
 
-To build the distributable macOS installer and DMG, including PACE wrapping
-with the Wave product WCGUID, Developer ID signing, notarization and stapling:
-
-```sh
-./Installer/build_installer.sh
-```
-
-Set `TEAM_ID`, `PACE_ACCOUNT`, and `PACE_WCGUID` for your release accounts.
-You can store shell assignments in `Installer/.env.local`, which is loaded
-automatically and ignored by Git. Use `${VARIABLE:-default}` assignments to
-preserve command-line environment overrides. Keep passwords in the keychain.
-The script uses the `wave-notary` keychain profile by default and accepts
-environment overrides documented at its top. For a local packaging check that
-does not contact PACE or Apple, use `SKIP_WRAP=1 SKIP_SIGN=1
-SKIP_NOTARIZE=1 SKIP_DMG=1`.
+## MIDI and wavetable loading
 
 The Standalone automatically enables present and newly connected MIDI inputs. The on-screen keyboard plays MIDI notes 36–96, and the computer keyboard mapping `A W S E D F T G Y H U J K` plays C4 through C5. Host MIDI supports note velocity, sustain pedal, pitch bend, mod wheel, channel pressure, all-notes-off, and all-sound-off.
 
