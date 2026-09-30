@@ -31,9 +31,12 @@ set(WAVE_WINDOWS_LIBRARIES "")
 foreach(directory crt/lib/x86_64 sdk/lib/um/x86_64 sdk/lib/ucrt/x86_64)
     string(APPEND WAVE_WINDOWS_LIBRARIES " /libpath:\"${WAVE_WINDOWS_SDK_ROOT}/${directory}\"")
 endforeach()
-set(CMAKE_EXE_LINKER_FLAGS_INIT "${WAVE_WINDOWS_LIBRARIES} /manifest:no")
-set(CMAKE_SHARED_LINKER_FLAGS_INIT "${WAVE_WINDOWS_LIBRARIES} /manifest:no")
-set(CMAKE_MODULE_LINKER_FLAGS_INIT "${WAVE_WINDOWS_LIBRARIES} /manifest:no")
+# CMake's MSVC linker wrapper asks lld to embed manifests (EXE resource 1,
+# DLL resource 2). Preserve JUCE's Common Controls v6 dependency: disabling
+# manifests makes Windows load comctl32 v5, which lacks TaskDialogIndirect.
+set(CMAKE_EXE_LINKER_FLAGS_INIT "${WAVE_WINDOWS_LIBRARIES}")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "${WAVE_WINDOWS_LIBRARIES}")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT "${WAVE_WINDOWS_LIBRARIES}")
 set(CMAKE_FIND_ROOT_PATH "${WAVE_WINDOWS_SDK_ROOT}")
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)

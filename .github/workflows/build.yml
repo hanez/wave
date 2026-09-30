@@ -22,6 +22,11 @@ jobs:
         run: cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 -DWAVE_EMBED_PRIVATE_ASSETS=OFF -DWAVE_BUILD_TESTS=ON
       - name: Build
         run: cmake --build build-windows --config Release --parallel 3
+      - name: Check embedded Windows manifests
+        run: >-
+          python scripts/check-windows-manifests.py
+          --exe "build-windows/WaveEmulation_artefacts/Release/Standalone/Wave Emulation.exe"
+          --vst3 "build-windows/WaveEmulation_artefacts/Release/VST3/Wave Emulation.vst3"
       - name: Test
         env:
           WAVE_TEST_ARTIFACT_DIR: ${{ github.workspace }}/build-windows/test-results

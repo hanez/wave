@@ -4,19 +4,20 @@
 
 A JUCE C++ research instrument that recreates the documented Waldorf Wave signal path: 250 kHz 8-bit/time-multiplexed wavetable voices, the ES2 ASIC's signed mixer overflow, the ASIC's 12 dB digital high-pass, CEM3387 three-pole reconstruction and separately saturating nonlinear resonant four-pole low-pass sections, 12-bit control-voltage stepping, VCA/panning, and the 480 x 64 monochrome graphic LCD.
 
-## Download version 0.1.8
+## Downloads
 
 | Platform | Download | Included formats |
 | --- | --- | --- |
-| Windows x64 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.8/Wave-Emulation-0.1.8-Windows-x64.zip) | Standalone EXE and VST3 |
-| macOS 13.0 or later, Apple Silicon and Intel | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.8/DJW.Wave.Emulation.0.1.8.dmg) | Standalone app, AU, VST3 and AAX |
+| Windows x64 — 0.1.10 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.10/Wave-Emulation-0.1.10-Windows-x64.zip) | Standalone EXE and VST3 |
+| macOS 13.0 or later, Apple Silicon and Intel — 0.1.8 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.8/DJW.Wave.Emulation.0.1.8.dmg) | Standalone app, AU, VST3 and AAX |
 
-See the [0.1.8 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.8)
+See the [Windows 0.1.10 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.10)
+and [macOS 0.1.8 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.8)
 for release notes. The Windows build's
-[corresponding source](https://github.com/mo0kid/wave/releases/download/v0.1.8/Wave-Emulation-0.1.8-Source.zip)
+[corresponding source](https://github.com/mo0kid/wave/releases/download/v0.1.10/Wave-Emulation-0.1.10-Source.zip)
 includes its modified dependencies; use that archive to reproduce the released
 Windows binaries. The accompanying
-[SHA-256 checksums](https://github.com/mo0kid/wave/releases/download/v0.1.8/SHA256SUMS.txt)
+[SHA-256 checksums](https://github.com/mo0kid/wave/releases/download/v0.1.10/SHA256SUMS.txt)
 cover the Windows ZIP, its source archive and Windows release notes.
 
 Supply your own Wave OS 1.700 firmware and sound disks. Neither platform's
@@ -70,7 +71,21 @@ Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
 
-## What's new in 0.1.8
+## What's new in 0.1.10
+
+[Version 0.1.10](https://github.com/mo0kid/wave/releases/tag/v0.1.10) is a Windows
+maintenance release. It restores embedded Common Controls v6 manifests in the
+standalone EXE and VST3 DLL, addressing the **Ordinal 345 not found** startup
+error reported on Windows 10 in [issue #2](https://github.com/mo0kid/wave/issues/2).
+The build workflow now checks both manifests before running tests.
+
+Windows 10 runtime confirmation is pending. The native MSVC CI build also
+reports CPU-test crashes that remain under investigation. The macOS download
+remains version 0.1.8.
+
+## Version history
+
+### Version 0.1.8
 
 Version 0.1.8 is available for Windows x64 as a standalone EXE and VST3, as well
 as the macOS formats above. The Windows build improves window startup,
