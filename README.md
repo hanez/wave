@@ -4,6 +4,24 @@
 
 A JUCE C++ research instrument that recreates the documented Waldorf Wave signal path: 250 kHz 8-bit/time-multiplexed wavetable voices, the ES2 ASIC's signed mixer overflow, the ASIC's 12 dB digital high-pass, CEM3387 three-pole reconstruction and separately saturating nonlinear resonant four-pole low-pass sections, 12-bit control-voltage stepping, VCA/panning, and the 480 x 64 monochrome graphic LCD.
 
+## Download version 0.1.8
+
+| Platform | Download | Included formats |
+| --- | --- | --- |
+| Windows x64 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.8/Wave-Emulation-0.1.8-Windows-x64.zip) | Standalone EXE and VST3 |
+| macOS 13.0 or later, Apple Silicon and Intel | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.8/DJW.Wave.Emulation.0.1.8.dmg) | Standalone app, AU, VST3 and AAX |
+
+See the [0.1.8 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.8)
+for release notes. The Windows build's
+[corresponding source](https://github.com/mo0kid/wave/releases/download/v0.1.8/Wave-Emulation-0.1.8-Source.zip)
+includes its modified dependencies; use that archive to reproduce the released
+Windows binaries. The accompanying
+[SHA-256 checksums](https://github.com/mo0kid/wave/releases/download/v0.1.8/SHA256SUMS.txt)
+cover the Windows ZIP, its source archive and Windows release notes.
+
+Supply your own Wave OS 1.700 firmware and sound disks. Neither platform's
+release includes firmware, ROM archives or Wave factory sound SETs.
+
 Enjoying Wave Emulation? [Leave a tip on Ko-fi](https://ko-fi.com/djw_audio) to support its development.
 
 <a href="https://ko-fi.com/djw_audio"><img src="https://storage.ko-fi.com/cdn/kofi5.png?v=3" height="36" alt="Support development with a tip on Ko-fi"></a>
@@ -22,16 +40,20 @@ Use **Cmd/Ctrl + =** and **Cmd/Ctrl + -** to zoom the editor in and out, **Cmd/C
 
 ## Installing the Windows release
 
-The Windows x64 ZIP contains a portable standalone EXE and the VST3 plug-in.
-Extract the ZIP before launching `Standalone/Wave Emulation.exe`. To install the
-plug-in, copy the entire `VST3/Wave Emulation.vst3` folder into
-`C:\Program Files\Common Files\VST3`, then rescan plug-ins in your DAW.
-Windows may require administrator permission to copy into Program Files.
-The build uses the static Microsoft C++ runtime and includes no firmware or
-Wave factory SET. Follow the firmware and sound-disk loading instructions below.
+1. Download and extract the Windows ZIP. Run
+   `Standalone/Wave Emulation.exe` to use the portable standalone application.
+2. To install the VST3, quit your DAW and copy the entire
+   `VST3/Wave Emulation.vst3` folder into
+   `C:\Program Files\Common Files\VST3`. Copying into Program Files may require
+   administrator permission. Reopen your DAW and rescan plug-ins, then add
+   **Wave Emulation** as a virtual instrument.
+3. Load your firmware folder and sound disk in the standalone or plug-in using
+   the [firmware and sound-disk instructions](#before-you-start-system-and-sound-floppies).
 
-The release binaries are unsigned. Corresponding source and SHA-256 checksums
-accompany the binary ZIP.
+The Windows binaries are unsigned and do not require a separate Visual C++
+redistributable installation. The ZIP includes installation instructions and
+licenses. Windows builds include VST3 and standalone formats; AU and AAX are
+available in the macOS release.
 
 ## Installing the macOS release
 
@@ -40,12 +62,19 @@ Plugin use also requires a host compatible with your macOS version. CPU and RAM
 minimums have not yet been established by testing. Earlier release binaries may
 have a higher macOS minimum; they must be rebuilt to support Ventura.
 
-Run the installer inside the release DMG. Starting with version 0.1.2, it installs
+Download the macOS DMG linked above and run the installer inside it.
+Starting with version 0.1.2, it installs
 **Wave Emulation.app** in `/Applications` as well as the AU, VST3, and AAX plugins.
 Quit any older standalone instance, then launch `/Applications/Wave Emulation.app`.
 Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
+
+## What's new in 0.1.8
+
+Version 0.1.8 is available for Windows x64 as a standalone EXE and VST3, as well
+as the macOS formats above. The Windows build improves window startup,
+shutdown and UI refresh when display refresh notifications are unavailable.
 
 Version 0.1.8 preserves saved Sound parameters, including oscillator octave,
 when switching Performances and layers. It also prevents a display refresh
@@ -57,6 +86,8 @@ cannot write to Transpose or another page's parameter. The TuneTable slider's
 choices now follow the displayed positions, and HMT changes preserve the pitch
 of held and newly played notes. Window zoom and keyboard visibility shortcuts
 are available in the System menu.
+
+### Earlier releases
 
 Version 0.1.7 fixes repeated or missed front-panel actions in Disk, Store, and
 Instrument Edit, including name cursors and Load-menu stepping. It also keeps
@@ -82,7 +113,7 @@ instances' firmware-emulator execution state independent, and connects voice-car
 workers to the host's macOS audio workgroup when provided. Version 0.1.3 remains
 withdrawn; users of that version should update to 0.1.5.
 
-### CPU load in Logic Pro
+## CPU load in Logic Pro
 
 Wave can split voice processing across three threads at higher polyphony.
 Light loads and very short audio segments run serially to avoid worker overhead;
@@ -97,7 +128,7 @@ plugin's processing. See [Apple's multithreading guide](https://support.apple.co
 ## Before you start: system and sound floppies
 
 **You must obtain your own Waldorf Wave system floppy files to run the original
-operating system in this emulation.** The installer/DMG does not contain the
+operating system in this emulation.** The release packages do not contain the
 Wave system ROM, voice firmware, factory sound disks, or floppy images. The
 included PPG wavetables are sound data, not the Wave operating system.
 
@@ -119,13 +150,14 @@ included PPG wavetables are sound data, not the Wave operating system.
    image. These extensions must contain a supported raw floppy image, not a ZIP.
    Use the Wave panel's Disk controls to load its contents.
 4. If you have a Wave `.set` file instead, choose **Create Disk Image from Wave
-   Setup...** to create and mount a 720 KB DD image. A new blank disk contains
+   Setup...** to create and mount a 720 KB DD image, then confirm the SET import
+   with the Wave panel's **OK** button. Creating a blank disk instead provides
    no system firmware or factory sounds.
 
 Until a sound SET is imported, the public build starts with one INIT
 performance. Performance -/+ cannot select another patch from that empty bank.
-Confirm the SET import with the Wave panel's OK button. Each plug-in instance
-has its own sound-bank state; loading a disk in the standalone does not load it
+Each plug-in instance has its own sound-bank state; loading a disk in the
+standalone does not load it
 into a DAW instance. Saving the DAW project preserves that instance's bank.
 
 The app can open without firmware and provide its behavioural synthesis
@@ -196,7 +228,7 @@ PPG_WAVETABLE_ROM=/path/to/ppg-eprom.bin \
 ctest --test-dir build --output-on-failure
 ```
 
-The Standalone, Audio Unit, VST3, and AAX artifacts are written below
+On macOS, the Standalone, Audio Unit, VST3, and AAX artifacts are written below
 `build/WaveEmulation_artefacts`. macOS Release bundles are universal
 `arm64`/`x86_64` binaries and are unsigned by default. To sign a local release, explicitly set
 `WAVE_SIGN_RELEASE_ARTIFACTS=ON` and `WAVE_CODESIGN_IDENTITY` when configuring CMake. Distribution to normal Pro Tools systems additionally
