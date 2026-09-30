@@ -76,7 +76,7 @@ Version 0.1.8 is available for Windows x64 as a standalone EXE and VST3, as well
 as the macOS formats above. The Windows build improves window startup,
 shutdown and UI refresh when display refresh notifications are unavailable.
 
-Version 0.1.8 preserves saved Sound parameters, including oscillator octave,
+[Version 0.1.8](https://github.com/mo0kid/wave/releases/tag/v0.1.8) preserves saved Sound parameters, including oscillator octave,
 when switching Performances and layers. It also prevents a display refresh
 from replacing a Performance name during Store, clears inactive destination
 layers when overwriting a Performance, and handles brief Store Cancel clicks.
@@ -89,7 +89,7 @@ are available in the System menu.
 
 ### Earlier releases
 
-Version 0.1.7 fixes repeated or missed front-panel actions in Disk, Store, and
+[Version 0.1.7](https://github.com/mo0kid/wave/releases/tag/v0.1.7) fixes repeated or missed front-panel actions in Disk, Store, and
 Instrument Edit, including name cursors and Load-menu stepping. It also keeps
 Performance program names and layered sounds consistent when switching modes.
 
