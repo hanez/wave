@@ -1,10 +1,35 @@
 #include "PluginProcessor.h"
 #include "PanelWiring.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+
+namespace
+{
+// macOS CI's libc++ does not yet provide jthread/stop_token. Keep the same
+// exception-safe shutdown with an atomic stop flag and an ordinary thread.
+class RenderThread
+{
+public:
+    template <typename Function>
+    explicit RenderThread(Function render)
+        : worker([this, render] { render(stop); }) {}
+    ~RenderThread()
+    {
+        stop.store(true);
+        worker.join();
+    }
+    RenderThread(const RenderThread&) = delete;
+    RenderThread& operator=(const RenderThread&) = delete;
+
+private:
+    std::atomic<bool> stop { false };
+    std::thread worker;
+};
+}
 
 int main(int argc, char** argv)
 {
@@ -113,11 +138,11 @@ int main(int argc, char** argv)
                 return 0;
             }
             std::atomic<unsigned> renderedBlocks { 0 };
-            std::jthread concurrentRender([&](std::stop_token stop)
+            RenderThread concurrentRender([&](const std::atomic<bool>& stop)
             {
                 juce::AudioBuffer<float> audio(2, 512);
                 juce::MidiBuffer midi;
-                while (!stop.stop_requested())
+                while (!stop.load())
                 {
                     {
                         const juce::ScopedLock lock(processor->getCallbackLock());
@@ -202,11 +227,11 @@ int main(int argc, char** argv)
                 || unrelatedPreference.getFile().loadFileAsString() != missingDefault)
                 throw std::runtime_error("Project recall replaced the default firmware preference");
         }
-        auto render = [](std::stop_token stop, WaveEmulationAudioProcessor* processor)
+        auto render = [](const std::atomic<bool>& stop, WaveEmulationAudioProcessor* processor)
         {
             juce::AudioBuffer<float> audio(2, 128);
             juce::MidiBuffer midi;
-            while (!stop.stop_requested())
+            while (!stop.load())
             {
                 const juce::ScopedLock lock(processor->getCallbackLock());
                 audio.clear();
@@ -214,8 +239,8 @@ int main(int argc, char** argv)
                 processor->processBlock(audio, midi);
             }
         };
-        std::jthread firstRender(render, first.get());
-        std::jthread secondRender(render, second.get());
+        RenderThread firstRender([&](const std::atomic<bool>& stop) { render(stop, first.get()); });
+        RenderThread secondRender([&](const std::atomic<bool>& stop) { render(stop, second.get()); });
         for (int recall = 0; recall < 8; ++recall)
         {
             juce::MemoryBlock state;

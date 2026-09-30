@@ -33,6 +33,10 @@ SOFTWARE.
 ## JUCE 8.0.15 and bundled dependencies
 
 JUCE is fetched from https://github.com/juce-framework/JUCE at tag `8.0.15`.
+The build applies `cmake/PrepareJuce.cmake` to the fetched checkout. This changes
+the Windows VBlank thread to observe thread shutdown and send paced repaint
+notifications when `IDXGIOutput::WaitForVBlank` fails. This prevents frozen
+repaints and window-recreation deadlocks under Wine. The rest of the pinned JUCE source is unchanged.
 Its framework modules are dual-licensed under AGPLv3 and the commercial JUCE
 license. This project's GPL-3.0-or-later license does not replace JUCE's terms.
 The upstream notice and dependency license index are reproduced in

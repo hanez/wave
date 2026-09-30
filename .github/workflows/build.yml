@@ -1,5 +1,5 @@
 name: Public source build
-on: [push, pull_request]
+on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
@@ -15,6 +15,7 @@ jobs:
         run: ctest --test-dir build --output-on-failure
   windows:
     runs-on: windows-2022
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Configure without private data
@@ -22,6 +23,9 @@ jobs:
       - name: Build
         run: cmake --build build-windows --config Release --parallel 3
       - name: Test
+        env:
+          WAVE_TEST_ARTIFACT_DIR: ${{ github.workspace }}/build-windows/test-results
+          WAVE_TEST_NATIVE_WINDOW: "1"
         run: ctest --test-dir build-windows -C Release --output-on-failure
       - name: Check Windows artifacts
         shell: pwsh
@@ -29,11 +33,60 @@ jobs:
           $output = "build-windows/WaveEmulation_artefacts/Release"
           if (-not (Test-Path "$output/Standalone/Wave Emulation.exe")) { throw "Standalone app is missing" }
           if (-not (Test-Path "$output/VST3/Wave Emulation.vst3")) { throw "VST3 bundle is missing" }
+      - name: Launch and close standalone on Windows
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path "build-windows/WaveEmulation_artefacts/Release/Standalone/Wave Emulation.exe").Path
+          $app = Start-Process -FilePath $exe -PassThru
+          try {
+            $deadline = (Get-Date).AddSeconds(30)
+            do {
+              Start-Sleep -Milliseconds 500
+              $app.Refresh()
+              if ($app.HasExited) { throw "Standalone exited before opening a window ($($app.ExitCode))" }
+            } while ($app.MainWindowHandle -eq 0 -and (Get-Date) -lt $deadline)
+            if ($app.MainWindowHandle -eq 0) { throw "Standalone did not open a window" }
+            Start-Sleep -Seconds 5
+            $app.Refresh()
+            if ($app.HasExited -or -not $app.Responding) { throw "Standalone crashed or stopped responding" }
+            if (-not $app.CloseMainWindow()) { throw "Standalone refused to close" }
+            if (-not $app.WaitForExit(30000)) { throw "Standalone shutdown timed out" }
+            if ($app.ExitCode -ne 0) { throw "Standalone exited with code $($app.ExitCode)" }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+      - name: Validate VST3 with pluginval
+        shell: pwsh
+        run: |
+          Invoke-WebRequest "https://github.com/Tracktion/pluginval/releases/download/v1.0.4/pluginval_Windows.zip" -OutFile "$env:RUNNER_TEMP/pluginval.zip"
+          Expand-Archive "$env:RUNNER_TEMP/pluginval.zip" "$env:RUNNER_TEMP/pluginval"
+          $validator = (Get-ChildItem "$env:RUNNER_TEMP/pluginval" -Recurse -Filter pluginval.exe | Select-Object -First 1).FullName
+          if (-not $validator) { throw "pluginval executable is missing" }
+          $plugin = (Resolve-Path "build-windows/WaveEmulation_artefacts/Release/VST3/Wave Emulation.vst3").Path
+          & $validator --strictness-level 5 --validate $plugin 2>&1 | Tee-Object -FilePath "build-windows/test-results/pluginval.log"
+          if ($LASTEXITCODE -ne 0) { throw "VST3 validation failed ($LASTEXITCODE)" }
+      - name: Upload Windows test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wave-emulation-windows-test-results
+          path: |
+            build-windows/test-results/
+            build-windows/Testing/Temporary/
+          if-no-files-found: warn
+      - name: Include license and source information
+        shell: pwsh
+        run: |
+          $package = "build-windows/package"
+          New-Item -ItemType Directory -Force "$package/Standalone", "$package/VST3" | Out-Null
+          Copy-Item "build-windows/WaveEmulation_artefacts/Release/Standalone/Wave Emulation.exe" "$package/Standalone/"
+          Copy-Item "build-windows/WaveEmulation_artefacts/Release/VST3/Wave Emulation.vst3" "$package/VST3/" -Recurse
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, README.md $package
+          Copy-Item LICENSES "$package/LICENSES" -Recurse
+          "Source: https://github.com/${{ github.repository }}/tree/${{ github.sha }}`nBuild: Windows x64 Release, private assets disabled" | Set-Content "$package/BUILD.txt"
       - name: Upload Windows app and VST3
         uses: actions/upload-artifact@v4
         with:
           name: wave-emulation-windows-x64
-          path: |
-            build-windows/WaveEmulation_artefacts/Release/Standalone/
-            build-windows/WaveEmulation_artefacts/Release/VST3/
+          path: build-windows/package/
           if-no-files-found: error

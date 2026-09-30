@@ -14,6 +14,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Keep Windows downloads self-contained, including the standalone executable.
+# Apply the same CRT choice to JUCE, Musashi, plugins and tests.
+if(MSVC AND NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
+        CACHE STRING "MSVC runtime library")
+endif()
+
 option(WAVE_BUILD_TESTS "Build deterministic DSP and firmware tests" ON)
 
 # Build universal macOS bundles. Distribution signing is an explicit opt-in.
@@ -33,6 +40,8 @@ FetchContent_Declare(
     GIT_TAG 8.0.15
     GIT_SHALLOW TRUE)
 FetchContent_MakeAvailable(JUCE)
+include(cmake/PrepareJuce.cmake)
+wave_prepare_juce("${juce_SOURCE_DIR}")
 
 FetchContent_Declare(
     Musashi
@@ -221,6 +230,14 @@ else()
     set(WAVE_PLUGIN_FORMATS VST3 Standalone)
 endif()
 
+# JUCE's manifest helper is executed directly after linking and cannot run on
+# the build host during Windows cross-compilation. VST3 hosts can scan the
+# bundle without this optional JSON manifest.
+set(WAVE_VST3_AUTO_MANIFEST TRUE)
+if(CMAKE_CROSSCOMPILING)
+    set(WAVE_VST3_AUTO_MANIFEST FALSE)
+endif()
+
 juce_add_plugin(WaveEmulation
     COMPANY_NAME "DJW"
     BUNDLE_ID "com.DJW.WaveEmulation"
@@ -235,6 +252,7 @@ juce_add_plugin(WaveEmulation
     NEEDS_MIDI_OUTPUT FALSE
     IS_MIDI_EFFECT FALSE
     EDITOR_WANTS_KEYBOARD_FOCUS TRUE
+    VST3_AUTO_MANIFEST ${WAVE_VST3_AUTO_MANIFEST}
     COPY_PLUGIN_AFTER_BUILD FALSE)
 
 target_sources(WaveEmulation PRIVATE

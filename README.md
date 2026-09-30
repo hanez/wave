@@ -20,6 +20,19 @@ The editor embeds `media/WaldorfWaveUI_NOLOGO.svg` as its 2338 x 1042 source art
 
 Use **Cmd/Ctrl + =** and **Cmd/Ctrl + -** to zoom the editor in and out, **Cmd/Ctrl + 0** for actual size, and **Cmd/Ctrl + K** to show or hide the lower keyboard and controller area. The same actions are in the System menu. Hiding the lower area shortens the window while keeping the upper panel at the same scale.
 
+## Installing the Windows release
+
+The Windows x64 ZIP contains a portable standalone EXE and the VST3 plug-in.
+Extract the ZIP before launching `Standalone/Wave Emulation.exe`. To install the
+plug-in, copy the entire `VST3/Wave Emulation.vst3` folder into
+`C:\Program Files\Common Files\VST3`, then rescan plug-ins in your DAW.
+Windows may require administrator permission to copy into Program Files.
+The build uses the static Microsoft C++ runtime and includes no firmware or
+Wave factory SET. Follow the firmware and sound-disk loading instructions below.
+
+The release binaries are unsigned. Corresponding source and SHA-256 checksums
+accompany the binary ZIP.
+
 ## Installing the macOS release
 
 Builds target macOS Ventura 13.0 or later on Apple Silicon and Intel Macs.
@@ -109,6 +122,12 @@ included PPG wavetables are sound data, not the Wave operating system.
    Setup...** to create and mount a 720 KB DD image. A new blank disk contains
    no system firmware or factory sounds.
 
+Until a sound SET is imported, the public build starts with one INIT
+performance. Performance -/+ cannot select another patch from that empty bank.
+Confirm the SET import with the Wave panel's OK button. Each plug-in instance
+has its own sound-bank state; loading a disk in the standalone does not load it
+into a DAW instance. Saving the DAW project preserves that instance's bank.
+
 The app can open without firmware and provide its behavioural synthesis
 fallback, but that does not run the original Wave operating system. Mounting a
 sound disk alone does not supply the system firmware. This implementation does
@@ -140,7 +159,7 @@ That makes this a useful, buildable hardware-model foundation rather than a fals
 
 ## Build
 
-Requirements: CMake 3.25+, Ninja or Xcode, and a C++20 compiler. JUCE 8.0.15 is fetched automatically.
+Requirements: CMake 3.25+, Ninja, Xcode or Visual Studio 2022, and a C++20 compiler. JUCE 8.0.15 is fetched automatically.
 
 ```sh
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
@@ -199,8 +218,86 @@ The `.exe` and `.vst3` bundle are under
 `build-windows/WaveEmulation_artefacts/Release`. Copy the VST3 bundle to
 `C:\Program Files\Common Files\VST3` to use it in a VST3 host. The standalone
 app can run directly from its build folder. Windows builds do not include AU or
-AAX. The public source CI workflow builds and tests Windows x64 and uploads
-the app and VST3 as a downloadable workflow artifact.
+AAX. The default Windows build links the C++ runtime statically, so these
+downloads do not require a separate Visual C++ redistributable installer.
+
+### Testing Windows without a Windows computer
+
+For local testing on macOS, `cmake/WindowsLLVMToolchain.cmake` builds Windows
+x64 binaries with `clang-cl`, `lld-link`, and Microsoft's headers/libraries
+downloaded with [xwin](https://github.com/Jake-Shadle/xwin). Accept Microsoft's
+license before downloading the SDK. JUCE 8 does not support MinGW compilation;
+use the MSVC target provided by this toolchain. The build applies a small JUCE
+VBlank-thread fallback so unsupported DXGI refresh calls in Wine still trigger
+repaints and cannot deadlock window creation or teardown.
+
+With CrossOver installed and a Windows 10 64-bit bottle named
+`Wave Windows Testing`, configure a Release build:
+
+```sh
+cmake -S . -B build-windows-local/msvc -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/WindowsLLVMToolchain.cmake" \
+  -DWAVE_WINDOWS_SDK_ROOT="$PWD/build-windows-local/sdk" \
+  -DWAVE_CLANG_CL=/opt/homebrew/opt/llvm/bin/clang-cl \
+  -DWAVE_LLD_LINK="$PWD/build-windows-local/toolchain/bin/lld-link" \
+  -DCMAKE_CROSSCOMPILING_EMULATOR="/usr/bin/python3;$PWD/scripts/run-windows-crossover.py" \
+  -DWAVE_EMBED_PRIVATE_ASSETS=OFF
+cmake --build build-windows-local/msvc --parallel 4
+WAVE_TEST_NATIVE_WINDOW=1 WAVE_TEST_ARTIFACT_DIR="$PWD/build-windows-local/evidence" \
+  ctest --test-dir build-windows-local/msvc --output-on-failure
+```
+
+Supply the paths to your installed tools and xwin SDK. The SDK must include
+the x64 release CRT. Cross builds omit the optional VST3 `moduleinfo.json`;
+hosts can scan the plugin DLL directly. The runner uses CrossOver's configured
+bottle directory, or `CX_BOTTLE_PATH`, and accepts an alternate bottle name
+through `WAVE_CROSSOVER_BOTTLE`. It also runs the standalone executable:
+
+```sh
+WAVE_CROSSOVER_GUI=1 python3 scripts/run-windows-crossover.py \
+  'build-windows-local/msvc/WaveEmulation_artefacts/Release/Standalone/Wave Emulation.exe'
+```
+
+Install Windows REAPER in the same bottle and copy the complete VST3 bundle to
+that bottle's `C:\Program Files\Common Files\VST3` directory for DAW testing.
+Load your locally obtained firmware through Wave's System menu. CrossOver
+testing covers Windows binaries on Wine; native Windows audio/MIDI drivers
+still require a Windows computer or VM.
+
+`WAVE_TEST_NATIVE_WINDOW=1` also opens, recreates and closes a real editor window
+in the public editor test. `WAVE_CROSSOVER_GUI=1` uses Windows ShellExecute for
+interactive launches; omit it for test executables and build generators.
+
+The **Public source build** GitHub Actions workflow uses a Windows x64 runner
+to build the standalone app and VST3. It runs on pushes and pull requests and
+can also be started from the workflow's **Run workflow** button. Its Windows
+job checks:
+
+- DSP/core tests, concurrent 68000 instances, and host state save/recall.
+- Editor creation, rendering, zoom, keyboard visibility and reopening, using
+  public assets without embedded firmware.
+- The actual standalone executable opens a responsive window and closes cleanly.
+- The built VST3 passes pluginval 1.0.4 at strictness level 5.
+
+After a successful job, download **wave-emulation-windows-x64** from the run's
+Artifacts section. The ZIP contains `Standalone/Wave Emulation.exe`, the
+`VST3/Wave Emulation.vst3` bundle, licenses, and the source revision in `BUILD.txt`.
+**wave-emulation-windows-test-results** contains editor PNGs, CTest logs and
+the pluginval log, including available diagnostics from failed jobs.
+
+For example, download a particular run's build from your Mac using GitHub CLI:
+
+```sh
+gh run download RUN_ID --repo mo0kid/wave --name wave-emulation-windows-x64
+```
+
+CI verifies Windows execution and plugin API behaviour without an audio device.
+It does not establish audio-driver latency, MIDI hardware compatibility, DAW
+compatibility or firmware-backed operation. Before calling the Windows build
+a tested release, use a Windows VM or a Windows tester to check a VST3 DAW,
+audio/MIDI devices, loading locally obtained firmware, and preset save/recall.
+Review the uploaded editor PNGs for rendering problems as well.
 
 To build the distributable macOS installer and DMG, including PACE wrapping
 with the Wave product WCGUID, Developer ID signing, notarization and stapling:

@@ -7,6 +7,11 @@ target_link_libraries(WaveCoreTests
         juce::juce_recommended_warning_flags)
 
 add_test(NAME WaveCoreTests COMMAND WaveCoreTests)
+if(MSVC)
+    # The DSP and firmware test fixtures need more than Windows' 1 MB default.
+    target_link_options(WaveCoreTests PRIVATE /STACK:8388608)
+endif()
+set_tests_properties(WaveCoreTests PROPERTIES TIMEOUT 120)
 
 find_package(Threads REQUIRED)
 add_executable(M68000ThreadTests M68000ThreadTests.cpp ../Source/Firmware/M68000.cpp)
@@ -20,6 +25,12 @@ target_include_directories(WaveHostStateTests PRIVATE ../Source)
 target_link_libraries(WaveHostStateTests PRIVATE WaveEmulation juce::juce_audio_utils Threads::Threads)
 add_test(NAME WaveHostStateTests COMMAND WaveHostStateTests)
 set_tests_properties(WaveHostStateTests PROPERTIES TIMEOUT 120)
+
+add_executable(WavePublicEditorTests WavePublicEditorTests.cpp)
+target_include_directories(WavePublicEditorTests PRIVATE ../Source)
+target_link_libraries(WavePublicEditorTests PRIVATE WaveEmulation juce::juce_audio_utils)
+add_test(NAME WavePublicEditorTests COMMAND WavePublicEditorTests)
+set_tests_properties(WavePublicEditorTests PROPERTIES TIMEOUT 60)
 
 if(WAVE_HAS_PRIVATE_ROMS)
     add_executable(WaveIntegrationTests WaveIntegrationTests.cpp)

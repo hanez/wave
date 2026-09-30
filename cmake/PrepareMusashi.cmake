@@ -15,12 +15,17 @@ function(wave_prepare_musashi source destination)
     foreach(filename m68kcpu.c m68kcpu.h)
         file(READ "${source}/${filename}" contents)
         foreach(symbol IN LISTS execution_state)
-            set(pattern "(^|\n)([ \t]*)(extern |static )?((unsigned int|int|sint|uint|m68ki_cpu_core|sigjmp_buf|jmp_buf)[ \t]+${symbol}[ \t]*[;=])")
+            # Capture the whole prefix, which always participates in the match.
+            # CMake < 4.1 rejects a backreference to an unmatched optional group.
+            set(pattern "(^|\n)([ \t]*(extern |static )?)((unsigned int|int|sint|uint|m68ki_cpu_core|sigjmp_buf|jmp_buf)[ \t]+${symbol}[ \t]*[;=])")
             if(filename STREQUAL "m68kcpu.c" AND NOT contents MATCHES "${pattern}")
                 message(FATAL_ERROR "Musashi execution-state declaration changed: ${symbol}")
             endif()
-            string(REGEX REPLACE "${pattern}" "\\1\\2\\3WAVE_M68K_THREAD_LOCAL \\4"
-                   contents "${contents}")
+            # Some symbols occur only in the implementation, not the header.
+            if(contents MATCHES "${pattern}")
+                string(REGEX REPLACE "${pattern}" "\\1\\2WAVE_M68K_THREAD_LOCAL \\4"
+                       contents "${contents}")
+            endif()
         endforeach()
         set(existing "")
         if(EXISTS "${destination}/${filename}")
