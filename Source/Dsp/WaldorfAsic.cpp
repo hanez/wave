@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <vector>
 
 namespace wave::dsp
@@ -438,9 +440,98 @@ size_t WavetableBank::index(int table, int position, int sampleIndex) noexcept
            * samplesPerWave + static_cast<size_t>(sampleIndex);
 }
 
+void AsicResampler::prepare(double hostSampleRate)
+{
+    // Coefficients are shared by all voices and only built during prepare.
+    static std::mutex cacheMutex;
+    static std::map<double, std::weak_ptr<const Kernel>> cache;
+    const auto rate = juce::jmax(1.0, hostSampleRate);
+    const std::lock_guard<std::mutex> lock(cacheMutex);
+    kernel = cache[rate].lock();
+    if (kernel == nullptr)
+    {
+        auto next = std::make_shared<Kernel>();
+        const auto bandwidth = juce::jmin(rate, OscillatorChipProxy::modelClockRate());
+        const auto ratio = OscillatorChipProxy::modelClockRate() / bandwidth;
+        // Blackman-windowed sinc: flat through 0.40 * bandwidth, with a
+        // transition centred at 0.45 and rejection by host Nyquist. Bound
+        // storage for pathological non-audio rates; normal audio rates use
+        // the full 96-tap-per-output-period design.
+        next->taps = 4 * static_cast<int>(std::ceil(juce::jmin(8192.0, 24.0 * ratio)));
+        next->coefficients.resize(static_cast<size_t>((phaseCount + 1) * next->taps));
+        const auto cutoff = 0.45 / ratio;
+        const auto radius = static_cast<double>(next->taps) * 0.5;
+        for (int phaseIndex = 0; phaseIndex <= phaseCount; ++phaseIndex)
+        {
+            const auto fraction = static_cast<double>(phaseIndex) / phaseCount;
+            auto sum = 0.0;
+            auto* coefficients = next->coefficients.data() + phaseIndex * next->taps;
+            for (int tap = 0; tap < next->taps; ++tap)
+            {
+                const auto distance = static_cast<double>(tap) + fraction - radius;
+                const auto angle = twoPi * cutoff * distance;
+                const auto sinc = std::abs(angle) < 1.0e-12 ? 1.0 : std::sin(angle) / angle;
+                const auto window = 0.42 + 0.5 * std::cos(juce::MathConstants<double>::pi
+                                                         * distance / radius)
+                                         + 0.08 * std::cos(twoPi * distance / radius);
+                coefficients[tap] = static_cast<float>(2.0 * cutoff * sinc * window);
+                sum += coefficients[tap];
+            }
+            for (int tap = 0; tap < next->taps; ++tap)
+                coefficients[tap] = static_cast<float>(coefficients[tap] / sum);
+        }
+        kernel = next;
+        cache[rate] = kernel;
+    }
+    // Mirroring the ring keeps the dot products contiguous without per-tap
+    // modulus operations. No allocations or coefficient generation in render.
+    history.resize(static_cast<size_t>(2 * kernel->taps));
+    reset();
+}
+
+void AsicResampler::reset() noexcept
+{
+    std::fill(history.begin(), history.end(), 0.0f);
+    head = 0;
+}
+
+void AsicResampler::push(float sample) noexcept
+{
+    if (--head < 0)
+        head = kernel->taps - 1;
+    history[static_cast<size_t>(head)] = sample;
+    history[static_cast<size_t>(head + kernel->taps)] = sample;
+}
+
+float AsicResampler::read(double fractionalTick) const noexcept
+{
+    const auto phase = juce::jlimit(0.0, 1.0, fractionalTick) * phaseCount;
+    const auto index = juce::jmin(phaseCount - 1, static_cast<int>(phase));
+    const auto blend = static_cast<float>(phase - index);
+    const auto* first = kernel->coefficients.data() + index * kernel->taps;
+    const auto* second = first + kernel->taps;
+    const auto* samples = history.data() + head;
+    // Independent lanes let the compiler vectorise both dot products without
+    // enabling fast-math or reassociating a single serial accumulation.
+    std::array<float, 4> a {};
+    std::array<float, 4> b {};
+    for (int tap = 0; tap < kernel->taps; tap += 4)
+    {
+        for (int lane = 0; lane < 4; ++lane)
+        {
+            a[static_cast<size_t>(lane)] += samples[tap + lane] * first[tap + lane];
+            b[static_cast<size_t>(lane)] += samples[tap + lane] * second[tap + lane];
+        }
+    }
+    const auto firstSum = (a[0] + a[1]) + (a[2] + a[3]);
+    const auto secondSum = (b[0] + b[1]) + (b[2] + b[3]);
+    return firstSum + blend * (secondSum - firstSum);
+}
+
 void OscillatorChipProxy::prepare(double hostSampleRate)
 {
     sampleRate = juce::jmax(1.0, hostSampleRate);
+    resampler.prepare(sampleRate);
     reset();
 }
 
@@ -449,6 +540,7 @@ void OscillatorChipProxy::reset(double startPhase) noexcept
     phase = startPhase - std::floor(startPhase);
     clockPhase = 1.0;
     heldSample = 0.0f;
+    resampler.reset();
 }
 
 void OscillatorChipProxy::setFrequency(float frequencyHz) noexcept
@@ -465,8 +557,9 @@ float OscillatorChipProxy::process(const WavetableBank& bank, int table, float p
     {
         clockPhase -= 1.0;
         heldSample = tick(bank, table, position, smoothPosition);
+        resampler.push(heldSample);
     }
-    return heldSample;
+    return resampler.read(clockPhase);
 }
 
 float OscillatorChipProxy::tick(const WavetableBank& bank, int table, float position,
@@ -592,6 +685,11 @@ void ReconstructionStage::setAge(float amount) noexcept
 void ReconstructionStage::updateCoefficients() noexcept
 {
     coefficientAge = age;
+    // The DAC input is rounded to one of 255 signed levels. Cache the exact
+    // nonlinear transfer at those levels instead of calling tanh at 250 kHz.
+    for (int code = -127; code <= 127; ++code)
+        saturatedLevels[static_cast<size_t>(code + 127)] = std::tanh(
+            (static_cast<float>(code) / 127.0f) * (1.0f + age * 0.16f));
     const auto cutoff = 15400.0f;
     firstPoleCoefficient = 1.0f
                            - std::exp(-juce::MathConstants<float>::twoPi * cutoff * 0.5f
@@ -611,15 +709,16 @@ float ReconstructionStage::process(float input) noexcept
     // The PD508 output is an eight-bit multiplexed level feeding a held and
     // reconstructed analogue path. These are observable boundary behaviours;
     // no undocumented oscillator-chip internals are assumed here.
-    const auto quantised = std::round(juce::jlimit(-1.0f, 1.0f, input) * 127.0f) / 127.0f;
+    const auto code = static_cast<int>(std::round(
+        juce::jlimit(-1.0f, 1.0f, input) * 127.0f));
     // OscillatorChipProxy has already performed the digital sample-and-hold:
     // its output only changes when the emulated oscillator clock advances.
     // Following that held value with an 18 ms one-pole here would model a
     // second, non-existent hold as an audio low-pass at about 9 Hz, removing
     // virtually the entire wavetable signal.  The PD508 level therefore
     // drives the analogue reconstruction filter directly.
-    heldLevel = quantised;
-    const auto slewInput = std::tanh(heldLevel * (1.0f + age * 0.16f));
+    heldLevel = static_cast<float>(code) / 127.0f;
+    const auto slewInput = saturatedLevels[static_cast<size_t>(code + 127)];
     // CEM3387 datasheet application: the fixed three-pole reconstruction
     // section is a one-pole followed by a second-order 1 dB Chebyshev stage.
     // Its first pole is half the final pole frequency and the second-order

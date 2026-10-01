@@ -46,6 +46,9 @@ public:
     {
         return loadedImage;
     }
+    [[nodiscard]] juce::MemoryBlock imageWithStoredBanks(
+        std::span<const uint8_t> storedSounds,
+        std::span<const uint8_t> storedPerformances) const;
 
 private:
     static constexpr size_t soundBankOffset = 0x12e7c;

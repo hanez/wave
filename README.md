@@ -9,10 +9,10 @@ A JUCE C++ research instrument that recreates the documented Waldorf Wave signal
 | Platform | Download | Included formats |
 | --- | --- | --- |
 | Windows x64 — 0.1.10 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.10/Wave-Emulation-0.1.10-Windows-x64.zip) | Standalone EXE and VST3 |
-| macOS 13.0 or later, Apple Silicon and Intel — 0.1.8 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.8/DJW.Wave.Emulation.0.1.8.dmg) | Standalone app, AU, VST3 and AAX |
+| macOS 13.0 or later, Apple Silicon and Intel — 0.1.11 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.11/DJW.Wave.Emulation.0.1.11.dmg) | Standalone app, AU, VST3 and AAX |
 
 See the [Windows 0.1.10 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.10)
-and [macOS 0.1.8 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.8)
+and [macOS 0.1.11 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.11)
 for release notes. The Windows build's
 [corresponding source](https://github.com/mo0kid/wave/releases/download/v0.1.10/Wave-Emulation-0.1.10-Source.zip)
 includes its modified dependencies; use that archive to reproduce the released
@@ -38,6 +38,12 @@ its [legacy Wave page](https://waldorfmusic.com/legacy-wave/).
 The editor embeds `media/WaldorfWaveUI_NOLOGO.svg` as its 2338 x 1042 source artwork. JUCE controls are transparent hit regions aligned to the artwork coordinates, and the live framebuffer is rendered only inside the LCD rectangle at `(939, 237, 448, 70)`. Additional panel switch, rotary, and fader regions are derived at runtime from the circles and rounded rectangles already in that SVG. The eight Performance faders use relative mouse dragging, retain their physical positions across Performance changes, and apply the destination/parameter assignments stored in each native factory Performance record only after a fader is moved. A playable 61-note keyboard spans C2 through C7 in the lower black keyboard bed, with pressed-key feedback and drag glissando.
 
 Use **Cmd/Ctrl + =** and **Cmd/Ctrl + -** to zoom the editor in and out, **Cmd/Ctrl + 0** for actual size, and **Cmd/Ctrl + K** to show or hide the lower keyboard and controller area. The same actions are in the System menu. Hiding the lower area shortens the window while keeping the upper panel at the same scale.
+
+Hover over any knob or fader to see its tooltip. Knob names follow the selected LFO and envelope page; hold Shift while dragging a knob for finer adjustment. Fader tips identify the numbered control and whether it uses a Performance assignment or the current LCD parameter.
+
+To use your own artwork, choose **System → Panel Skin → Load Alternative SVG Skin…**. Choose **Original** to return to the bundled panel. The selected file is remembered for future instances; keep it at the same path. Missing or invalid files fall back to the original skin.
+
+Create a larger-label skin by copying [the original panel SVG](media/WaldorfWaveUI_NOLOGO.svg) and editing its labels, colours, or decoration. Keep `width="2338"`, `height="1042"`, and `viewBox="0 0 2338 1042"`, and leave all control, LCD, LED, and keyboard positions unchanged. Only panel artwork is replaced; the moving controls, keyboard, LEDs, LCD, and interaction geometry retain their original layout. Export text as paths for consistent rendering across machines. Reload the SVG from the menu after editing it.
 
 ## Installing the Windows release
 
@@ -70,6 +76,12 @@ Quit any older standalone instance, then launch `/Applications/Wave Emulation.ap
 Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
+
+## What's new in 0.1.11
+
+[Version 0.1.11](https://github.com/mo0kid/wave/releases/tag/v0.1.11) restores complete Performance and Sound banks when reopening, including native Store names containing NUL bytes. It fixes Total Recall after cancelling optional machine-specific adjustments, mode lamps after Store, repeated + browsing after Store, and pending writes when remounting the same disk image.
+
+The macOS installer is signed, notarized, and contains universal Apple Silicon and Intel builds of the standalone app, AU, VST3, and PACE-wrapped AAX. The [macOS source archive](https://github.com/mo0kid/wave/releases/download/v0.1.11/Wave-Emulation-0.1.11-Source.zip) includes the modified dependencies used for the build. [Checksums](https://github.com/mo0kid/wave/releases/download/v0.1.11/SHA256SUMS.txt) cover the installer, source archive, and release notes.
 
 ## What's new in 0.1.10
 
@@ -129,6 +141,15 @@ workers to the host's macOS audio workgroup when provided. Version 0.1.3 remains
 withdrawn; users of that version should update to 0.1.5.
 
 ## CPU load in Logic Pro
+
+Enable **System → Eco Mode (applies to new notes)** to reduce voice CPU usage.
+Eco runs the oscillator, digital high-pass, and reconstruction stages at
+62.5 kHz instead of 250 kHz. The resonant CEM filter retains its existing
+integration rate, and firmware timing is unchanged. Eco is a sound-quality
+tradeoff: bright sounds, high notes, and noise can differ from the full-rate
+model. Full quality is the default, and the choice is saved with the project.
+Held notes and their release tails keep the quality they started with; changing
+the setting affects newly triggered notes.
 
 Wave can split voice processing across three threads at higher polyphony.
 Light loads and very short audio segments run serially to avoid worker overhead;
@@ -221,6 +242,19 @@ Configure a separate build with `-DWAVE_EMBED_PRIVATE_ASSETS=ON` to embed them.
 Do not distribute artifacts from that build. The installer explicitly disables
 private embedding. Firmware-backed integration/editor tests are enabled only
 when all three private ROM inputs are present and embedding is enabled.
+
+The private build also provides `WavePerformanceBenchmark`. Its arguments are
+block size, voice count, DSP resonance (0–1), and Eco mode (0 or 1):
+
+```sh
+build/Tests/WavePerformanceBenchmark 512 48 0.18 0
+build/Tests/WavePerformanceBenchmark 512 48 0.18 1
+```
+
+Compare repeated Release runs on the same machine. The benchmark reports
+whether firmware is loaded and how many voices actually rendered. The resonance
+argument controls the standalone DSP fixture; the full-processor fixture uses
+its selected Performance.
 
 For the authenticated continuous-firmware core tests:
 

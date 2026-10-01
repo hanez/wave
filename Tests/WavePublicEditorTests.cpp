@@ -63,6 +63,48 @@ int main()
         require(editor->getWidth() == 2338 && editor->getHeight() == 1042,
                 "Unexpected initial editor size");
         snapshot(*editor, "editor-full");
+        auto* panelEditor = dynamic_cast<WaveEmulationAudioProcessorEditor*>(editor.get());
+        require(panelEditor != nullptr, "Unexpected editor type");
+        require(panelEditor->tooltipAt({ 222.0f, 81.0f }).contains("Wave 1 Detune"),
+                "Knob tooltip does not identify its control");
+        for (const auto x : { 969.0f, 1025.0f, 1080.0f, 1136.0f,
+                              1191.0f, 1248.0f, 1302.0f, 1358.0f })
+            require(panelEditor->tooltipAt({ x, 400.0f }).startsWith("Fader "),
+                    "Missing fader tooltip");
+        require(panelEditor->tooltipAt({ 10.0f, 600.0f }).isEmpty(),
+                "Empty panel space should not have a control tooltip");
+
+        // A synthetic skin verifies visible replacement and fixed hit geometry.
+        juce::TemporaryFile skin(".svg");
+        require(skin.getFile().replaceWithText(
+                    "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"2338\" height=\"1042\" "
+                    "viewBox=\"0 0 2338 1042\"><rect width=\"2338\" height=\"1042\" fill=\"#00ff00\"/></svg>"),
+                "Cannot write synthetic skin");
+        require(panelEditor->loadPanelSkin(skin.getFile()).wasOk(), "Valid skin rejected");
+        const auto skinImage = editor->createComponentSnapshot(editor->getLocalBounds());
+        require(skinImage.getPixelAt(80, 20) == juce::Colours::lime,
+                "Alternative skin did not replace panel artwork");
+        require(panelEditor->tooltipAt({ 222.0f, 81.0f }).contains("Wave 1 Detune"),
+                "Skin replaced control geometry");
+        {
+            std::unique_ptr<juce::AudioProcessorEditor> reopened(processor->createEditor());
+            require(reopened->createComponentSnapshot(reopened->getLocalBounds())
+                        .getPixelAt(80, 20) == juce::Colours::lime,
+                    "Reopened editor did not remember the skin");
+        }
+        juce::TemporaryFile invalidSkin(".svg");
+        invalidSkin.getFile().replaceWithText(
+            "<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\"/>");
+        require(panelEditor->loadPanelSkin(invalidSkin.getFile()).failed(),
+                "Skin with incompatible coordinates accepted");
+        require(editor->createComponentSnapshot(editor->getLocalBounds())
+                    .getPixelAt(80, 20) == juce::Colours::lime,
+                "Rejected skin replaced working artwork");
+        panelEditor->useDefaultPanelSkin();
+        require(processor->getRememberedPanelSkin() == juce::File{},
+                "Original skin did not clear the saved preference");
+        preference.getFile().getSiblingFile(
+            preference.getFile().getFileNameWithoutExtension() + "-panel-skin.txt").deleteFile();
         // A physical pot must move its visible artwork, even before firmware
         // or a factory SET is supplied. Exercise the actual child input handler.
         const juce::Point<float> knobCentre { 222.0f, 81.0f };

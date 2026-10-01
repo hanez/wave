@@ -6,7 +6,7 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
         "Minimum supported macOS version" FORCE)
 endif()
 
-project(WaveEmulationSample VERSION 0.1.10 LANGUAGES C CXX)
+project(WaveEmulationSample VERSION 0.1.11 LANGUAGES C CXX)
 
 include(FetchContent)
 

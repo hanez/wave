@@ -429,6 +429,7 @@ void WaldorfEngine::Voice::prepare(double newSampleRate, int index)
     // remains at its own existing 2x-host integration rate.
     highpassFilter.prepare(OscillatorChipProxy::modelClockRate());
     reconstruction.prepare(OscillatorChipProxy::modelClockRate(), tolerance);
+    asicResampler.prepare(sampleRate);
     circuit.prepare(sampleRate, tolerance);
     // Reinstate the installed card trim before the first note. The firmware's
     // $15A680 service table remains authoritative once the CPU is running.
@@ -450,6 +451,7 @@ void WaldorfEngine::Voice::reset()
     oscillator2.reset();
     highpassFilter.reset();
     reconstruction.reset();
+    asicResampler.reset();
     circuit.reset();
     envelope.reset();
     filterEnvelope.reset();
@@ -601,6 +603,7 @@ void WaldorfEngine::Voice::start(int midiNote, int midiChannel, float noteVeloci
     {
         highpassFilter.reset();
         reconstruction.reset();
+        asicResampler.reset();
         circuit.reset();
         baseCutoffInitialised = false;
     }
@@ -1075,7 +1078,6 @@ Cem3387::StereoSample WaldorfEngine::Voice::process(
     }
 
     reconstruction.setAge(parameters.circuitAgeAmount);
-    auto reconstructed = 0.0f;
     const auto levelCode1 = static_cast<uint8_t>(juce::jlimit(
         0, 127, juce::roundToInt(controlWaveLevels[0] * 112.0f)));
     const auto levelCode2 = static_cast<uint8_t>(juce::jlimit(
@@ -1100,8 +1102,9 @@ Cem3387::StereoSample WaldorfEngine::Voice::process(
             = controlFilterMode == 0
                   ? dacInput
                   : highpassFilter.process(dacInput, controlHighpassCutoff);
-        reconstructed = reconstruction.process(digitalInput);
+        asicResampler.push(reconstruction.process(digitalInput));
     }
+    const auto reconstructed = asicResampler.read(asicClockPhase);
     circuit.setControls(controlAnalogueCutoff, controlResonance,
                         parameters.driveDb, controlPan,
                         parameters.circuitAgeAmount);

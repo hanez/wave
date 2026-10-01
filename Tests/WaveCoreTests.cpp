@@ -166,6 +166,23 @@ void testDp8473MountedDiskImage()
     require(std::all_of(persistedBytes + 1024, persistedBytes + 1536,
                         [](uint8_t value) { return value == 0xa5; }),
             "DP8473 sector writes were not saved at the correct CHS offset");
+    // Reopening the same path must flush pending writes before reading it.
+    send({ 0x45, 0x00, 0x00, 0x00, 0x04, 0x02, 0x04, 0x2a, 0xff });
+    for (int byte = 0; byte < 512; ++byte)
+        controller.write(0xa8001b, 0x3c);
+    (void) controller.read(0xa8002b);
+    for (int byte = 0; byte < 7; ++byte)
+        (void) controller.read(0xa8000b);
+    require(controller.isDirty() && controller.mount(temporary).wasOk(),
+            "DP8473 could not reopen its dirty mounted image");
+    controller.write(0xa80005, 0x1c);
+    send({ 0x46, 0x00, 0x00, 0x00, 0x04, 0x02, 0x04, 0x2a, 0xff });
+    for (int byte = 0; byte < 512; ++byte)
+        require(controller.read(0xa8001b) == 0x3c,
+                "Reopening the mounted image discarded pending sector changes");
+    (void) controller.read(0xa8002b);
+    for (int byte = 0; byte < 7; ++byte)
+        (void) controller.read(0xa8000b);
     require(controller.eject().wasOk(), "DP8473 could not eject its mounted image");
     require((controller.read(0xa8000f) & 0x80u) != 0,
             "DP8473 did not report an empty drive after ejecting its image");
@@ -311,6 +328,124 @@ void testAsicClockMixOverflowAndVcfSaturation()
                 && std::abs(wave::dsp::Cem3387::saturateVcfInput(-0.7f) + knee)
                        < 1.0e-6f,
             "VCF input saturation is not a mild symmetric compression near 70% level");
+}
+
+void testAsicResampling()
+{
+    constexpr auto clockRate = wave::dsp::OscillatorChipProxy::modelClockRate();
+    for (const auto hostRate : { 32000.0, 44100.0, 48000.0, 88200.0,
+                                 96000.0, 192000.0, 250000.0, 384000.0 })
+    {
+        wave::dsp::AsicResampler resampler;
+        resampler.prepare(hostRate);
+        auto clockPhase = 0.0;
+        auto tick = int64_t { 0 };
+        const auto render = [&](double frequency, int samples) {
+            auto energy = 0.0;
+            for (int sample = 0; sample < samples; ++sample)
+            {
+                clockPhase += clockRate / hostRate;
+                while (clockPhase >= 1.0)
+                {
+                    clockPhase -= 1.0;
+                    ++tick;
+                    resampler.push(static_cast<float>(std::cos(
+                        juce::MathConstants<double>::twoPi * frequency
+                        * static_cast<double>(tick) / clockRate)));
+                }
+                const auto value = resampler.read(clockPhase);
+                energy += static_cast<double>(value) * value;
+            }
+            return std::sqrt(energy / samples);
+        };
+        const auto measure = [&](double frequency) {
+            resampler.reset();
+            clockPhase = 0.0;
+            tick = 0;
+            static_cast<void>(render(frequency, 4096));
+            return render(frequency, 8192);
+        };
+        require(std::abs(measure(0.0) - 1.0) < 2.0e-6,
+                "ASIC resampler changes DC gain");
+        const auto passband = measure(0.40 * std::min(hostRate, clockRate));
+        require(std::abs(passband - std::sqrt(0.5)) < 0.002,
+                "ASIC resampler attenuates the audible passband");
+        if (hostRate < clockRate)
+            for (const auto fraction : { 0.501, 0.55, 0.73, 1.13, 1.91 })
+            {
+                const auto frequency = fraction * hostRate;
+                if (frequency < clockRate * 0.5)
+                    require(measure(frequency) < 0.0002,
+                            "ASIC resampler folds ultrasonic harmonics into the host band");
+            }
+
+        // Check the actual fractional sampling time, including hosts faster
+        // than the ASIC (some output frames contain no new internal tick).
+        resampler.reset();
+        clockPhase = 0.0;
+        tick = 0;
+        constexpr auto frequency = 1000.0;
+        const auto delayTicks = 2.0 * std::ceil(24.0 * clockRate / std::min(hostRate, clockRate));
+        static_cast<void>(render(frequency, 4096));
+        for (int sample = 0; sample < 1024; ++sample)
+        {
+            static_cast<void>(render(frequency, 1));
+            const auto expected = std::cos(juce::MathConstants<double>::twoPi * frequency
+                                          * (static_cast<double>(tick) + clockPhase
+                                             - delayTicks) / clockRate);
+            require(std::abs(resampler.read(clockPhase) - expected) < 0.0001,
+                    "ASIC resampling has incorrect fractional timing");
+        }
+        resampler.reset();
+        require(resampler.read(0.37) == 0.0f,
+                "ASIC resampler retains history after reset");
+    }
+}
+
+void testHighRegisterOscillatorResampling()
+{
+    // A synthetic bright wave has a 10 kHz fundamental and a 30 kHz third
+    // harmonic. Point sampling at 48 kHz folds the third down to 18 kHz.
+    using Bank = wave::dsp::WavetableBank;
+    std::vector<int8_t> rom(static_cast<size_t>(Bank::factoryTableCount)
+                            * Bank::wavesPerTable * Bank::samplesPerWave);
+    for (size_t sample = 0; sample < rom.size(); ++sample)
+    {
+        const auto phase = juce::MathConstants<double>::twoPi
+                           * static_cast<double>(sample % Bank::samplesPerWave)
+                           / Bank::samplesPerWave;
+        rom[sample] = static_cast<int8_t>(std::lround(48.0 * (std::cos(phase)
+                                                            + std::cos(3.0 * phase))));
+    }
+    Bank bank;
+    require(bank.loadSigned8BitRom(rom.data(), rom.size()),
+            "Synthetic high-register wavetable did not load");
+    wave::dsp::OscillatorChipProxy oscillator;
+    oscillator.prepare(48000.0);
+    oscillator.setFrequency(10000.0f);
+    for (int sample = 0; sample < 4096; ++sample)
+        static_cast<void>(oscillator.process(bank, 0, 0.0f));
+    std::array<double, 2> real {};
+    std::array<double, 2> imaginary {};
+    constexpr std::array<double, 2> frequencies { 10000.0, 18000.0 };
+    constexpr int sampleCount = 4800;
+    for (int sample = 0; sample < sampleCount; ++sample)
+    {
+        const auto output = oscillator.process(bank, 0, 0.0f);
+        for (size_t bin = 0; bin < frequencies.size(); ++bin)
+        {
+            const auto angle = juce::MathConstants<double>::twoPi * frequencies[bin]
+                               * sample / 48000.0;
+            real[bin] += output * std::cos(angle);
+            imaginary[bin] += output * std::sin(angle);
+        }
+    }
+    const auto fundamental = 2.0 * std::hypot(real[0], imaginary[0]) / sampleCount;
+    const auto alias = 2.0 * std::hypot(real[1], imaginary[1]) / sampleCount;
+    require(fundamental > 0.35 && fundamental < 0.40,
+            "High-register oscillator loses its in-band fundamental");
+    require(alias < 0.0001,
+            "High-register oscillator aliases its ultrasonic third harmonic");
 }
 
 void testWaveEnvelopeTraversal()
@@ -857,7 +992,11 @@ void testCemStability()
     auto peak = 0.0f;
     for (int i = 0; i < 96000; ++i)
     {
-        const auto output = filter.process(i == 0 ? 1.0f : 0.0f, 1.0f);
+        const auto input = i < 48000
+            ? std::sin(juce::MathConstants<float>::twoPi * 3200.0f
+                       * static_cast<float>(i) / 48000.0f)
+            : 0.0f;
+        const auto output = filter.process(input, 1.0f);
         require(std::isfinite(output.left) && std::isfinite(output.right),
                 "CEM3387 model became non-finite");
         peak = juce::jmax(peak, std::abs(output.left), std::abs(output.right));
@@ -1179,6 +1318,87 @@ void testCemSelfOscillation()
                 && std::abs(at62 - 957.0f) <= 50.0f
                 && std::abs(at100 - 7779.0f) <= 400.0f,
             "CEM self-oscillation tracking no longer matches the measured Wave cutoffs");
+}
+
+void testCemResonanceAcrossSampleRates()
+{
+    // A continuous analogue feedback loop must not start oscillating earlier
+    // as its cutoff approaches the digital sample rate. Drive is an input
+    // level control, so it must not change the unexcited loop's threshold.
+    for (const auto cutoff : { 1000.0f, 6000.0f })
+    {
+        auto referenceFrequency = 0;
+        for (const auto rate : { 44100.0, 48000.0, 96000.0 })
+            for (const auto drive : { 0.0f, 18.0f })
+            {
+                const auto measure = [=](float resonance) {
+                    wave::dsp::Cem3387 filter;
+                    filter.prepare(rate, 0.0f);
+                    filter.setControls(cutoff, resonance, drive, 0.0f, 0.0f);
+                    double energy = 0.0;
+                    auto crossings = 0;
+                    auto previous = 0.0f;
+                    for (int sample = 0; sample < static_cast<int>(rate * 2.0); ++sample)
+                    {
+                        const auto output = filter.process(sample == 0 ? 0.1f : 0.0f,
+                                                           1.0f).left;
+                        if (sample >= static_cast<int>(rate))
+                        {
+                            energy += static_cast<double>(output) * output;
+                            if (previous <= 0.0f && output > 0.0f)
+                                ++crossings;
+                        }
+                        previous = output;
+                    }
+                    return std::pair { std::sqrt(energy / rate), crossings };
+                };
+                const auto belowThreshold = measure(0.85f);
+                require(belowThreshold.first < 1.0e-5,
+                        "CEM resonance oscillates below threshold at high cutoff or drive");
+                require(measure(0.95f).first < 1.0e-5,
+                        "CEM resonance starts oscillating before the analogue threshold");
+                const auto oscillating = measure(1.0f);
+                require(oscillating.first > 0.01,
+                        "CEM maximum resonance fails to oscillate across sample rates");
+                if (referenceFrequency == 0)
+                    referenceFrequency = oscillating.second;
+                require(std::abs(static_cast<float>(oscillating.second)
+                                 / static_cast<float>(referenceFrequency) - 1.0f) < 0.02f,
+                        "CEM oscillation frequency shifts with sample rate or drive");
+            }
+    }
+}
+
+void testCemSmallSignalResonanceResponse()
+{
+    // Datasheet's classical four-pole application: at w = wc, the
+    // open-loop response is -1/4. Negative feedback k therefore gives
+    // |H(wc)| / |H(0)| = (1+k)/(4-k), independent of input makeup gain.
+    constexpr auto resonance = 0.7f;
+    constexpr auto feedback = 4.15f * resonance;
+    constexpr auto expectedRatio = (1.0f + feedback) / (4.0f - feedback);
+    for (const auto rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        const auto measure = [=](double frequency) {
+            wave::dsp::Cem3387 filter;
+            filter.prepare(rate, 0.0f);
+            filter.setControls(wave::parameters::cutoffFrequencyForStep(62.0f),
+                               resonance, 0.0f, 0.0f, 0.0f);
+            double energy = 0.0;
+            for (int sample = 0; sample < static_cast<int>(rate); ++sample)
+            {
+                const auto input = 0.001f * static_cast<float>(std::sin(
+                    juce::MathConstants<double>::twoPi * frequency * sample / rate));
+                const auto output = filter.process(input, 1.0f).left;
+                if (sample >= static_cast<int>(rate * 0.5))
+                    energy += static_cast<double>(output) * output;
+            }
+            return std::sqrt(energy / (rate * 0.5));
+        };
+        const auto ratio = measure(957.0) / measure(100.0);
+        require(std::abs(ratio / expectedRatio - 1.0) < 0.03,
+                "CEM resonance peak does not match the analogue four-pole response");
+    }
 }
 
 void testIndependentFilterEnvelope()
@@ -2555,6 +2775,8 @@ int main()
     {
         testWavetableQuantisation();
         testAsicClockMixOverflowAndVcfSaturation();
+        testAsicResampling();
+        testHighRegisterOscillatorResampling();
         testCutoffControlLaw();
         testQuickEditFastAccessControls();
         testWaveEnvelopeTraversal();
@@ -2577,6 +2799,8 @@ int main()
         testAsicHighpassResponse();
         testSerialBandpassTopology();
         testCemSelfOscillation();
+        testCemResonanceAcrossSampleRates();
+        testCemSmallSignalResonanceResponse();
         testMeasuredFastAmplifierAttackScaling();
         testAmplifierEnvelopeStages();
         testShortVcaReleaseDrainsAnalogueControl();

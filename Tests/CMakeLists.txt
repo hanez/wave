@@ -42,6 +42,9 @@ if(WAVE_HAS_PRIVATE_ROMS)
             juce::juce_recommended_config_flags
             juce::juce_recommended_warning_flags)
     add_test(NAME WaveIntegrationTests COMMAND WaveIntegrationTests)
+    add_test(NAME WaveDiskTotalRecallTests COMMAND WaveIntegrationTests --disk-total-recall)
+    add_test(NAME WaveStoreModeLampTests COMMAND WaveIntegrationTests --store-mode-exit)
+    add_test(NAME WaveReopenBankTests COMMAND WaveIntegrationTests --reopen-banks)
 
     add_executable(WaveEditorTests WaveEditorTests.cpp)
     target_include_directories(WaveEditorTests PRIVATE ${CMAKE_SOURCE_DIR}/Source)
@@ -65,7 +68,7 @@ endif()
 if(WAVE_HAS_PRIVATE_ROMS)
     set_tests_properties(WaveCoreTests PROPERTIES ENVIRONMENT
         "WAVE_FIRMWARE_DIR=${CMAKE_SOURCE_DIR}/Firmware/wave_sys1_700;PPG_WAVETABLE_ROM=${CMAKE_SOURCE_DIR}/Firmware/wave_sys1_700/ppg-wave-2.3-v6-wavetables.rom;WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
-    set_tests_properties(WaveIntegrationTests PROPERTIES
+    set_tests_properties(WaveIntegrationTests WaveDiskTotalRecallTests WaveStoreModeLampTests WaveReopenBankTests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         ENVIRONMENT "WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
     set_tests_properties(WaveEditorTests PROPERTIES

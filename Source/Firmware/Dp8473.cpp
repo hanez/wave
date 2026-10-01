@@ -30,6 +30,13 @@ juce::Result Dp8473::mount(const juce::File& file)
     if (!file.existsAsFile())
         return juce::Result::fail("The selected disk image does not exist.");
 
+    // The selected path may be the image already in the drive. Commit its
+    // pending sector writes before reading it, so a remount cannot install
+    // the older on-disk bytes after successfully flushing the newer image.
+    const auto previousFlush = flush();
+    if (previousFlush.failed())
+        return previousFlush;
+
     juce::MemoryBlock bytes;
     if (!file.loadFileAsData(bytes))
         return juce::Result::fail("The selected disk image could not be read.");
@@ -43,10 +50,6 @@ juce::Result Dp8473::mount(const juce::File& file)
         return juce::Result::fail(
             "This is not a supported raw MS-DOS floppy image (720 KB, 800 KB, "
             "1.44 MB, or a valid FAT BPB geometry).");
-
-    const auto previousFlush = flush();
-    if (previousFlush.failed())
-        return previousFlush;
 
     const std::scoped_lock lock(mutex);
     imagePath = file;

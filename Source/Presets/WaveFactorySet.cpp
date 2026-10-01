@@ -9,10 +9,12 @@ namespace wave::presets
 {
 namespace
 {
-bool printableName(const uint8_t* bytes) noexcept
+bool nativeName(const uint8_t* bytes) noexcept
 {
+    // Store can write NULs inside the otherwise space-padded 16-byte name.
+    // These also occur in SET files saved by the firmware, not just host state.
     return std::all_of(bytes, bytes + 16, [](uint8_t value) {
-        return value >= 0x20u && value <= 0x7eu;
+        return value == 0u || (value >= 0x20u && value <= 0x7eu);
     });
 }
 
@@ -47,9 +49,9 @@ WaveFactorySet::Report WaveFactorySet::load(const void* bytes, size_t size)
         const auto* soundRecord = sounds.data() + static_cast<size_t>(index) * soundSize;
         const auto* performanceRecord = performances.data()
                                         + static_cast<size_t>(index) * performanceSize;
-        if (soundRecord[239] == 0x55u && printableName(soundRecord + 240))
+        if (soundRecord[239] == 0x55u && nativeName(soundRecord + 240))
             ++report.validSounds;
-        if (performanceRecord[48] == 0x55u && printableName(performanceRecord + 32))
+        if (performanceRecord[48] == 0x55u && nativeName(performanceRecord + 32))
             ++report.validPerformances;
     }
 
@@ -59,6 +61,22 @@ WaveFactorySet::Report WaveFactorySet::load(const void* bytes, size_t size)
                         ? "Native Waldorf Wave SET: two 128-program sound banks and two 128-program performance banks"
                         : "SET bank markers or names do not match the Waldorf Wave layout";
     return report;
+}
+
+juce::MemoryBlock WaveFactorySet::imageWithStoredBanks(
+    std::span<const uint8_t> storedSounds,
+    std::span<const uint8_t> storedPerformances) const
+{
+    auto image = loadedImage;
+    if (image.getSize() >= minimumSize && storedSounds.size() == sounds.size()
+        && storedPerformances.size() == performances.size())
+    {
+        auto* bytes = static_cast<uint8_t*>(image.getData());
+        std::copy(storedSounds.begin(), storedSounds.end(), bytes + soundBankOffset);
+        std::copy(storedPerformances.begin(), storedPerformances.end(),
+                  bytes + performanceBankOffset);
+    }
+    return image;
 }
 
 std::span<const uint8_t, WaveFactorySet::soundSize> WaveFactorySet::sound(

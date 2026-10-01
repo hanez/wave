@@ -221,6 +221,7 @@ private:
         OscillatorChipProxy oscillator2;
         AsicHighpassFilter highpassFilter;
         ReconstructionStage reconstruction;
+        AsicResampler asicResampler;
         Cem3387 circuit;
         WdvEnvelope envelope;
         WdvEnvelope filterEnvelope;

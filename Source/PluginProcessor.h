@@ -199,6 +199,8 @@ public:
     {
         return keyboardOctaveShift.load(std::memory_order_acquire);
     }
+    [[nodiscard]] juce::File getRememberedPanelSkin() const;
+    juce::Result rememberPanelSkin(const juce::File& file);
     bool setPanelButton(int buttonId, bool pressed) noexcept;
     void setKeyboardControllerButton(uint8_t asciiCode, bool pressed) noexcept;
     [[nodiscard]] int getFirmwareOscillatorOctave(int oscillator) const noexcept;
@@ -323,7 +325,7 @@ private:
     int scheduledInstrumentPageSelection = -1;
     int scheduledInstrumentPageDelayBlocks = 0;
     std::atomic<int> pendingFirmwareSoftButton { -1 };
-    std::atomic<bool> pendingStoreCancel { false };
+    std::atomic<bool> pendingPanelCancel { false };
     std::atomic<bool> cancelFirmwareSoftButtonEvents { false };
     int activeSoftButtonDiagnosticCode = -1;
     bool activeSoftButtonPressSent = false;
@@ -359,8 +361,13 @@ private:
     // byte transfer can finish before OK is pressed, so it cannot double as
     // the front-panel requester's ownership flag.
     std::atomic<bool> diskSetImportConfirmationPending { false };
+    std::atomic<bool> firmwareDiskCalibrationRequesterActive { false };
+    std::atomic<int> pendingManagerExitProgram { -1 };
     std::atomic<bool> returnToPerformanceAfterDiskImport { false };
     std::atomic<bool> returnToPerformanceAfterStoreExit { false };
+    std::atomic<int> storeSaveMode { 39 };
+    std::atomic<int> completedStoreMode { -1 };
+    std::atomic<bool> storeSaveCompletionPending { false };
     const juce::String hostStateInstanceId { juce::Uuid().toString() };
     juce::File restoredHostStateDirectory;
     std::array<uint16_t, wave::dsp::WaldorfEngine::voiceCount>

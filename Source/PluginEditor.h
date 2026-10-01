@@ -10,11 +10,17 @@
 
 class WaveEmulationAudioProcessorEditor final : public juce::AudioProcessorEditor,
                                                 private juce::Timer,
-                                                private juce::MenuBarModel
+                                                private juce::MenuBarModel,
+                                                public juce::TooltipClient
 {
 public:
     explicit WaveEmulationAudioProcessorEditor(WaveEmulationAudioProcessor&);
     ~WaveEmulationAudioProcessorEditor() override;
+
+    juce::String getTooltip() override;
+    [[nodiscard]] juce::String tooltipAt(juce::Point<float> editorPoint) const;
+    juce::Result loadPanelSkin(const juce::File& file, bool remember = true);
+    void useDefaultPanelSkin();
 
     void paint(juce::Graphics&) override;
     void resized() override;
@@ -87,6 +93,7 @@ private:
     void menuItemSelected(int menuItemId, int topLevelMenuIndex) override;
     void showSystemMenu();
     void showFirmwareFolderChooser();
+    void showPanelSkinChooser();
     void showDiskImageChooser();
     void showCreateBlankDiskChooser();
     void showCreateDiskFromSetChooser();
@@ -102,6 +109,9 @@ private:
     std::unique_ptr<wave::ui::WaveLcdComponent> lcd;
     std::unique_ptr<juce::Drawable> panelArtwork;
     juce::Image panelImage;
+    juce::File panelSkinFile;
+    juce::TooltipWindow tooltipWindow { this, 650 };
+    std::unique_ptr<juce::FileChooser> panelSkinChooser;
     std::unique_ptr<juce::Drawable> sliderArtwork;
     std::unique_ptr<juce::Drawable> knobArtwork;
     std::unique_ptr<juce::Drawable> redKnobArtwork;

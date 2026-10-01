@@ -26,17 +26,22 @@ Cem3387::coefficientTableForSampleRate(double targetSampleRate)
         const auto unit = static_cast<float>(index)
                           / static_cast<float>(table->size() - 1);
         const auto cv = minimumCv + unit * (maximumCv - minimumCv);
-        // Measurements from a Wave voice card at full resonance place the
-        // oscillation at approximately 28 Hz, 957 Hz and 7.78 kHz for Sound
-        // cutoff values 0, 62 and 100. The nominal OS table alone produces
-        // 20 Hz, 710 Hz and 5.88 kHz in this four-pole topology. This stable
-        // 1.35 analogue scale factor belongs at the CEM control-law boundary,
-        // while the firmware-facing semitone table remains unchanged.
-        constexpr auto waveCemFrequencyScale = 1.35f;
+        // Wave voice-card oscillation measurements: 28 Hz, 957 Hz and
+        // 7779 Hz at Sound cutoff 0, 62 and 100. Interpolate in log frequency
+        // at the analogue control-law boundary. A constant scale previously
+        // concealed digital feedback delay at high cutoff. Above the last
+        // measured point, retain its scale; that range still needs captures.
+        const auto step = cv * 127.0f;
+        const auto scaleAt62 = 957.0f / (20.0f * std::exp2(62.0f / 12.0f));
+        const auto scaleAt100 = 7779.0f / (20.0f * std::exp2(100.0f / 12.0f));
+        const auto logScale = step <= 62.0f
+            ? std::log2(1.4f) + juce::jlimit(0.0f, 1.0f, step / 62.0f)
+                * (std::log2(scaleAt62) - std::log2(1.4f))
+            : std::log2(scaleAt62) + juce::jlimit(0.0f, 1.0f, (step - 62.0f) / 38.0f)
+                * (std::log2(scaleAt100) - std::log2(scaleAt62));
         const auto cutoff = juce::jlimit(
             12.0f, static_cast<float>(targetSampleRate * 0.225),
-            waveCemFrequencyScale * 20.0f
-                * std::exp2(cv * cutoffRangeOctaves));
+            20.0f * std::exp2(cv * cutoffRangeOctaves + logScale));
         const auto g = std::tan(juce::MathConstants<float>::pi * cutoff
                                 / static_cast<float>(targetSampleRate));
         (*table)[index] = g / (1.0f + g);
@@ -273,13 +278,9 @@ void Cem3387::updateControlVoltages(float vcaLevel) noexcept
               / (1.0f - std::exp(-lossCurve));
         const auto measuredPassbandGain = std::pow(
             10.0f, -maximumPassbandLossDb * lossPosition / 20.0f);
-        const auto selfOscillationPosition = juce::jmax(
-            0.0f, (resonanceCv - 0.5f) * 2.0f);
-        const auto drivenLoopMakeup
-            = 1.0f + 0.64f * std::pow(selfOscillationPosition, 0.6f);
         resonanceInputGain
             = (1.0f + feedbackGain * resonanceAmount)
-              * measuredPassbandGain * drivenLoopMakeup;
+              * measuredPassbandGain;
     }
     if (panCv != coefficientPanCv)
     {
@@ -294,20 +295,67 @@ void Cem3387::updateControlVoltages(float vcaLevel) noexcept
 
 float Cem3387::runFilter(float input) noexcept
 {
-    const auto saturatedInput = saturateVcfInput(input);
-    auto stageInput = std::tanh((saturatedInput * resonanceInputGain
-                                 - integrators[3] * resonanceAmount * 4.15f)
-                                * inputDrive);
+    // Datasheet pp. 5-6: with Ca = 4 Cb the two second-order
+    // sections have H(s) = 1 / (1 + s/wc)^4. Four trapezoidal
+    // one-poles give that equivalent small-signal response. Close the
+    // resonance loop around their *current outputs*, not their stored
+    // integrator states: the latter adds artificial feedback phase delay.
+    const auto drivenInput = saturateVcfInput(input) * resonanceInputGain * inputDrive;
+    const auto feedback = resonanceAmount * 4.15f;
+    std::array<float, 4> outputs{};
+    const auto evaluate = [&](float stageInput) {
+        auto derivative = 1.0f;
+        for (size_t stage = 0; stage < outputs.size(); ++stage)
+        {
+            outputs[stage] = integrators[stage]
+                             + coefficient * (stageInput - integrators[stage]);
+            derivative *= coefficient;
+            if (stage + 1 < outputs.size())
+            {
+                stageInput = std::tanh(outputs[stage]);
+                derivative *= 1.0f - stageInput * stageInput;
+            }
+        }
+        return derivative;
+    };
 
-    for (auto& state : integrators)
+    // The scalar feedback equation is monotone, with derivative >= 1.
+    // A safeguarded Newton solve handles saturation without updating any
+    // state until the whole loop has been evaluated. Drive acts on the
+    // incoming signal only; multiplying feedback by it changes the chip's Q.
+    auto stageInput = std::tanh(drivenInput - feedback * integrators[3]);
+    if (feedback == 0.0f)
     {
-        const auto delta = (stageInput - state) * coefficient;
-        const auto output = state + delta;
-        state = output + delta;
-        stageInput = std::tanh(output);
+        // With no feedback the first evaluation is already the solution.
+        // Keep the same stage arithmetic and saturation as the general solver.
+        (void) evaluate(stageInput);
+        for (size_t stage = 0; stage < outputs.size(); ++stage)
+            integrators[stage] = 2.0f * outputs[stage] - integrators[stage];
+        return outputs[3];
     }
-
-    return integrators[3];
+    auto lower = -1.0f;
+    auto upper = 1.0f;
+    for (int iteration = 0; iteration < 8; ++iteration)
+    {
+        const auto derivative = evaluate(stageInput);
+        const auto feedbackInput = std::tanh(drivenInput - feedback * outputs[3]);
+        const auto residual = stageInput - feedbackInput;
+        if (std::abs(residual) < 1.0e-7f * std::abs(stageInput) + 1.0e-12f
+            || iteration == 7)
+            break;
+        if (residual < 0.0f)
+            lower = stageInput;
+        else
+            upper = stageInput;
+        const auto next = stageInput - residual
+            / (1.0f + feedback * (1.0f - feedbackInput * feedbackInput) * derivative);
+        if (next == stageInput)
+            break;
+        stageInput = next > lower && next < upper ? next : 0.5f * (lower + upper);
+    }
+    for (size_t stage = 0; stage < outputs.size(); ++stage)
+        integrators[stage] = 2.0f * outputs[stage] - integrators[stage];
+    return outputs[3];
 }
 
 float Cem3387::quantiseCv(float normalised) noexcept

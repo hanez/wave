@@ -5,6 +5,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace wave::dsp
 {
@@ -49,6 +50,29 @@ private:
     void detachSamples();
 };
 
+// Bandlimited conversion from the fixed ASIC clock to the host clock. Feed
+// every internal tick, then read at the fractional host sampling instant.
+// The causal FIR adds about 1.1 ms at 44.1 kHz; it is not an analogue model.
+class AsicResampler
+{
+public:
+    void prepare(double hostSampleRate);
+    void reset() noexcept;
+    void push(float sample) noexcept;
+    [[nodiscard]] float read(double fractionalTick) const noexcept;
+
+private:
+    static constexpr int phaseCount = 64;
+    struct Kernel
+    {
+        int taps = 0;
+        std::vector<float> coefficients;
+    };
+    std::shared_ptr<const Kernel> kernel;
+    std::vector<float> history;
+    int head = 0;
+};
+
 // External behavioural proxy for the undocumented oscillator chip. This does
 // not claim to reproduce, or know, its internal implementation.
 class OscillatorChipProxy
@@ -80,6 +104,7 @@ private:
     double clockPhase = 1.0;
     double phaseIncrementPerTick = 440.0 / modelClockRate();
     float heldSample = 0.0f;
+    AsicResampler resampler;
 };
 
 // The ES2 ASIC combines its two signed eight-bit oscillator values after
@@ -137,6 +162,7 @@ private:
     float tolerance = 0.0f;
     float age = 0.0f;
     float coefficientAge = -1.0f;
+    std::array<float, 255> saturatedLevels{};
     float firstPoleCoefficient = 0.0f;
     float secondOrderA1 = 1.0f;
     float secondOrderA2 = 0.0f;

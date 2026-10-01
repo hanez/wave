@@ -49,6 +49,8 @@ constexpr auto zoomInMenuItem = 0x4708;
 constexpr auto zoomOutMenuItem = 0x4709;
 constexpr auto resetZoomMenuItem = 0x470a;
 constexpr auto toggleKeyboardMenuItem = 0x470b;
+constexpr auto loadPanelSkinMenuItem = 0x470c;
+constexpr auto defaultPanelSkinMenuItem = 0x470d;
 
 bool hitCircle(juce::Point<float> point, float x, float y) noexcept
 {
@@ -230,7 +232,7 @@ public:
         if (attachedParameter != nullptr)
             slider.setDoubleClickReturnValue(true, attachedParameter->convertFrom0to1(
                                                        attachedParameter->getDefaultValue()));
-        setTooltip(displayName);
+        setTooltip(displayName + "\nDrag up/down to adjust. Hold Shift for fine adjustment.");
         if (endlessRelative)
             attachment = std::make_unique<Attachment>(parameterState, parameterId, slider);
         else if (!physicalPositionInitialised && attachedParameter != nullptr)
@@ -534,6 +536,9 @@ WaveEmulationAudioProcessorEditor::WaveEmulationAudioProcessorEditor(
         panelArtwork = juce::Drawable::createFromSVG(*xml);
         initialisePanelRegions(*xml);
     }
+    const auto rememberedSkin = ownerProcessor.getRememberedPanelSkin();
+    if (rememberedSkin != juce::File{})
+        loadPanelSkin(rememberedSkin, false); // Missing/invalid artwork falls back to the bundled panel.
     const auto sliderSvg = juce::String::fromUTF8(WaveAssets::Slider_svg,
                                                   WaveAssets::Slider_svgSize);
     if (const auto sliderXml = juce::XmlDocument::parse(sliderSvg))
@@ -767,6 +772,13 @@ juce::PopupMenu WaveEmulationAudioProcessorEditor::getMenuForIndex(
     menu.addItem(toggleKeyboardMenuItem,
                  keyboardVisible ? "Hide Lower Keyboard Area (Cmd/Ctrl + K)"
                                  : "Show Lower Keyboard Area (Cmd/Ctrl + K)");
+    menu.addSeparator();
+    juce::PopupMenu skins;
+    skins.addItem(defaultPanelSkinMenuItem, "Original", true, panelSkinFile == juce::File{});
+    skins.addItem(loadPanelSkinMenuItem, "Load Alternative SVG Skin...");
+    if (panelSkinFile != juce::File{})
+        skins.addItem(-2, "Current: " + panelSkinFile.getFileName(), false);
+    menu.addSubMenu("Panel Skin", skins);
     return menu;
 }
 
@@ -785,6 +797,16 @@ void WaveEmulationAudioProcessorEditor::showSystemMenu()
 
 void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
 {
+    if (menuItemId == loadPanelSkinMenuItem)
+    {
+        showPanelSkinChooser();
+        return;
+    }
+    if (menuItemId == defaultPanelSkinMenuItem)
+    {
+        useDefaultPanelSkin();
+        return;
+    }
     if (menuItemId == zoomInMenuItem || menuItemId == zoomOutMenuItem)
     {
         const auto currentScale = static_cast<float>(getWidth()) / designWidth;
@@ -2191,4 +2213,94 @@ void WaveEmulationAudioProcessorEditor::updateWaveEnvelopeKnobBindings()
         waveEnvelopeLevelKnobs[knob]->setBinding(
             wave::parameters::waveEnvelopeLevel[point], "Wave Envelope Level " + number);
     }
+}
+
+juce::String WaveEmulationAudioProcessorEditor::getTooltip()
+{
+    return tooltipAt(getMouseXYRelative().toFloat());
+}
+
+juce::String WaveEmulationAudioProcessorEditor::tooltipAt(juce::Point<float> point) const
+{
+    if (getWidth() <= 0)
+        return {};
+    for (const auto& knob : knobs)
+        if (knob->getBounds().toFloat().contains(point))
+            return knob->getTooltip();
+    const auto designPoint = point * (designWidth / static_cast<float>(getWidth()));
+    for (const auto& region : panelRegions)
+        if (region.fader && region.faderIndex >= 0
+            && region.path.contains(designPoint.x, designPoint.y))
+            return "Fader " + juce::String(region.faderIndex + 1)
+                   + (performanceMode && selectedEditSwitch < 0
+                          ? " - assigned performance control"
+                          : " - parameter shown above on the LCD")
+                   + "\nDrag up/down to adjust.";
+    return {};
+}
+
+juce::Result WaveEmulationAudioProcessorEditor::loadPanelSkin(const juce::File& file,
+                                                             bool remember)
+{
+    const auto xml = juce::XmlDocument::parse(file);
+    if (xml == nullptr || !xml->hasTagName("svg"))
+        return juce::Result::fail("Choose a valid SVG panel skin.");
+    auto viewBox = juce::StringArray::fromTokens(xml->getStringAttribute("viewBox"), " ,\t\r\n", "");
+    viewBox.removeEmptyStrings();
+    if (viewBox.size() != 4 || viewBox[0].getDoubleValue() != 0.0
+        || viewBox[1].getDoubleValue() != 0.0
+        || !juce::approximatelyEqual(viewBox[2].getDoubleValue(), static_cast<double>(designWidth))
+        || !juce::approximatelyEqual(viewBox[3].getDoubleValue(), static_cast<double>(designHeight))
+        || !juce::approximatelyEqual(xml->getDoubleAttribute("width"), static_cast<double>(designWidth))
+        || !juce::approximatelyEqual(xml->getDoubleAttribute("height"), static_cast<double>(designHeight)))
+        return juce::Result::fail("Panel skins must use width=2338, height=1042 and viewBox=\"0 0 2338 1042\". Keep controls in their original positions.");
+    auto artwork = juce::Drawable::createFromSVG(*xml);
+    if (artwork == nullptr)
+        return juce::Result::fail("The SVG panel skin could not be rendered.");
+    if (remember)
+    {
+        const auto result = ownerProcessor.rememberPanelSkin(file);
+        if (result.failed())
+            return result;
+    }
+    panelArtwork = std::move(artwork);
+    panelSkinFile = file;
+    // Interaction geometry always comes from the original panel, so changing
+    // label paths/groups cannot change firmware wiring or fader destinations.
+    rebuildPanelImage();
+    repaint();
+    return juce::Result::ok();
+}
+
+void WaveEmulationAudioProcessorEditor::useDefaultPanelSkin()
+{
+    const auto xml = juce::XmlDocument::parse(juce::String::fromUTF8(
+        WaveAssets::WaldorfWaveUI_NOLOGO_svg, WaveAssets::WaldorfWaveUI_NOLOGO_svgSize));
+    if (xml == nullptr)
+        return;
+    const auto result = ownerProcessor.rememberPanelSkin({});
+    if (result.failed())
+    {
+        showDiskError("Panel Skin", result);
+        return;
+    }
+    panelArtwork = juce::Drawable::createFromSVG(*xml);
+    panelSkinFile = juce::File{};
+    rebuildPanelImage();
+    repaint();
+}
+
+void WaveEmulationAudioProcessorEditor::showPanelSkinChooser()
+{
+    panelSkinChooser = std::make_unique<juce::FileChooser>(
+        "Load Alternative Panel Skin", panelSkinFile, "*.svg");
+    panelSkinChooser->launchAsync(juce::FileBrowserComponent::openMode
+                                      | juce::FileBrowserComponent::canSelectFiles,
+        [safe = juce::Component::SafePointer(this)](const juce::FileChooser& chooser) {
+            if (safe == nullptr || chooser.getResult() == juce::File{})
+                return;
+            const auto result = safe->loadPanelSkin(chooser.getResult());
+            if (result.failed())
+                safe->showDiskError("Panel Skin", result);
+        });
 }

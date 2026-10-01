@@ -7,7 +7,7 @@
 # are stored in this script.
 #
 # Common overrides:
-#   VERSION=0.1.10
+#   VERSION=0.1.11
 #   BUILD_JOBS=8
 #   SKIP_PLUGIN_BUILD=1
 #   SKIP_WRAP=1
@@ -37,7 +37,7 @@ PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 if [ -f "$PROJECT_ROOT/Installer/.env.local" ]; then
   source "$PROJECT_ROOT/Installer/.env.local"
 fi
-BUILD_DIR="$PROJECT_ROOT/build"
+BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
 INSTALLER_DIR="$PROJECT_ROOT/Installer"
 WORK_DIR="$INSTALLER_DIR/.release-work"
 STAGING_DIR="$WORK_DIR/staging"
@@ -45,7 +45,7 @@ PACKAGES_DIR="$WORK_DIR/packages"
 RESOURCES_DIR="$WORK_DIR/resources"
 DMG_STAGING_DIR="$WORK_DIR/dmg"
 
-VERSION="${VERSION:-0.1.10}"
+VERSION="${VERSION:-0.1.11}"
 TEAM_ID="${TEAM_ID:-}"
 BUILD_CONFIG="${BUILD_CONFIG:-Release}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-$BUILD_CONFIG}"

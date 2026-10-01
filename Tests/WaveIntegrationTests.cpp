@@ -964,7 +964,7 @@ void testPerformanceStoreNameAcrossBanks(int commitSamples, int commitOffset)
             "The current Performance name differs from the stored name");
 }
 
-void testStoreModeButtonExitAfterSave()
+void testStoreModeButtonExitAfterSave(bool sound = false)
 {
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
     auto processor = std::make_unique<WaveEmulationAudioProcessor>();
@@ -989,8 +989,16 @@ void testStoreModeButtonExitAfterSave()
         process(96);
     };
     process(96);
+    if (sound)
+        click(36); // Instrument Edit.
     click(57); // Store.
-    click(25); // Performance.
+    if (sound)
+    {
+        click(79); // Sound chooser.
+        click(22); // First Instrument.
+    }
+    else
+        click(25); // Performance.
     require(processor->isFirmwareRequesterActive(),
             "Performance Store requester did not open");
     const auto requesterScreen
@@ -1009,8 +1017,32 @@ void testStoreModeButtonExitAfterSave()
     process(512);
     require(!processor->isFirmwareRequesterActive()
                 && processor->getPanelSelectedMode() == 57
-                && processor->getPanelLed(87),
-            "Store did not return to its page after saving");
+                && processor->getPanelLed(sound ? 22 : 51)
+                && !processor->getPanelLed(sound ? 51 : 22)
+                && !processor->getPanelLed(87),
+            "Saving did not restore the record's operating-mode lamp");
+    if (!sound)
+    {
+        const auto selected = processor->getCurrentProgram();
+        const auto plus = wave::panel::matrixIndexForDiagnosticCode(72);
+        for (int clickIndex = 0; clickIndex < 3; ++clickIndex)
+        {
+            require(processor->setPanelButton(plus, true),
+                    "Plus immediately after Store was rejected");
+            processor->setPanelButton(plus, false); // Brief click between callbacks.
+            process(clickIndex + 1);
+        }
+        process(512);
+        require(processor->getCurrentProgram() == (selected + 3) % 256
+                    && processor->getMasterFirmwareRuntime().currentPerformanceId()
+                           == processor->getCurrentProgram(),
+                "Plus after Store lost or repeated a browsing click");
+        const auto afterClick = processor->getCurrentProgram();
+        process(1000);
+        require(processor->getCurrentProgram() == afterClick
+                    && processor->getMasterFirmwareRuntime().currentPerformanceId() == afterClick,
+                "Released Plus kept browsing after Store");
+    }
     click(36); // The firmware accepts a mode change after the save.
     process(512);
     require(processor->getPanelSelectedMode() == 36
@@ -1085,7 +1117,7 @@ void testPerformanceOverwriteClearsInactiveSlots(int blockSize)
     require(processor->getPanelSelectedMode() == 39
                 && processor->getPanelLed(51)
                 && !processor->getPanelLed(87),
-            "Store Cancel did not restore the Performance mode lamp");
+            "Store save did not restore the Performance mode lamp");
     audio.setSize(2, 512);
     for (int repeat = 0; repeat < 2; ++repeat) {
         click(57);
@@ -1130,7 +1162,9 @@ void testRepeatedSoundStoreCursor()
     click(79); // Sound opens the Instrument chooser.
     for (int pass = 0; pass < 3; ++pass) {
         click(pass % 2 == 0 ? 22 : 25);
-        require(processor->isFirmwareRequesterActive(), "Sound Store requester did not open");
+        require(processor->isFirmwareRequesterActive() && processor->getPanelLed(87)
+                    && !processor->getPanelLed(22),
+                "Sound Store requester did not restore its Store lamp");
         const auto& runtime = processor->getMasterFirmwareRuntime();
         const auto cursor = runtime.localByte(0x57005u);
         click(23);
@@ -1148,10 +1182,12 @@ void testRepeatedSoundStoreCursor()
         require(runtime.localByte(0x56000u + cursor) != character,
                 "Data dial did not edit the selected Sound name character");
         click(70);
+        process(512);
         require(!processor->isFirmwareRequesterActive(),
                 "One OK press did not close the Sound naming requester");
-        require(processor->getPanelSelectedMode() == 57 && processor->getPanelLed(87),
-                "Sound Store OK retired Store while the firmware still owns the chooser");
+        require(processor->getPanelSelectedMode() == 57 && processor->getPanelLed(22)
+                    && !processor->getPanelLed(87),
+                "Sound Store OK did not restore the Instrument Edit lamp");
     }
     click(71);
     require(processor->getPanelSelectedMode() == 39 && !processor->getPanelLed(87),
@@ -1735,8 +1771,12 @@ void testFactoryA001CapturedChordSequenceKeepsEveryVcaOpen()
             "Captured A001 sequence collapsed five held voice VCAs");
 }
 
-void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true)
+void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true,
+                                          bool nativeDiskLoad = false,
+                                          bool fromColdStart = false,
+                                          bool loadMachineSpecific = true)
 {
+    juce::ScopedJuceInitialiser_GUI initialiseJuce;
     constexpr size_t soundBankOffset = 0x12e7cu;
     constexpr size_t performanceBankOffset = 0x22e7cu;
     constexpr size_t soundSize = 256u;
@@ -1792,6 +1832,12 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true)
 
     auto processor = std::make_unique<WaveEmulationAudioProcessor>();
     processor->prepareToPlay(48000.0, 512);
+    if (fromColdStart)
+        processor->resetToColdStart();
+#if JUCE_MAC
+    else if (nativeDiskLoad)
+        processor->setCurrentProgram(7); // Recall must retire a different prior program.
+#endif
     require(processor->mountDiskImage(firstImageFile).wasOk(),
             "Initial Wave disk could not be mounted before media swap");
     juce::AudioBuffer<float> audio(2, 512);
@@ -1835,16 +1881,46 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true)
         }
     };
     clickAndSettle(58); // Disk / Load menu.
-    clickAndSettle(70); // Open its next step; the SET has not transferred.
+    if (!nativeDiskLoad)
+        clickAndSettle(70); // Open its next step; the SET has not transferred.
     require(processor->getPanelSelectedMode() == 58,
             "First Disk OK prematurely closed the Total Recall workspace");
-    clickAndSettle(71); // Leave Disk before testing Option/Import separately.
-    require(processor->mountDiskImage(imageFile).wasOk(),
-            "Could not remount SET after cancelling Disk selection");
-    clickAndSettle(34); // Option / Import workspace.
-    require(processor->getPanelSelectedMode() == 34,
-            "Mounted SET did not enter the Option/Import workspace");
-    clickAndSettle(70); // Confirm the SET load.
+    if (nativeDiskLoad)
+    {
+        clickAndSettle(22); // Load choices.
+        for (int choice = 0; choice < 12; ++choice)
+            clickAndSettle(72);
+        clickAndSettle(70); // Select Total Recall.
+        clickAndSettle(70); // Confirm the file.
+        clickAndSettle(70); // Confirm the load.
+        for (int block = 0; block < 4000; ++block)
+        {
+            audio.clear();
+            juce::MidiBuffer noMidi;
+            processor->processBlock(audio, noMidi);
+        }
+        clickAndSettle(loadMachineSpecific ? 70 : 71); // Machine-specific data choice.
+        for (int block = 0; block < 4000; ++block)
+        {
+            audio.clear();
+            juce::MidiBuffer noMidi;
+            processor->processBlock(audio, noMidi);
+        }
+        uint32_t callback = 0;
+        for (uint32_t i = 0; i < 4; ++i)
+            callback = (callback << 8u) | processor->getMasterFirmwareRuntime().localByte(0x56bb0u + i);
+        require(callback == 0x0189c4u, "Total Recall did not install the Performance screen");
+    }
+    else
+    {
+        clickAndSettle(71); // Leave Disk before testing Option/Import separately.
+        require(processor->mountDiskImage(imageFile).wasOk(),
+                "Could not remount SET after cancelling Disk selection");
+        clickAndSettle(34); // Option / Import workspace.
+        require(processor->getPanelSelectedMode() == 34,
+                "Mounted SET did not enter the Option/Import workspace");
+        clickAndSettle(70); // Confirm the SET load.
+    }
     for (int block = 0;
          block < 256 && processor->isPanelModeDisplayTransitionActive();
          ++block)
@@ -1856,6 +1932,13 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true)
     require(processor->getPanelSelectedMode() == 39
                 && !processor->isPanelModeDisplayTransitionActive(),
             "Successful SET import left Performance mode or its LCD transaction frozen");
+    require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 0,
+            "SET import did not select A001");
+#if JUCE_MAC
+    // The firmware posts its DSP recall to the message thread, just as in a host.
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+    require(processor->getCurrentProgram() == 0, "DSP recall did not reach the message thread");
+#endif
     constexpr uint32_t storedSoundBank = 0x18000u;
     constexpr uint32_t bankBSound1Name = storedSoundBank + 128u * 256u + 240u;
     require(processor->getMasterFirmwareRuntime().sharedProgramByte(
@@ -3578,6 +3661,104 @@ void testOscillatorOctaveButtonsDriveFirmwareSoundRecord()
     }
 }
 
+void testSavedStateRestoresBanks(const juce::File& file)
+{
+    juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    juce::MemoryBlock state;
+    require(file.loadFileAsData(state), "Could not read saved machine state");
+    const auto xml = juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize()));
+    require(xml != nullptr, "Could not decode saved machine state");
+    const auto tree = juce::ValueTree::fromXml(*xml);
+    const auto data = tree.getProperty("machineActiveSetData");
+    const auto* bytes = data.getBinaryData();
+    wave::presets::WaveFactorySet expected;
+    require(bytes != nullptr && expected.load(*bytes).validLayout,
+            "Saved native bank was rejected by the SET loader");
+    juce::TemporaryFile preference(".txt");
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+    processor->prepareToPlay(48000.0, 512);
+    processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    const auto& runtime = processor->getMasterFirmwareRuntime();
+    const auto performances = expected.performanceBank();
+    const auto sounds = expected.soundBank();
+    for (size_t byte = 0; byte < performances.size(); ++byte)
+        require(runtime.sharedProgramByte(0x28000u + static_cast<uint32_t>(byte)) == performances[byte],
+                "Saved state restored a different Performance bank");
+    for (size_t byte = 0; byte < sounds.size(); ++byte)
+        require(runtime.sharedProgramByte(0x18000u + static_cast<uint32_t>(byte)) == sounds[byte],
+                "Saved state restored a different Sound bank");
+}
+
+void testReopenRestoresAllStoredBanks()
+{
+    juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    juce::TemporaryFile preference(".txt");
+    auto processor = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+    processor->prepareToPlay(48000.0, 512);
+    auto& runtime = const_cast<wave::firmware::MasterFirmwareRuntime&>(
+        processor->getMasterFirmwareRuntime());
+    std::vector<uint8_t> performances(256u * 512u);
+    std::vector<uint8_t> sounds(256u * 256u);
+    for (size_t byte = 0; byte < performances.size(); ++byte)
+        performances[byte] = runtime.sharedProgramByte(0x28000u + static_cast<uint32_t>(byte));
+    for (size_t byte = 0; byte < sounds.size(); ++byte)
+        sounds[byte] = runtime.sharedProgramByte(0x18000u + static_cast<uint32_t>(byte));
+    // Model bank changes made by Store after the original SET was imported.
+    // Change every name so restoring only the selected record cannot pass.
+    for (size_t program = 0; program < 256u; ++program)
+    {
+        performances[program * 512u + 32u] = 'R';
+        performances[program * 512u + 33u] = '0' + static_cast<uint8_t>(program % 10u);
+        sounds[program * 256u + 240u] = 'S';
+        sounds[program * 256u + 2u] = static_cast<uint8_t>(program % 128u);
+    }
+    // Native Store can leave NUL terminators in a name. This is valid machine
+    // state and also occurs in SET files saved by the firmware.
+    performances[512u + 42u] = 0;
+    performances[512u + 43u] = 0;
+    require(runtime.installPerformanceBank(performances), "Could not prepare saved Performance bank");
+    require(runtime.installSoundBank(sounds), "Could not prepare saved Sound bank");
+    juce::MemoryBlock state;
+    processor->getStateInformation(state);
+    // Embedded firmware has no remembered directory. Exercise that restore
+    // path even on machines where a local firmware preference exists.
+    auto xml = juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize()));
+    require(xml != nullptr, "Could not decode bank state");
+    auto tree = juce::ValueTree::fromXml(*xml);
+    tree.removeProperty("firmwareDirectory", nullptr);
+    juce::AudioProcessor::copyXmlToBinary(*tree.createXml(), state);
+    processor.reset();
+    auto reopened = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+    reopened->prepareToPlay(48000.0, 512);
+    reopened->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    const auto& restored = reopened->getMasterFirmwareRuntime();
+    for (size_t byte = 0; byte < performances.size(); ++byte)
+        require(restored.sharedProgramByte(0x28000u + static_cast<uint32_t>(byte)) == performances[byte],
+                "Reopening lost an unselected stored Performance");
+    for (size_t byte = 0; byte < sounds.size(); ++byte)
+        require(restored.sharedProgramByte(0x18000u + static_cast<uint32_t>(byte)) == sounds[byte],
+                "Reopening lost a stored Sound");
+    juce::AudioBuffer<float> audio(2, 512);
+    for (const auto program : { 1, 63, 128, 255 })
+    {
+        reopened->setCurrentProgram(program);
+        for (int block = 0; block < 128; ++block)
+        {
+            audio.clear();
+            juce::MidiBuffer midi;
+            reopened->processBlock(audio, midi);
+#if JUCE_MAC
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0001, true);
+#endif
+        }
+        require(restored.currentPerformanceId() == program,
+                "Reopened bank could not browse an unselected Performance");
+        const auto offset = restored.currentPerformanceRecordOffset();
+        require(offset.has_value() && restored.sharedProgramByte(*offset + 32u) == 'R',
+                "Browsing after reopening recalled a previous bank name");
+    }
+}
+
 void testStoredSoundParametersSurvivePerformanceRecall()
 {
     auto processor = std::make_unique<WaveEmulationAudioProcessor>();
@@ -5179,9 +5360,22 @@ int main(int argc, char** argv)
             std::cout << "Performance overwrite regression passed\n";
             return 0;
         }
+        if (argc > 1 && std::string_view(argv[1]) == "--reopen-banks")
+        {
+            testReopenRestoresAllStoredBanks();
+            std::cout << "Reopened stored banks regression passed\n";
+            return 0;
+        }
+        if (argc == 3 && std::string_view(argv[1]) == "--check-reopen-state")
+        {
+            testSavedStateRestoresBanks(juce::File(argv[2]));
+            std::cout << "Saved machine bank restore passed\n";
+            return 0;
+        }
         if (argc > 1 && std::string_view(argv[1]) == "--store-mode-exit")
         {
             testStoreModeButtonExitAfterSave();
+            testStoreModeButtonExitAfterSave(true);
             std::cout << "Store mode exit regression passed\n";
             return 0;
         }
@@ -5241,6 +5435,10 @@ int main(int argc, char** argv)
         if (argc > 1 && std::string_view(argv[1]) == "--disk-total-recall")
         {
             testDiskSetSerialSelectionUpdatesDsp(false);
+            testDiskSetSerialSelectionUpdatesDsp(false, true);
+            testDiskSetSerialSelectionUpdatesDsp(false, true, true);
+            testDiskSetSerialSelectionUpdatesDsp(false, true, false, false);
+            testDiskSetSerialSelectionUpdatesDsp(false, true, true, false);
             std::cout << "Disk Total Recall regression passed\n";
             return 0;
         }
@@ -5277,6 +5475,7 @@ int main(int argc, char** argv)
         testPerformanceOverwriteClearsInactiveSlots(16);
         testPerformanceOverwriteClearsInactiveSlots(512);
         testStoreModeButtonExitAfterSave();
+        testStoreModeButtonExitAfterSave(true);
         testRepeatedSoundStoreCursor();
         testStoreCancelRestoresNumericPerformancePreview();
         testKeyboardControllerShiftReachesFirmware();

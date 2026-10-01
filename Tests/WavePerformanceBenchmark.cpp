@@ -49,6 +49,9 @@ int main(int argc, char** argv)
     sound.releaseSeconds = 2.0f;
     sound.cutoffHz = 12000.0f;
     sound.filterEnvelopeSemitones = 0.0f;
+    if (argc > 3)
+        sound.resonanceAmount = juce::jlimit(0.0f, 1.0f,
+                                            juce::String(argv[3]).getFloatValue());
     juce::AudioBuffer<float> audio(2, blockSize);
     auto engineMidi = notes(voiceCount);
     const auto engineSeconds = measure([&] {
@@ -83,6 +86,8 @@ int main(int argc, char** argv)
     });
 
     std::cout << "Block size: " << blockSize << " samples, voices: " << voiceCount << '\n'
+              << "DSP resonance: " << sound.resonanceAmount << '\n'
+              << "Active DSP voices: " << engine.activeVoiceCount() << '\n'
               << "Parallel DSP: " << engineSeconds << " s, "
               << renderedSeconds / engineSeconds << "x realtime\n"
               << "Serial DSP: " << serialSeconds << " s, "
@@ -91,6 +96,8 @@ int main(int argc, char** argv)
               << "Processor boot: " << bootSeconds << " s\n"
               << "Full processor: " << processorSeconds << " s, "
               << renderedSeconds / processorSeconds << "x realtime\n";
+    std::cout << "Firmware loaded: " << processor->getMasterFirmwareRuntime().isLoaded()
+              << ", active processor voices: " << processor->getActiveVoiceCount() << '\n';
     std::cout << "Master delay cycles fast-forwarded: "
               << processor->getMasterFirmwareRuntime().fastForwardedCycleCount() << '\n';
     return 0;
