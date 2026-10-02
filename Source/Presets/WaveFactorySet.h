@@ -23,12 +23,19 @@ public:
         bool validLayout = false;
         int validSounds = 0;
         int validPerformances = 0;
+        int emptySounds = 0;
+        int emptyPerformances = 0;
+        int invalidSounds = 0;
+        int invalidPerformances = 0;
         juce::String sha256;
         juce::String detail;
     };
 
     Report load(const void* bytes, size_t size);
     Report load(const juce::MemoryBlock& data) { return load(data.getData(), data.getSize()); }
+    // Host snapshots contain native SRAM, including uninitialised/empty slots.
+    // Preserve those bytes without applying disk-import record validation.
+    Report loadStateSnapshot(const juce::MemoryBlock& data);
 
     [[nodiscard]] bool isLoaded() const noexcept { return report.validLayout; }
     [[nodiscard]] const Report& getReport() const noexcept { return report; }

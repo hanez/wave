@@ -7,7 +7,7 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parent.parent
 ALLOWED_ROOTS = {"Source", "Tests", "Tools", "cmake", "media", "scripts",
-                 "Installer", "reference-captures", "LICENSES", ".github"}
+                 "Installer", "reference-captures", "LICENSES", ".github", "docs"}
 ALLOWED_FILES = {".gitignore", "CMakeLists.txt", "README.md", "LICENSE",
                  "THIRD_PARTY_NOTICES.md", "CONTRIBUTING.md", "PUBLIC_RELEASE.md",
                  "waldorf-wave-firmware-reverse-engineering.md",

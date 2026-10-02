@@ -24,7 +24,10 @@
 #include <juce_cryptography/juce_cryptography.h>
 
 #include <cmath>
+#include <bit>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -107,6 +110,61 @@ void testDosFloppyImageCreation()
                 && std::equal(setup.begin(), setup.end(),
                               static_cast<const uint8_t*>(extracted.data.getData())),
             "Wave disk reader did not recover the created Setup byte-for-byte");
+    for (const auto halfWaves : { 0u, 61u, 64u })
+    {
+        const auto wtbFile = temporaryDirectory.getChildFile("User Table.WTB");
+        std::vector<uint8_t> wtb(138u + halfWaves * 64u, 0);
+        std::copy_n(reinterpret_cast<const uint8_t*>("USER WT  "), 9, wtb.begin());
+        wtb[9] = 0x55;
+        std::fill(wtb.begin() + 10, wtb.begin() + 138, 0xff);
+        for (size_t sample = 138; sample < wtb.size(); ++sample)
+            wtb[sample] = static_cast<uint8_t>((sample * 37u + 3u) & 0xffu);
+        require(wtbFile.replaceWithData(wtb.data(), wtb.size())
+                    && wave::firmware::DosFloppyImage::createWithWaveWavetable(
+                           imageFile, wtbFile).wasOk(),
+                "Native WTB could not be packaged in a disk image");
+        image.reset();
+        require(imageFile.loadFileAsData(image) && image.getSize() == 720u * 1024u,
+                "WTB disk has incorrect DD geometry");
+        bytes = static_cast<const uint8_t*>(image.getData());
+        require(std::equal(bytes + 3584, bytes + 3595,
+                           reinterpret_cast<const uint8_t*>("USERTABLWTB"))
+                    && std::equal(wtb.begin(), wtb.end(), bytes + 7168)
+                    && wave::firmware::DosFloppyImage::readWaveSetup(imageFile, extracted).failed(),
+                "WTB packaging changed the file or misidentified it as a SET");
+        const auto size = static_cast<uint32_t>(bytes[3612])
+                          | static_cast<uint32_t>(bytes[3613]) << 8u
+                          | static_cast<uint32_t>(bytes[3614]) << 16u
+                          | static_cast<uint32_t>(bytes[3615]) << 24u;
+        require(size == wtb.size(), "WTB directory size differs from the original");
+        require(std::equal(bytes + 512, bytes + 2048, bytes + 2048), "WTB FAT copies differ");
+        const auto clusters = (wtb.size() + 1023u) / 1024u;
+        for (size_t cluster = 2; cluster < 2 + clusters; ++cluster)
+        {
+            const auto offset = 512 + cluster * 3 / 2;
+            const auto entry = cluster % 2 == 0
+                ? static_cast<uint16_t>(bytes[offset] | (bytes[offset + 1] & 15u) << 8u)
+                : static_cast<uint16_t>((bytes[offset] >> 4u) | bytes[offset + 1] << 4u);
+            require(entry == (cluster + 1 == 2 + clusters ? 0xfffu : cluster + 1),
+                    "WTB FAT cluster chain is truncated or unterminated");
+        }
+        const auto imageBefore = image;
+        require(wave::firmware::DosFloppyImage::createWithWaveWavetable(wtbFile, wtbFile).failed(),
+                "WTB conversion overwrote its source file");
+        wtb[9] = 0;
+        image.reset();
+        require(wtbFile.replaceWithData(wtb.data(), wtb.size())
+                    && wave::firmware::DosFloppyImage::createWithWaveWavetable(
+                           imageFile, wtbFile).failed()
+                    && imageFile.loadFileAsData(image) && image == imageBefore,
+                "Rejected WTB conversion changed the destination image");
+        wtb[9] = 0x55;
+        wtb.push_back(1);
+        require(wtbFile.replaceWithData(wtb.data(), wtb.size())
+                    && wave::firmware::DosFloppyImage::createWithWaveWavetable(
+                           imageFile, wtbFile).failed(),
+                "Truncated WTB Wave data passed validation");
+    }
     require(temporaryDirectory.deleteRecursively(),
             "Could not remove the temporary DD-image test directory");
 }
@@ -156,7 +214,7 @@ void testDp8473MountedDiskImage()
     (void) controller.read(0xa8002b);
     for (int byte = 0; byte < 7; ++byte)
         (void) controller.read(0xa8000b);
-    require(controller.isDirty() && controller.flush().wasOk(),
+    require(controller.flush().wasOk(),
             "DP8473 did not persist a written sector");
 
     juce::MemoryBlock persisted;
@@ -173,7 +231,7 @@ void testDp8473MountedDiskImage()
     (void) controller.read(0xa8002b);
     for (int byte = 0; byte < 7; ++byte)
         (void) controller.read(0xa8000b);
-    require(controller.isDirty() && controller.mount(temporary).wasOk(),
+    require(controller.mount(temporary).wasOk(),
             "DP8473 could not reopen its dirty mounted image");
     controller.write(0xa80005, 0x1c);
     send({ 0x46, 0x00, 0x00, 0x00, 0x04, 0x02, 0x04, 0x2a, 0xff });
@@ -187,6 +245,147 @@ void testDp8473MountedDiskImage()
     require((controller.read(0xa8000f) & 0x80u) != 0,
             "DP8473 did not report an empty drive after ejecting its image");
     require(temporary.deleteFile(), "Could not remove the temporary DP8473 image");
+}
+
+void testDp8473AutomaticDiskWrites()
+{
+    juce::TemporaryFile directory;
+    const auto media = directory.getFile().getChildFile("media");
+    const auto offlineMedia = directory.getFile().getChildFile("offline");
+    require(media.createDirectory().wasOk(), "Could not create disk-write test directory");
+    const auto first = media.getChildFile("First.img");
+    const auto second = media.getChildFile("Second.img");
+    require(wave::firmware::DosFloppyImage::createEmpty(first).wasOk()
+                && wave::firmware::DosFloppyImage::createEmpty(second).wasOk(),
+            "Could not create disk-write fixtures");
+    juce::MemoryBlock expectedFirst, expectedSecond;
+    require(first.loadFileAsData(expectedFirst) && second.loadFileAsData(expectedSecond),
+            "Could not read disk-write fixtures");
+    const auto fillSector = [](juce::MemoryBlock& bytes, int sector, uint8_t value) {
+        std::fill_n(static_cast<uint8_t*>(bytes.getData()) + (sector - 1) * 512,
+                    512, value);
+    };
+    const auto matches = [](const juce::File& file, const juce::MemoryBlock& expected) {
+        juce::MemoryBlock bytes;
+        return file.loadFileAsData(bytes) && bytes == expected;
+    };
+    const auto waitFor = [](const auto& predicate) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+        while (!predicate())
+        {
+            if (std::chrono::steady_clock::now() >= deadline)
+                return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return true;
+    };
+
+    {
+        wave::firmware::Dp8473 controller;
+        require(controller.mount(first).wasOk(), "Could not mount disk-write fixture");
+        controller.write(0xa80005, 0x1c);
+        const auto send = [&controller](std::initializer_list<uint8_t> bytes) {
+            for (const auto byte : bytes)
+                controller.write(0xa8000b, byte);
+        };
+        const auto finish = [&controller] {
+            (void) controller.read(0xa8002b);
+            for (int byte = 0; byte < 7; ++byte)
+                (void) controller.read(0xa8000b);
+        };
+        const auto writeSector = [&](uint8_t sector, uint8_t value) {
+            send({ 0x45, 0x00, 0x00, 0x00, sector, 0x02, sector, 0x2a, 0xff });
+            for (int byte = 0; byte < 512; ++byte)
+                controller.write(0xa8001b, value);
+            finish();
+        };
+
+        writeSector(3, 0xa5);
+        fillSector(expectedFirst, 3, 0xa5);
+        require(waitFor([&] { return !controller.isDirty(); })
+                    && matches(first, expectedFirst),
+                "Sector writes did not reach the mounted file without a manual save");
+
+        send({ 0x4d, 0x00, 0x02, 0x02, 0x2a, 0xe5 });
+        for (const auto byte : { 0, 0, 4, 2, 0, 0, 5, 2 })
+            controller.write(0xa8001b, static_cast<uint8_t>(byte));
+        finish();
+        fillSector(expectedFirst, 4, 0xe5);
+        fillSector(expectedFirst, 5, 0xe5);
+        require(waitFor([&] { return !controller.isDirty(); })
+                    && matches(first, expectedFirst),
+                "Formatted sectors did not automatically replace the disk image");
+
+        // Manual flushes and the automatic writer may overlap newer DMA writes.
+        // The last revision must win and all unrelated bytes must survive.
+        std::atomic<bool> flushesSucceeded{ true };
+        std::thread flusher([&] {
+            for (int flush = 0; flush < 32; ++flush)
+            {
+                if (controller.flush().failed())
+                    flushesSucceeded.store(false);
+                std::this_thread::sleep_for(std::chrono::milliseconds(8));
+            }
+        });
+        for (uint8_t value = 0; value < 32; ++value)
+        {
+            writeSector(6, value);
+            std::this_thread::sleep_for(std::chrono::milliseconds(8));
+        }
+        flusher.join();
+        fillSector(expectedFirst, 6, 31);
+        require(flushesSucceeded.load()
+                    && waitFor([&] { return !controller.isDirty(); })
+                    && matches(first, expectedFirst),
+                "Concurrent saves replaced newer sectors with an older image");
+
+        // A disconnected destination must retain pending bytes and retry when
+        // it returns, without replacing the old file with incomplete data.
+        require(media.moveFileTo(offlineMedia), "Could not disconnect test media");
+        writeSector(7, 0x7c);
+        require(waitFor([&] { return controller.mountedDescription().contains("save failed"); })
+                    && controller.isDirty()
+                    && matches(offlineMedia.getChildFile(first.getFileName()), expectedFirst),
+                "A failed automatic save lost data or was not reported");
+        fillSector(expectedFirst, 7, 0x7c);
+        require(offlineMedia.moveFileTo(media), "Could not reconnect test media");
+        require(waitFor([&] { return !controller.isDirty(); })
+                    && matches(first, expectedFirst)
+                    && !controller.mountedDescription().contains("save failed"),
+                "Automatic disk saving did not recover after reconnecting media");
+
+        writeSector(8, 0x8d);
+        fillSector(expectedFirst, 8, 0x8d);
+        require(controller.mount(second).wasOk() && matches(first, expectedFirst),
+                "Changing disks lost pending writes to the previous image");
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        require(matches(second, expectedSecond),
+                "The old disk's automatic save overwrote the replacement image");
+        controller.write(0xa80005, 0x1c);
+        writeSector(9, 0x9e);
+        fillSector(expectedSecond, 9, 0x9e);
+        // Destruction must save even if the batching interval has not elapsed.
+    }
+    require(matches(second, expectedSecond),
+            "Controller destruction lost the final pending disk write");
+
+    require(second.setReadOnly(true), "Could not write-protect test media");
+    auto writeProtected = false;
+    {
+        wave::firmware::Dp8473 controller;
+        const auto mounted = controller.mount(second);
+        controller.write(0xa80005, 0x1c);
+        for (const auto byte : { 0x45, 0, 0, 0, 9, 2, 9, 0x2a, 0xff })
+            controller.write(0xa8000b, static_cast<uint8_t>(byte));
+        const auto st0 = controller.read(0xa8000b);
+        const auto st1 = controller.read(0xa8000b);
+        writeProtected = mounted.wasOk() && !controller.isWritable()
+                         && !controller.drqAsserted() && !controller.isDirty()
+                         && (st0 & 0x40u) != 0 && (st1 & 0x02u) != 0;
+    }
+    require(second.setReadOnly(false), "Could not unlock test media");
+    require(writeProtected && matches(second, expectedSecond),
+            "Automatic saving bypassed native floppy write protection");
 }
 
 void testCutoffControlLaw()
@@ -330,14 +529,13 @@ void testAsicClockMixOverflowAndVcfSaturation()
             "VCF input saturation is not a mild symmetric compression near 70% level");
 }
 
-void testAsicResampling()
+void testAsicResampling(double clockRate = 250000.0)
 {
-    constexpr auto clockRate = wave::dsp::OscillatorChipProxy::modelClockRate();
     for (const auto hostRate : { 32000.0, 44100.0, 48000.0, 88200.0,
                                  96000.0, 192000.0, 250000.0, 384000.0 })
     {
         wave::dsp::AsicResampler resampler;
-        resampler.prepare(hostRate);
+        resampler.prepare(hostRate, clockRate);
         auto clockPhase = 0.0;
         auto tick = int64_t { 0 };
         const auto render = [&](double frequency, int samples) {
@@ -399,6 +597,72 @@ void testAsicResampling()
         resampler.reset();
         require(resampler.read(0.37) == 0.0f,
                 "ASIC resampler retains history after reset");
+    }
+}
+
+void testResamplerSimdAgainstScalar(double clockRate = 250000.0)
+{
+    constexpr auto phases = 64;
+    for (const auto rate : { 22050.0, 44100.0, 48000.0, 96000.0, 192000.0, 250000.0 })
+    {
+        wave::dsp::AsicResampler resampler;
+        resampler.prepare(rate, clockRate);
+        const auto ratio = clockRate / std::min(rate, clockRate);
+        const auto taps = 4 * static_cast<int>(std::ceil(24.0 * ratio));
+        const auto radius = static_cast<double>(taps) * 0.5;
+        const auto cutoff = 0.45 / ratio;
+        std::vector<float> coefficients(static_cast<size_t>((phases + 1) * taps));
+        for (int phase = 0; phase <= phases; ++phase)
+        {
+            double sum = 0.0;
+            for (int tap = 0; tap < taps; ++tap)
+            {
+                const auto distance = tap + static_cast<double>(phase) / phases - radius;
+                const auto angle = juce::MathConstants<double>::twoPi * cutoff * distance;
+                const auto sinc = std::abs(angle) < 1.0e-12 ? 1.0 : std::sin(angle) / angle;
+                const auto window = 0.42 + 0.5 * std::cos(
+                    juce::MathConstants<double>::pi * distance / radius)
+                    + 0.08 * std::cos(juce::MathConstants<double>::twoPi * distance / radius);
+                auto& value = coefficients[static_cast<size_t>(phase * taps + tap)];
+                value = static_cast<float>(2.0 * cutoff * sinc * window);
+                sum += value;
+            }
+            for (int tap = 0; tap < taps; ++tap)
+            {
+                auto& value = coefficients[static_cast<size_t>(phase * taps + tap)];
+                value = static_cast<float>(value / sum);
+            }
+        }
+        std::vector<float> history(static_cast<size_t>(taps));
+        int head = 0;
+        uint32_t random = 12345;
+        for (int tick = 0; tick < taps * 2 + 9; ++tick)
+        {
+            random = random * 1664525u + 1013904223u;
+            const auto input = static_cast<float>(static_cast<int32_t>(random)) / 2147483648.0f;
+            resampler.push(input);
+            head = (head + taps - 1) % taps;
+            history[static_cast<size_t>(head)] = input;
+            for (const auto fraction : { 0.0, 0.013, 0.37, 0.999, 1.0 })
+            {
+                const auto position = fraction * phases;
+                const auto phase = std::min(phases - 1, static_cast<int>(position));
+                const auto blend = static_cast<float>(position - phase);
+                std::array<float, 4> a {}, b {};
+                for (int tap = 0; tap < taps; ++tap)
+                {
+                    const auto sample = history[static_cast<size_t>((head + tap) % taps)];
+                    const auto lane = static_cast<size_t>(tap % 4);
+                    a[lane] += sample * coefficients[static_cast<size_t>(phase * taps + tap)];
+                    b[lane] += sample * coefficients[static_cast<size_t>((phase + 1) * taps + tap)];
+                }
+                const auto first = (a[0] + a[1]) + (a[2] + a[3]);
+                const auto second = (b[0] + b[1]) + (b[2] + b[3]);
+                const auto expected = first + blend * (second - first);
+                require(std::abs(resampler.read(fraction) - expected) < 2.0e-6f,
+                        "SIMD resampler differs from the scalar convolution");
+            }
+        }
     }
 }
 
@@ -587,6 +851,36 @@ void testPerformanceTuningTables()
     require(std::abs(heldPitch(60) - 67.25f) < 1.0e-5f,
             "Wave SET User table 1 could not be selected directly");
 
+    // A SET with displaced Performance bytes in its tuning pool must not
+    // remap every Global Instrument to arbitrary notes. Reset each damaged
+    // table completely while preserving an adjacent valid custom tuning.
+    const auto pristineTuning = setImage;
+    bytes[0x42e7cu + 69u * 2u + 1u] = 0;
+    bytes[0x42e7cu + 256u + 60u * 2u] = 62;
+    bytes[0x42e7cu + 256u + 60u * 2u + 1u] = 114;
+    bytes[0x42e7cu + 512u + 69u * 2u] = 0x80;
+    bytes[0x42e7cu + 768u + 69u * 2u + 1u] = 115;
+    const auto damagedTuning = setImage;
+    juce::ignoreUnused(engine.loadWaveSetUserTables(setImage));
+    const auto checkPitch = [&](int table, int key, float expected) {
+        layer.tuningTable = table;
+        juce::MidiBuffer events;
+        events.addEvent(juce::MidiMessage::allSoundOff(1), 0);
+        events.addEvent(juce::MidiMessage::noteOn(1, key, 0.9f), 1);
+        engine.render(audio, events, performance);
+        require(std::abs(heldPitch(key) - expected) < 1.0e-5f,
+                "Malformed SET tuning data changed the played note");
+    };
+    for (const auto key : { 48, 60, 69, 72 })
+        checkPitch(0, key, static_cast<float>(key));
+    checkPitch(8, 60, 60.0f);
+    checkPitch(9, 60, 62.5f);
+    checkPitch(10, 60, 60.0f);
+    checkPitch(11, 60, 60.0f);
+    require(setImage == damagedTuning, "Tuning quarantine changed source SET bytes");
+    juce::ignoreUnused(engine.loadWaveSetUserTables(pristineTuning));
+    checkPitch(0, 60, 67.25f);
+
     // HMT retunes a held chord as notes arrive. The oscillator must keep that
     // pitch after the next voice-board control update, including when changing
     // back to HMT while the chord is already sounding.
@@ -749,6 +1043,154 @@ void testFreeRunningEngineLfo()
             "Unsynchronised Wave LFO phase froze while no voice was sounding");
 }
 
+void testSparsePerformanceBanks()
+{
+    constexpr size_t soundOffset = 0x12e7c;
+    constexpr size_t performanceOffset = 0x22e7c;
+    juce::MemoryBlock image(performanceOffset + 256 * 512, true);
+    auto* bytes = static_cast<uint8_t*>(image.getData());
+    bytes[soundOffset + 239] = 0x55;
+    bytes[performanceOffset + 48] = 0x55;
+    std::copy_n("ONLY PATCH", 10, bytes + performanceOffset + 32);
+    wave::presets::WaveFactorySet set;
+    const auto report = set.load(image);
+    require(report.validLayout && report.validPerformances == 1
+                && report.emptyPerformances == 255,
+            "A one-patch SET with empty slots was rejected");
+    require(set.performanceName(0, 1).empty() && set.performance(1, 127)[48] == 0,
+            "An empty Performance was replaced during SET import");
+    const auto pristine = image;
+    auto* damaged = bytes + performanceOffset + 151u * 512u;
+    std::fill_n(damaged, 512, uint8_t{ 0xff });
+    damaged[48] = 0x55;
+    auto damagedReport = set.load(image);
+    require(damagedReport.validLayout && damagedReport.invalidPerformances == 1
+                && set.performanceName(0, 0) == "ONLY PATCH"
+                && std::all_of(set.performance(1, 23).begin(), set.performance(1, 23).end(),
+                               [](uint8_t value) { return value == 0; })
+                && set.sourceImage() == image,
+            "One damaged Performance rejected the bank or changed the source disk bytes");
+    require(set.loadStateSnapshot(image).validLayout && set.performance(1, 23)[0] == 0xff,
+            "Disk-import quarantine changed an exact host SRAM snapshot");
+    image = pristine;
+    bytes = static_cast<uint8_t*>(image.getData());
+    for (size_t slot = 1; slot <= 7; ++slot)
+        bytes[performanceOffset + slot * 512u + 32u] = 0xff;
+    require(!set.load(image).validLayout,
+            "A bank with more than six malformed Performances passed SET validation");
+    image.reset();
+    image.setSize(performanceOffset + 256 * 512, true);
+    require(!set.load(image).validLayout, "A zero-filled file passed disk SET validation");
+    require(set.loadStateSnapshot(image).validLayout,
+            "An empty native host bank failed snapshot recall");
+    require(set.performanceName(0, 0).empty(), "Empty snapshot recalled a prior patch");
+}
+
+void testDamagedUserWavetableImport()
+{
+    constexpr size_t tableOffset = 0x4387c;
+    constexpr size_t waveOffset = 0x45afc;
+    std::vector<uint8_t> setup(waveOffset + 1000u * 64u, 128);
+    const auto reference = [&](int table, int wave, uint16_t value) {
+        const auto offset = tableOffset + static_cast<size_t>(table) * 138u
+                            + 10u + static_cast<size_t>(wave) * 2u;
+        setup[offset] = static_cast<uint8_t>(value >> 8u);
+        setup[offset + 1] = static_cast<uint8_t>(value);
+    };
+    for (int table = 0; table < 64; ++table)
+    {
+        const auto record = tableOffset + static_cast<size_t>(table) * 138u;
+        setup[record + 9] = 0x55;
+        std::fill_n(setup.begin() + static_cast<std::ptrdiff_t>(record + 10), 128, 0xff);
+        reference(table, 0, 0);
+        reference(table, 60, 1);
+    }
+    wave::dsp::WavetableBank init;
+    require(init.loadWaveSetUserTables(setup.data(), setup.size()), "INIT fixture failed to import");
+    const auto hash = [](const wave::dsp::WavetableBank& bank, int first, int last) {
+        std::vector<int8_t> codes;
+        for (int table = first; table < last; ++table)
+            for (int wave = 0; wave < 64; ++wave)
+                for (int sample = 0; sample < 128; ++sample)
+                    codes.push_back(bank.rawSample(table, wave, sample));
+        return juce::SHA256(codes.data(), codes.size()).toHexString();
+    };
+    auto imported = init;
+    const auto audioSnapshot = imported.renderSnapshot();
+    const auto previousHash = hash(init, 0, 128);
+    const auto factoryHash = hash(init, 0, 64);
+    reference(0, 0, 300);
+    reference(63, 0, 1299); // Last valid user Wave, after damaged table 93.
+    setup[waveOffset] = 230;
+    setup[waveOffset + 999u * 64u] = 20;
+    reference(28, 0, 0x4c54); // DG_PE's misplaced Performance record.
+    setup[tableOffset + 30u * 138u + 9u] = 0;
+    reference(31, 0, 1300); // One past the last stored user Wave.
+    reference(32, 0, 0xffff); // Sparse table with no leading anchor.
+    reference(32, 15, 2);
+    const auto source = setup;
+    require(imported.loadWaveSetUserTables(setup.data(), setup.size())
+                && imported.hasWaveSetUserTables() && imported.damagedUserTableCount() == 3,
+            "Damaged records aborted the complete user-table import");
+    require(imported.rawSample(64, 0, 0) == 102 && imported.rawSample(127, 0, 0) == -108,
+            "Valid tables on either side of a damaged record were not imported");
+    for (const auto table : { 92, 94, 95 })
+        for (int wave = 0; wave < 64; ++wave)
+            for (int sample = 0; sample < 128; ++sample)
+                require(imported.rawSample(table, wave, sample) == init.rawSample(64, wave, sample),
+                        "A damaged user table retained old samples instead of INIT");
+    require(imported.rawSample(96, 0, 0) == imported.rawSample(0, 0, 0)
+                && hash(imported, 0, 64) == factoryHash && hash(init, 0, 128) == previousHash
+                && hash(audioSnapshot, 0, 128) == previousHash
+                && setup == source,
+            "User import changed factory waves, a shared bank, or its source bytes");
+    const auto importedHash = hash(imported, 0, 128);
+    require(!imported.loadWaveSetUserTables(setup.data(), waveOffset)
+                && hash(imported, 0, 128) == importedHash,
+            "Truncated SET changed the active wavetable bank");
+    for (int table = 0; table < 64; ++table)
+        setup[tableOffset + static_cast<size_t>(table) * 138u + 9u] = 0;
+    require(!imported.loadWaveSetUserTables(setup.data(), setup.size())
+                && hash(imported, 0, 128) == importedHash,
+            "Unrelated data replaced the active wavetable bank");
+    require(imported.loadWaveSetUserTables(source.data(), source.size()), "Repeated SET import failed");
+
+    // Publishing from the loader must not change a bank being sampled by
+    // the audio thread, including when factory ROMs are replaced explicitly.
+    std::vector<int8_t> firstBank(128u * 64u * 128u, 24);
+    std::vector<int8_t> secondBank(firstBank.size(), -53);
+    require(imported.loadSigned8BitRom(firstBank.data(), firstBank.size()), "Concurrent fixture failed");
+    std::atomic<bool> finished{ false };
+    std::atomic<bool> coherent{ true };
+    std::atomic<int> snapshots{ 0 };
+    std::thread renderer([&] {
+        while (!finished.load(std::memory_order_acquire))
+        {
+            const auto snapshot = imported.renderSnapshot();
+            const auto expected = snapshot.rawSample(0, 0, 0);
+            if (expected != 24 && expected != -53)
+                coherent.store(false, std::memory_order_relaxed);
+            for (int table = 0; table < 128; ++table)
+                for (int wave = 0; wave < 64; ++wave)
+                    if (snapshot.rawSample(table, wave, (wave * 13) % 128) != expected)
+                        coherent.store(false, std::memory_order_relaxed);
+            snapshots.fetch_add(1, std::memory_order_relaxed);
+        }
+    });
+    while (snapshots.load(std::memory_order_acquire) == 0)
+        std::this_thread::yield();
+    bool loaded = true;
+    for (int load = 0; load < 32; ++load)
+    {
+        const auto& bank = load % 2 == 0 ? secondBank : firstBank;
+        loaded = imported.loadSigned8BitRom(bank.data(), bank.size()) && loaded;
+    }
+    finished.store(true, std::memory_order_release);
+    renderer.join();
+    require(loaded && coherent.load() && snapshots.load() > 0,
+            "Concurrent wavetable publication changed samples within an audio snapshot");
+}
+
 void testFactorySetWhenAvailable()
 {
     const auto* path = std::getenv("WAVE_FACTORY_SET");
@@ -793,19 +1235,25 @@ void testFactorySetWhenAvailable()
                 && wavetableBank.hasWaveSetUserTables(),
             "Factory SET user Wavetables were not decoded");
 
-    // Sound A001 (used by Performance A030, Sitar) stores selector 95.  That
-    // is user-table slot 32, named TSITAR3 in this SET, and maps to engine
-    // table index 95. Its first 13 entries reference flat factory Wave
-    // numbers $0507..$0513: table 20, positions 7..19.
+    // TSITAR3's first 13 references are native U987..U999 (1287..1299),
+    // followed by legacy Wave Edit workspace references $100D..$103F.
     constexpr auto sitarTable = 95;
-    for (int wave = 0; wave < 13; ++wave)
-        for (int sample = 0; sample < wave::dsp::WavetableBank::samplesPerWave; ++sample)
-            require(wavetableBank.rawSample(sitarTable, wave, sample)
-                        == wavetableBank.rawSample(20, 7 + wave, sample),
-                    "TSITAR3 factory-Wave reference was decoded incorrectly");
-
     constexpr size_t userWaveBankOffset = 0x45afc;
     const auto* setBytes = static_cast<const uint8_t*>(data.getData());
+    for (int wave = 0; wave < 13; ++wave)
+        for (int sample = 0; sample < 64; ++sample)
+        {
+            const auto stored = setBytes[userWaveBankOffset
+                                         + static_cast<size_t>(987 + wave) * 64u
+                                         + static_cast<size_t>(sample)];
+            require(wavetableBank.rawSample(sitarTable, wave, sample)
+                        == static_cast<int8_t>(static_cast<int>(stored) - 128)
+                        && wavetableBank.rawSample(sitarTable, wave, 127 - sample)
+                               == static_cast<int8_t>(static_cast<int>(
+                                                         static_cast<uint8_t>(~stored)) - 128),
+                    "TSITAR3 native user-Wave reference was decoded incorrectly");
+        }
+
     for (int sample = 0; sample < 64; ++sample)
     {
         const auto stored = setBytes[userWaveBankOffset + 13u * 64u
@@ -927,6 +1375,156 @@ void testFactoryUpperWavetableBank()
     require(fingerprint == 0x8021f195e5862f4full,
             "Wave factory tables 31..64 are not the complete reference bank");
 #endif
+}
+
+void testOriginalWaveFactoryTablesWhenAvailable()
+{
+    const auto* directory = std::getenv("WAVE_FIRMWARE_DIR");
+    if (directory == nullptr)
+        return;
+    juce::MemoryBlock image;
+    require(juce::File(directory).getChildFile("w2sys.bin").loadFileAsData(image),
+            "Wave factory-table source firmware could not be read");
+    wave::dsp::WavetableBank bank;
+    const auto untouchedUserWave = bank.rawSample(64, 12, 34);
+    require(bank.loadWaveFactoryRom(image.getData(), image.getSize()),
+            "Original Wave factory routines failed to produce the verified bank");
+    require(bank.hasOriginalWaveFactoryTables() && bank.importedTableCount() == 64,
+            "Original factory bank was not marked as complete");
+    std::vector<uint8_t> halfWaves;
+    for (int table = 0; table < 64; ++table)
+        for (int wave = 0; wave < 64; ++wave)
+            for (int sample = 0; sample < 64; ++sample)
+            {
+                const auto value = static_cast<uint8_t>(
+                    static_cast<int>(bank.rawSample(table, wave, sample)) + 128);
+                halfWaves.push_back(value);
+                require(bank.rawSample(table, wave, 127 - sample)
+                            == static_cast<int8_t>(static_cast<int>(
+                                                       static_cast<uint8_t>(~value)) - 128),
+                        "Wave factory waveform lost its complemented half-cycle");
+            }
+    require(juce::SHA256(halfWaves.data(), halfWaves.size()).toHexString()
+                == "e2d3bdd4d22053058458962df7dc9a7ad08e895190f7b08e7f6b1ef63d1976c3",
+            "Factory bank differs from the original OS 1.700 routine output");
+    require(bank.rawSample(0, 60, 0) == 2
+                && bank.rawSample(0, 61, 0) == 2
+                && bank.rawSample(0, 62, 0) == 64
+                && bank.rawSample(0, 63, 0) == 64
+                && bank.rawSample(0, 63, 63) == 1,
+            "Wave endpoint or triangle/square/saw slots use PPG replacements");
+    require(bank.rawSample(64, 12, 34) == untouchedUserWave,
+            "Factory installation overwrote a user wavetable");
+    // The individual ROM Wave palette is separate from the 64 factory
+    // tables: user records address R000..R299, then U000..U999.
+    const auto* romBytes = static_cast<const uint8_t*>(image.getData());
+    for (int wave = 0; wave < 300; ++wave)
+        for (int sample = 0; sample < 64; ++sample)
+        {
+            const auto value = romBytes[0x41850u + static_cast<size_t>(wave) * 64u
+                                       + static_cast<size_t>(sample)];
+            require(bank.rawRomWaveSample(wave, sample)
+                        == static_cast<int8_t>(static_cast<int>(value) - 128)
+                        && bank.rawRomWaveSample(wave, 127 - sample)
+                               == static_cast<int8_t>(static_cast<int>(
+                                                         static_cast<uint8_t>(~value)) - 128),
+                    "Original ROM Wave palette differs from firmware data");
+        }
+
+    constexpr size_t tableOffset = 0x4387c;
+    constexpr size_t waveOffset = 0x45afc;
+    std::vector<uint8_t> setup(waveOffset + 1000u * 64u, 128);
+    for (int table = 0; table < 64; ++table)
+    {
+        const auto record = tableOffset + static_cast<size_t>(table) * 138u;
+        setup[record + 9] = 0x55;
+        std::fill_n(setup.begin() + static_cast<std::ptrdiff_t>(record + 10), 128, 0xff);
+        setup[record + 10] = 0;
+        setup[record + 11] = 0;
+        setup[record + 130] = 0;
+        setup[record + 131] = 1;
+    }
+    class UserTableBus final : public wave::firmware::M68000Bus
+    {
+    public:
+        std::vector<uint8_t> ram = std::vector<uint8_t>(0x200000);
+        bool completed = false;
+        bool unmapped = false;
+        uint8_t read8(uint32_t address) noexcept override
+        {
+            if (address < ram.size()) return ram[address];
+            unmapped = true;
+            return 0xff;
+        }
+        void write8(uint32_t address, uint8_t value) noexcept override
+        {
+            if (address < ram.size()) ram[address] = value;
+            else unmapped = true;
+        }
+        bool usesInstructionInterception() const noexcept override { return true; }
+        bool interceptInstruction(wave::firmware::M68000& cpu, uint32_t pc) noexcept override
+        {
+            if (pc != 0x00bd6e) return false;
+            completed = true;
+            cpu.endTimeslice();
+            return true;
+        }
+    } bus;
+    for (int fixture = 0; fixture < 2; ++fixture)
+    {
+        if (fixture == 1)
+        {
+            const auto reference = [&](int wave, uint16_t value) {
+                setup[tableOffset + 10u + static_cast<size_t>(wave) * 2u]
+                    = static_cast<uint8_t>(value >> 8u);
+                setup[tableOffset + 11u + static_cast<size_t>(wave) * 2u]
+                    = static_cast<uint8_t>(value);
+            };
+            reference(0, 299);
+            reference(30, 300);
+            reference(60, 1299);
+            for (size_t sample = 0; sample < 64; ++sample)
+            {
+                setup[waveOffset + sample] = static_cast<uint8_t>(sample * 3u);
+                setup[waveOffset + 999u * 64u + sample] = static_cast<uint8_t>(255u - sample * 2u);
+            }
+        }
+        require(bank.loadWaveSetUserTables(setup.data(), setup.size()),
+                "Native user Wave fixture failed to import");
+        std::fill(bus.ram.begin(), bus.ram.end(), 0);
+        bus.completed = false;
+        bus.unmapped = false;
+        std::copy_n(romBytes, image.getSize(), bus.ram.begin() + 0x1000);
+        std::copy_n(setup.begin() + tableOffset, 138, bus.ram.begin() + 0x148a00);
+        std::copy_n(setup.begin() + waveOffset, 1000u * 64u, bus.ram.begin() + 0x14ac80);
+        wave::firmware::M68000 cpu;
+        cpu.start(bus, 0x0ffffe, 0x011bb8);
+        cpu.setDataRegister(bus, 0, 64);
+        cpu.setDataRegister(bus, 1, 0);
+        for (int cycles = 0; !bus.completed && !bus.unmapped && cycles < 2000000;
+             cycles += 10000)
+            cpu.execute(bus, 10000);
+        require(bus.completed && !bus.unmapped,
+                "Original firmware failed to generate a native user table");
+        for (int wave = 0; wave < 64; ++wave)
+            for (int sample = 0; sample < 64; ++sample)
+            {
+                const auto value = bus.ram[0x104000u + static_cast<size_t>(wave) * 64u
+                                          + static_cast<size_t>(sample)];
+                require(bank.rawSample(64, wave, sample)
+                            == static_cast<int8_t>(static_cast<int>(value) - 128)
+                            && bank.rawSample(64, wave, 127 - sample)
+                                   == static_cast<int8_t>(static_cast<int>(
+                                                             static_cast<uint8_t>(~value)) - 128),
+                        "Native user table differs from original firmware output");
+            }
+    }
+
+    auto corrupted = image;
+    static_cast<uint8_t*>(corrupted.getData())[100] ^= 1;
+    require(!bank.loadWaveFactoryRom(corrupted.getData(), corrupted.getSize())
+                && bank.hasOriginalWaveFactoryTables() && bank.rawSample(0, 63, 63) == 1,
+            "Unverified firmware was accepted or changed the existing bank");
 }
 
 void testExpandedFirst32Loading()
@@ -1154,6 +1752,54 @@ void testAllVoiceFiltersAreCalibrated()
     }
     require(maximumResponse / minimumResponse < 1.0001,
             "Fixed reconstruction filters retain an undocumented voice spread");
+}
+
+void testReconstructionCachedTransfer()
+{
+    // Independent, uncached signal path: exercise every DAC code, rounding
+    // boundary, clipping, reset, and live age changes against the original math.
+    for (const auto rate : { 44100.0, 48000.0, 96000.0, 250000.0 })
+    {
+        wave::dsp::ReconstructionStage reconstruction;
+        reconstruction.prepare(rate, 0.0f);
+        const auto firstPole = 1.0f - std::exp(
+            -juce::MathConstants<float>::twoPi * 15400.0f * 0.5f
+            / static_cast<float>(rate));
+        const auto g = std::tan(juce::MathConstants<float>::pi * 15400.0f
+                                / static_cast<float>(rate));
+        const auto a1 = 1.0f / (1.0f + g * (g + 0.5f));
+        const auto a2 = g * a1;
+        const auto a3 = g * a2;
+        const auto highpass = std::exp(-juce::MathConstants<float>::twoPi * 7.0f
+                                       / static_cast<float>(rate));
+        float state = 0.0f, secondState = 0.0f, thirdState = 0.0f, dcState = 0.0f;
+        for (const auto age : { 0.0f, 0.18f, 1.0f, 0.4f, 0.0f })
+        {
+            reconstruction.setAge(age);
+            for (int code = -140; code <= 140; ++code)
+                for (const auto offset : { -0.501f, -0.5f, 0.0f, 0.5f, 0.501f })
+                {
+                    const auto input = (static_cast<float>(code) + offset) / 127.0f;
+                    const auto quantised = std::round(
+                        juce::jlimit(-1.0f, 1.0f, input) * 127.0f) / 127.0f;
+                    const auto saturated = std::tanh(quantised * (1.0f + age * 0.16f));
+                    state += firstPole * (saturated - state);
+                    const auto v3 = state - thirdState;
+                    const auto v1 = a1 * secondState + a2 * v3;
+                    const auto v2 = thirdState + a2 * secondState + a3 * v3;
+                    secondState = 2.0f * v1 - secondState;
+                    thirdState = 2.0f * v2 - thirdState;
+                    const auto dc = v2 + highpass * (dcState - v2);
+                    const auto expected = v2 - dc;
+                    dcState = dc;
+                    require(std::bit_cast<uint32_t>(reconstruction.process(input))
+                                == std::bit_cast<uint32_t>(expected),
+                            "Cached reconstruction differs from the uncached transfer");
+                }
+            reconstruction.reset();
+            state = secondState = thirdState = dcState = 0.0f;
+        }
+    }
 }
 
 void testCemControlVoltageSettling()
@@ -1623,6 +2269,36 @@ void testAudibleKeyboardRange()
     }
 }
 
+void testEmptyPerformanceSilencesHeldNotes()
+{
+    wave::dsp::WaldorfEngine engine;
+    engine.prepare(48000.0, 512);
+    wave::dsp::WaldorfEngine::PerformanceSnapshot performance;
+    performance.layers[0].enabled = true;
+    performance.layers[0].source = 3;
+    performance.circuitAgeAmount = 0.0f;
+    performance.layers[0].sound.attackSeconds = 0.001f;
+    performance.layers[0].sound.filterEnvelopeSemitones = 0.0f;
+    performance.layers[0].sound.cutoffHz = 16000.0f;
+    juce::AudioBuffer<float> audio(2, 512);
+    juce::MidiBuffer noteOn;
+    noteOn.addEvent(juce::MidiMessage::noteOn(1, 60, 1.0f), 0);
+    engine.render(audio, noteOn, performance);
+    require(audio.getMagnitude(0, 0, 512) > 1.0e-6f,
+            "Empty Performance fixture did not start an audible held note");
+    performance.layers[0].enabled = false;
+    // Drain the analogue output stage's stored charge after removing its input.
+    for (int block = 0; block < 64; ++block)
+    {
+        audio.clear();
+        engine.render(audio, {}, performance);
+    }
+    // The output-stage model retains its tiny analogue noise floor.
+    require(audio.getMagnitude(0, 0, 512) < 2.0e-6f
+                && audio.getMagnitude(1, 0, 512) < 2.0e-6f,
+            "Selecting an empty Performance retained the preceding held voice audio");
+}
+
 void testPerformanceMidi()
 {
     wave::dsp::WaldorfEngine engine;
@@ -1678,6 +2354,171 @@ void testPerformanceMidi()
     engine.render(audio, panic, parameters);
     require(engine.activeVoiceCount() == 0,
             "MIDI all-sound-off did not stop voices immediately");
+}
+
+void testInstrumentVoiceAllocation()
+{
+    wave::dsp::WaldorfEngine engine;
+    engine.prepare(48000.0, 512);
+    wave::dsp::WaldorfEngine::PerformanceSnapshot performance;
+    auto& layer = performance.layers[0];
+    layer.enabled = true;
+    layer.source = 3;
+    layer.sound.attackSeconds = 0.3f;
+    layer.sound.filterAttackSeconds = 0.3f;
+    layer.sound.releaseSeconds = 0.2f;
+    juce::AudioBuffer<float> audio(2, 1);
+    const auto send = [&](const juce::MidiMessage& message, bool local = false) {
+        juce::MidiBuffer midi;
+        midi.addEvent(message, 0);
+        if (local)
+            engine.render(audio, {}, midi, performance);
+        else
+            engine.render(audio, midi, performance);
+    };
+    const auto warm = [&] {
+        juce::AudioBuffer<float> block(2, 512);
+        for (int count = 0; count < 16; ++count)
+            engine.render(block, {}, performance);
+    };
+    const auto heldNote = [&] {
+        auto note = -1;
+        auto count = 0;
+        for (const auto& voice : engine.voiceStates())
+            if (voice.active && voice.keyDown && voice.layer == 0)
+            {
+                note = voice.triggerNote;
+                ++count;
+            }
+        require(count == 1, "Monophonic Instrument allocated more than one held voice");
+        return note;
+    };
+    for (int mode = 17; mode <= 22; ++mode)
+    {
+        engine.reset();
+        layer.allocationMode = mode;
+        const auto priority = (mode - 17) % 3;
+        send(juce::MidiMessage::noteOn(1, 60, 0.8f));
+        warm();
+        const auto envelopeBefore = engine.firstActiveAmplifierEnvelopeValue();
+        const auto filterBefore = engine.firstActiveFilterEnvelopeValue();
+        require(envelopeBefore > 0.05f && filterBefore > 0.05f,
+                "Mono envelope fixture did not advance its attack");
+        send(juce::MidiMessage::noteOn(1, 67, 0.9f));
+        require(heldNote() == (priority == 1 ? 60 : 67),
+                "Mono last/low/high note priority is incorrect");
+        if (mode >= 20 || priority == 1)
+            require(engine.firstActiveAmplifierEnvelopeValue() >= envelopeBefore - 0.01f
+                        && engine.firstActiveFilterEnvelopeValue() >= filterBefore - 0.01f,
+                    "Single-trigger or non-priority key restarted an envelope");
+        else
+            require(engine.firstActiveAmplifierEnvelopeValue() < envelopeBefore * 0.25f
+                        && engine.firstActiveFilterEnvelopeValue() < filterBefore * 0.25f,
+                    "Mono retrigger mode did not restart the envelopes");
+        send(juce::MidiMessage::noteOn(1, 55, 0.7f));
+        require(heldNote() == (priority == 2 ? 67 : 55),
+                "Mono low/high priority failed with three overlapping keys");
+        send(juce::MidiMessage::noteOff(1, 55));
+        require(heldNote() == (priority == 1 ? 60 : 67),
+                "Mono release did not return to the correct held key");
+        send(juce::MidiMessage::noteOff(1, 67));
+        require(heldNote() == 60, "Mono allocation forgot the first held key");
+        send(juce::MidiMessage::controllerEvent(1, 64, 127));
+        send(juce::MidiMessage::noteOff(1, 60));
+        require(engine.heldVoiceCount() == 0 && engine.activeVoiceCount() == 1,
+                "Mono sustain released its voice too early or retained a held key");
+        send(juce::MidiMessage::controllerEvent(1, 64, 0));
+        send(juce::MidiMessage::allSoundOff(1));
+        require(engine.activeVoiceCount() == 0, "Mono panic left a sounding voice");
+        // Local keyboard and repeated-pitch MIDI Note Offs use the same
+        // priority stack without consuming another physical voice.
+        send(juce::MidiMessage::noteOn(1, 60, 0.8f), true);
+        send(juce::MidiMessage::noteOn(1, 60, 0.9f), true);
+        send(juce::MidiMessage::noteOff(1, 60), true);
+        require(heldNote() == 60, "Repeated mono pitch lost its remaining keystroke");
+        send(juce::MidiMessage::noteOff(1, 60), true);
+        require(engine.heldVoiceCount() == 0, "Repeated mono pitch became stuck");
+    }
+
+    engine.reset();
+    layer.allocationMode = 1;
+    send(juce::MidiMessage::noteOn(1, 60, 0.8f));
+    send(juce::MidiMessage::noteOn(1, 64, 0.8f));
+    send(juce::MidiMessage::noteOn(1, 67, 0.8f));
+    require(engine.heldVoiceCount() == 3, "Poly 1 incorrectly limited ordinary polyphony");
+    layer.allocationMode = 21;
+    engine.render(audio, {}, performance);
+    require(heldNote() == 60 && engine.activeVoiceCount() == 1,
+            "A live change from polyphonic to mono did not take effect");
+
+    engine.reset();
+    layer.allocationMode = 20;
+    performance.layers[1] = layer;
+    performance.layers[1].allocationMode = 0;
+    send(juce::MidiMessage::noteOn(1, 60, 0.8f));
+    send(juce::MidiMessage::noteOn(1, 67, 0.8f));
+    send(juce::MidiMessage::noteOn(1, 55, 0.8f));
+    require(heldNote() == 55 && engine.heldVoiceCount() == 4,
+            "Mono allocation leaked into another Performance Instrument");
+    send(juce::MidiMessage::noteOff(1, 55));
+    require(heldNote() == 67 && engine.heldVoiceCount() == 3,
+            "Layered mono fallback released the wrong polyphonic keystroke");
+
+    engine.reset();
+    performance.layers[1].enabled = false;
+    layer.sound.glideEnabled = true;
+    layer.sound.glideTypeMode = 5; // Fingered portamento.
+    layer.sound.glideRateValue = 100.0f;
+    send(juce::MidiMessage::noteOn(1, 60, 0.8f));
+    send(juce::MidiMessage::noteOn(1, 72, 0.8f));
+    for (const auto& voice : engine.voiceStates())
+        if (voice.active && voice.keyDown)
+            require(voice.glidePitch >= 60.0f && voice.glidePitch < 61.0f,
+                    "Single-trigger mono legato bypassed fingered portamento");
+}
+
+void testInstrumentVoiceSharing()
+{
+    wave::dsp::WaldorfEngine engine;
+    engine.prepare(48000.0, 32);
+    wave::dsp::WaldorfEngine::PerformanceSnapshot performance;
+    for (int index = 0; index < 3; ++index)
+    {
+        auto& layer = performance.layers[static_cast<size_t>(index)];
+        layer.enabled = true;
+        layer.source = 2;
+        layer.midiChannel = index + 1;
+    }
+    juce::AudioBuffer<float> audio(2, 1);
+    const auto on = [&](int channel, int note) {
+        juce::MidiBuffer midi;
+        midi.addEvent(juce::MidiMessage::noteOn(channel, note, 0.8f), 0);
+        engine.render(audio, midi, performance);
+    };
+    const auto count = [&](int layer) {
+        auto total = 0;
+        for (const auto& voice : engine.voiceStates())
+            total += voice.active && voice.layer == layer ? 1 : 0;
+        return total;
+    };
+    for (int note = 0; note < 48; ++note)
+        on(1, note);
+    on(2, 60);
+    require(count(0) == 48 && count(1) == 0,
+            "Dynamic allocation stole another Instrument's sounding voice");
+    performance.layers[1].allocationMode = 2;
+    on(2, 61);
+    on(2, 62);
+    on(2, 63);
+    require(count(0) == 46 && count(1) == 2,
+            "Poly N did not respect its cross-Instrument voice-sharing allowance");
+    performance.layers[2].allocationMode = 17;
+    on(3, 70);
+    on(3, 72);
+    require(count(2) == 1, "Mono allocation did not reclaim and reuse one voice");
+    for (int note = 60; note < 110; ++note)
+        on(1, note);
+    require(count(2) == 1, "Another Instrument stole a protected mono voice");
 }
 
 void testWaveGlideModes()
@@ -2404,6 +3245,42 @@ void testOfficialFirmwareWhenAvailable()
             "Firmware-driven note did not reach either oscillator-chip register page");
     require(masterRuntime.unmappedReadCount() == 0 && voiceRuntime.unmappedReadCount() == 0,
             "Firmware-driven MIDI note reached an unmodelled system-bus address");
+
+    // Disk machine settings may disable Performance reception or remap MIDI
+    // programs. Internal panel recall must work, then release its bypass so
+    // the following external MIDI packet still obeys those settings.
+    sharedMemory.work[0x8824u] = 1u;
+    sharedMemory.work[0x880du] = 7u;
+    sharedMemory.work[0x8806u] = 1u;
+    const auto displayRevision = masterRuntime.lcdDisplayRevision();
+    const auto displayWrites = masterRuntime.lcdVideoWriteCount();
+    require(masterRuntime.requestPerformanceSelection(128),
+            "Internal Performance recall was rejected");
+    require(masterRuntime.lcdDisplayRevision() != displayRevision
+                && masterRuntime.lcdVideoWriteCount() == displayWrites,
+            "Holding a recall frame did not notify the LCD without a VRAM write");
+    const auto heldDisplayRevision = masterRuntime.lcdDisplayRevision();
+    for (int slice = 0; slice < 40; ++slice)
+    {
+        masterRuntime.runCycles(50000);
+        voiceRuntime.runCycles(100000);
+    }
+    require(masterRuntime.currentPerformanceId() == 128,
+            "External MIDI settings redirected internal panel recall");
+    require(masterRuntime.lcdDisplayRevision() != heldDisplayRevision,
+            "Completed Performance recall did not publish a new LCD revision");
+    masterRuntime.pushMidiByte(0, 0xc0u);
+    masterRuntime.pushMidiByte(0, 2u);
+    for (int slice = 0; slice < 40; ++slice)
+    {
+        masterRuntime.runCycles(50000);
+        voiceRuntime.runCycles(100000);
+    }
+    require(masterRuntime.currentPerformanceId() == 128
+                && sharedMemory.work[0x8824u] == 1u
+                && sharedMemory.work[0x880du] == 7u
+                && sharedMemory.work[0x8806u] == 1u,
+            "Internal recall left external MIDI reception bypassed or changed its settings");
 }
 
 void testDecodedVoiceBoardProtocol()
@@ -2776,6 +3653,7 @@ int main()
         testWavetableQuantisation();
         testAsicClockMixOverflowAndVcfSaturation();
         testAsicResampling();
+        testResamplerSimdAgainstScalar();
         testHighRegisterOscillatorResampling();
         testCutoffControlLaw();
         testQuickEditFastAccessControls();
@@ -2785,15 +3663,19 @@ int main()
         testPerformanceTuningTables();
         testFreeRunningEngineLfo();
         testFactorySetWhenAvailable();
+        testDamagedUserWavetableImport();
+        testSparsePerformanceBanks();
         testPpgRomDecoding();
         testBundledPpgWavetables();
         testFactoryUpperWavetableBank();
+        testOriginalWaveFactoryTablesWhenAvailable();
         testExpandedFirst32Loading();
         testUserPpgRomWhenAvailable();
         testCemStability();
         testCemFilterResponse();
         testMeasuredWaveResonancePassbandLoss();
         testAllVoiceFiltersAreCalibrated();
+        testReconstructionCachedTransfer();
         testCemControlVoltageSettling();
         testLiveCutoffUsesContinuousBaseControlVoltage();
         testAsicHighpassResponse();
@@ -2809,6 +3691,9 @@ int main()
         testSampleAccurateMidiStart();
         testAudibleKeyboardRange();
         testPerformanceMidi();
+        testEmptyPerformanceSilencesHeldNotes();
+        testInstrumentVoiceAllocation();
+        testInstrumentVoiceSharing();
         testWaveGlideModes();
         testReleasedVoicesAreStolenBeforeHeldChord();
         testVoiceStealPreservesAnalogueHandover();
@@ -2822,6 +3707,7 @@ int main()
         test6522TimerOneInterruptPath();
         testDosFloppyImageCreation();
         testDp8473MountedDiskImage();
+        testDp8473AutomaticDiskWrites();
         testLcdFramebuffer();
         testCompletePanelWiringContract();
         testDecodedVoiceBoardProtocol();

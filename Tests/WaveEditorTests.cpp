@@ -11,6 +11,12 @@
 
 namespace
 {
+std::unique_ptr<WaveEmulationAudioProcessor> makeFactoryProcessor(const juce::File& preference = {})
+{
+    return std::make_unique<WaveEmulationAudioProcessor>(
+        preference, WaveEmulationAudioProcessor::InitialBank::embeddedFactory);
+}
+
 void require(bool condition, const char* message)
 {
     if (!condition)
@@ -102,7 +108,7 @@ void dragEditorControl(WaveEmulationAudioProcessorEditor& editor,
 
 void testWindowShortcutsPreservePanelLayout()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     WaveEmulationAudioProcessorEditor editor(*processor);
     editor.setVisible(true);
     auto* lcd = static_cast<juce::Component*>(nullptr);
@@ -146,7 +152,7 @@ void testWindowShortcutsPreservePanelLayout()
 
 void testLowerPerformanceWheelsFollowHardwareRules()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     WaveEmulationAudioProcessorEditor editor(*processor);
     editor.setVisible(true);
@@ -176,7 +182,7 @@ void testLowerPerformanceWheelsFollowHardwareRules()
 
 void testRepeatedInstrumentEditLayerClicks()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41); // A042: three active Instruments.
     juce::AudioBuffer<float> audio(2, 512);
@@ -256,7 +262,7 @@ void testRepeatedInstrumentEditLayerClicks()
 
 void testLayerProcessingPromptAcceptsCancel()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 640);
@@ -327,7 +333,7 @@ void testLayerProcessingPromptAcceptsCancel()
 
 void testFirmwareWavetableStepReachesAudioParameter()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 64);
@@ -362,7 +368,7 @@ void testFirmwareWavetableStepReachesAudioParameter()
 
 void testInstrumentEditPageOneFadersUpdatePerformance()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 640);
@@ -458,7 +464,7 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
 
 void testInstrumentPageOneFaderDoesNotLeakIntoOtherPages()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 640);
@@ -522,7 +528,7 @@ void testInstrumentPageOneFaderDoesNotLeakIntoOtherPages()
 
 void testInstrumentEditPageTwoVolumeReachesAudioEngine()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 640);
@@ -781,7 +787,7 @@ void testInstrumentEditPageTwoVolumeReachesAudioEngine()
 
 void testWaveEditSoftKeysRelease()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 96);
@@ -864,7 +870,7 @@ void testWaveEditSoftKeysRelease()
 
 void testLowerGlideOnOffUsesFirmwareSerial()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 96);
@@ -885,7 +891,7 @@ void testLowerGlideOnOffUsesFirmwareSerial()
 
 void testEveryLowerControllerButtonReachesItsSerialInput()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 96);
@@ -896,15 +902,22 @@ void testEveryLowerControllerButtonReachesItsSerialInput()
     // These positions are the centres in the complete Figma SVG. The editor
     // helper accepts upper-panel-local X, hence the common artwork offset.
     constexpr auto offset = 66.0f;
-    clickPanelControl(editor, *processor, audio, 110.0f - offset, 766.5f, 16);
-    processBlocks(*processor, audio, 48);
-    require(processor->getPanelLed(16),
-            "The visible lower Button 1 did not reach firmware serial 3");
-
-    clickPanelControl(editor, *processor, audio, 170.0f - offset, 766.5f, 16);
-    processBlocks(*processor, audio, 48);
-    require(processor->getPanelLed(35),
-            "The visible lower Button 2 did not reach firmware serial 4");
+    const auto& firmware = processor->getMasterFirmwareRuntime();
+    const auto performance = firmware.currentPerformanceRecordOffset();
+    require(performance.has_value(), "Lower button fixture has no live Performance");
+    for (const auto [x, led, modeOffset] : std::array<std::tuple<float, int, uint32_t>, 2> {
+             std::tuple<float, int, uint32_t> { 110.0f, 16, 6u }, { 170.0f, 35, 7u } })
+    {
+        const auto toggle = firmware.sharedProgramByte(*performance + modeOffset) != 0u;
+        clickPanelControl(editor, *processor, audio, x - offset, 766.5f, 16, [&] {
+            processBlocks(*processor, audio, 48);
+            require(processor->getPanelLed(led),
+                    "A visible lower Button press did not reach its firmware controller");
+        });
+        processBlocks(*processor, audio, 48);
+        require(processor->getPanelLed(led) == toggle,
+                "A visible lower Button release ignored the Performance mode");
+    }
 
     const auto beforeGlidePage
         = processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
@@ -939,7 +952,7 @@ void testEveryLowerControllerButtonReachesItsSerialInput()
 
 void testWaveEnvelopeSelectorRemainsStable()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 96);
@@ -975,7 +988,7 @@ void testWaveEnvelopeSelectorRemainsStable()
 
 void testPerformanceStepButtonsDoNotRepeatAfterRelease()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(40);
     juce::AudioBuffer<float> audio(2, 512);
@@ -1027,7 +1040,7 @@ void testPerformanceStepButtonsDoNotRepeatAfterRelease()
 
 void testColdStartPerformanceStepDoesNotRepeat()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     WaveEmulationAudioProcessorEditor editor(*processor);
@@ -1060,7 +1073,7 @@ void testColdStartPerformanceStepDoesNotRepeat()
 
 void testRestoredEditModeCannotMisrouteFirstPerformanceStep()
 {
-    auto saved = std::make_unique<WaveEmulationAudioProcessor>();
+    auto saved = makeFactoryProcessor();
     saved->prepareToPlay(48000.0, 512);
     saved->setCurrentProgram(40);
     juce::AudioBuffer<float> audio(2, 512);
@@ -1077,7 +1090,7 @@ void testRestoredEditModeCannotMisrouteFirstPerformanceStep()
     saved->getStateInformation(state);
     saved.reset();
 
-    auto restored = std::make_unique<WaveEmulationAudioProcessor>();
+    auto restored = makeFactoryProcessor();
     restored->setStateInformation(state.getData(),
                                   static_cast<int>(state.getSize()));
     restored->prepareToPlay(48000.0, 512);
@@ -1096,7 +1109,7 @@ void testRestoredEditModeCannotMisrouteFirstPerformanceStep()
 
 void testPerformanceStepCancelsAnOutgoingEditStep()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(40);
     juce::AudioBuffer<float> audio(2, 512);
@@ -1156,7 +1169,7 @@ void testPerformanceStepCancelsAnOutgoingEditStep()
 
 void testModeButtonsChangePageOnFirstClick()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 160);
@@ -1209,7 +1222,7 @@ void testModeButtonsChangePageOnFirstClick()
 
 void testPageButtonsChangePageOnFirstClick()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     processBlocks(*processor, audio, 160);
@@ -1265,7 +1278,7 @@ void testPageButtonsChangePageOnFirstClick()
 
 void testModifierEditButtonsOpenFirmwarePages()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(0);
     juce::AudioBuffer<float> audio(2, 512);
@@ -1291,8 +1304,9 @@ void testModifierEditButtonsOpenFirmwarePages()
         processBlocks(*processor, audio, 240);
         require(processor->getPanelLed(ledCodes[index]),
                 "A Modifier Edit button did not latch its LED");
-        require(processor->getMasterFirmwareRuntime().lcdVideoSnapshot() != before,
-                "A Modifier Edit button did not open its firmware LCD page");
+        if (processor->getMasterFirmwareRuntime().lcdVideoSnapshot() == before)
+            throw std::runtime_error("Modifier Edit button " + std::to_string(index + 1)
+                                     + " did not open its firmware LCD page");
         const auto callback
             = (static_cast<uint32_t>(processor->getMasterFirmwareRuntime().localByte(
                    0x56bb0u))
@@ -1324,12 +1338,24 @@ int main(int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI initialiseGui;
     try
     {
+        if (argc == 2 && std::string_view(argv[1]) == "--keyboard-buttons")
+        {
+            testEveryLowerControllerButtonReachesItsSerialInput();
+            std::cout << "Lower keyboard button UI checks passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--instrument-faders")
         {
             testInstrumentEditPageOneFadersUpdatePerformance();
             testInstrumentPageOneFaderDoesNotLeakIntoOtherPages();
             testInstrumentEditPageTwoVolumeReachesAudioEngine();
             std::cout << "Instrument fader checks passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--modifier-edit")
+        {
+            testModifierEditButtonsOpenFirmwarePages();
+            std::cout << "Modifier Edit checks passed\n";
             return 0;
         }
         testWindowShortcutsPreservePanelLayout();

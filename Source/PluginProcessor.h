@@ -29,7 +29,9 @@ public:
         solo
     };
 
-    explicit WaveEmulationAudioProcessor(const juce::File& firmwarePreferenceFile = {});
+    enum class InitialBank { empty, embeddedFactory };
+    explicit WaveEmulationAudioProcessor(const juce::File& firmwarePreferenceFile = {},
+                                        InitialBank initialBank = InitialBank::empty);
     ~WaveEmulationAudioProcessor() override;
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
@@ -91,10 +93,13 @@ public:
     juce::Result createBlankDiskImage(const juce::File& destination);
     juce::Result createDiskImageFromWaveSetup(const juce::File& setup,
                                               const juce::File& destination);
+    juce::Result createDiskImageFromWavetable(const juce::File& wavetable,
+                                              const juce::File& destination);
     juce::Result flushMountedDiskImage();
     juce::Result saveMountedDiskImageAs(const juce::File& destination);
     juce::Result ejectDiskImage();
     void resetToColdStart();
+    juce::Result reloadBankFromMountedImage();
     [[nodiscard]] bool hasMountedDiskImage() const noexcept
     {
         return masterFirmware.hasMountedDiskImage();
@@ -297,7 +302,6 @@ private:
         activeInstrumentSoundRecords {};
     std::array<bool, 8> activeInstrumentSoundRecordValid {};
     std::array<bool, 8> activeInstrumentSoundRecordReconciled {};
-    std::array<bool, 8> activeInstrumentSoundRecordUsesImportEncoding {};
     int activeInstrumentSoundPerformance = -1;
     uint64_t lastPublishedFirmwareSoundHash = 0;
     uint64_t lastPublishedHostMachineHash = 0;
@@ -364,8 +368,9 @@ private:
     std::atomic<bool> firmwareDiskCalibrationRequesterActive { false };
     std::atomic<int> pendingManagerExitProgram { -1 };
     std::atomic<bool> returnToPerformanceAfterDiskImport { false };
-    std::atomic<bool> returnToPerformanceAfterStoreExit { false };
-    std::atomic<int> storeSaveMode { 39 };
+    std::atomic<bool> storeExitModePending { false };
+    std::atomic<int> storeExitMode { 39 };
+    std::atomic<int> storeReturnMode { 39 };
     std::atomic<int> completedStoreMode { -1 };
     std::atomic<bool> storeSaveCompletionPending { false };
     const juce::String hostStateInstanceId { juce::Uuid().toString() };
@@ -396,7 +401,11 @@ private:
     std::atomic<uint64_t> controllerInputSequence { 0 };
     std::atomic<uint64_t> modWheelInputSequence { 0 };
     std::array<std::atomic<uint64_t>, 8> performanceFaderInputSequences {};
-    std::array<int, 2> lastKeyboardAssignableButtonStates { -1, -1 };
+    juce::AbstractFifo keyboardButtonEventFifo { 64 };
+    std::array<uint8_t, 64> keyboardButtonEvents {};
+    int activeKeyboardButtonEvent = -1;
+    int activeKeyboardButtonExpectedState = 0;
+    int keyboardButtonRetryBlocks = 0;
     std::array<int, 128> localKeyboardTransposedNotes {};
     std::atomic<int> instrumentButtonMode {
         static_cast<int>(InstrumentButtonMode::normal)
@@ -465,6 +474,7 @@ private:
     // position here; advanceFirmware() commits and redraws it on the sole
     // firmware-owning audio thread.
     std::atomic<int> pendingPanelGlideRate { -1 };
+    std::array<std::atomic<int>, 8> pendingGlideFaderEdits;
     std::atomic<int> pendingFirmwareGlideSwitchClicks { 0 };
     int queuedFirmwareGlideSwitchClicks = 0;
     bool firmwareGlideSwitchTransactionActive = false;
@@ -490,12 +500,14 @@ private:
     double currentSampleRate = 44100.0;
     std::atomic<int> currentProgram { 0 };
     bool firmwareKeyboardShiftDown = false;
+    int firmwareKeyboardShiftRetryBlocks = 0;
 
     void advanceFirmware(int samples);
     void handleAsyncUpdate() override;
     void runFirmwareTimeline(const juce::MidiBuffer& midi, int sampleCount);
     void sendPendingPerformanceFadersToFirmware();
     void sendPendingInstrumentFadersToFirmware();
+    void sendPendingGlideFadersToFirmware();
     void synchronisePerformanceInstrumentsFromFirmware() noexcept;
     void sendPendingPanelEncodersToFirmware();
     void sendPendingPanelGlideSwitchesToFirmware();

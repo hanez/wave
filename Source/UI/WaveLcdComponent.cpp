@@ -92,26 +92,28 @@ bool WaveLcdComponent::copyFirmwareDisplay()
     if (completingModeTransition)
         modeTransitionWasActive = false;
 
-    // Instrument Edit can ask OS 1.700 to rasterise the same completed page
-    // several more times while its initial Instrument action unwinds. The
-    // first complete frame is already genuine firmware output, so retain it
-    // while those residual passes temporarily clear and restore rows. Resume
-    // live monitoring after VRAM and the display-page register have both been
-    // quiet for 300 ms.
+    // Suppress residual passes of the same completed mode page. A new
+    // Performance/frame publication ends that guard immediately. Continuous
+    // MIDI/controller redraws must also have a finite hold time.
     if (postCommitGuardActive && !completingModeTransition)
     {
         const auto writes = runtime.lcdVideoWriteCount();
         const auto page = runtime.lcdDisplayPage();
         const auto now = juce::Time::getMillisecondCounterHiRes();
-        if (writes != postCommitWriteCount || page != postCommitPage)
+        const auto sameRecall = owner.getCurrentProgram() == postCommitProgram
+                               && runtime.lcdDisplayRevision() == postCommitRevision;
+        if (sameRecall && now - postCommitStartedMs < 500.0)
         {
-            postCommitWriteCount = writes;
-            postCommitPage = page;
-            postCommitLastChangeMs = now;
-            return false;
+            if (writes != postCommitWriteCount || page != postCommitPage)
+            {
+                postCommitWriteCount = writes;
+                postCommitPage = page;
+                postCommitLastChangeMs = now;
+                return false;
+            }
+            if (now - postCommitLastChangeMs < 300.0)
+                return false;
         }
-        if (now - postCommitLastChangeMs < 300.0)
-            return false;
         postCommitGuardActive = false;
     }
 
@@ -129,16 +131,18 @@ bool WaveLcdComponent::copyFirmwareDisplay()
     else
     {
         const auto pageBefore = runtime.lcdDisplayPage();
+        auto revisionBefore = runtime.lcdDisplayRevision();
 
         // Most timer ticks see an unchanged display. Avoid copying all four
         // VRAM pages until the firmware has written or selected a new frame.
         if (hasDisplayedFrame && writesBefore == displayedWriteCount
-            && pageBefore == displayedPage)
+            && pageBefore == displayedPage && revisionBefore == displayedRevision)
             return false;
 
         auto video = runtime.lcdVideoSnapshot();
         auto pageAfter = runtime.lcdDisplayPage();
         auto writesAfter = runtime.lcdVideoWriteCount();
+        auto revisionAfter = runtime.lcdDisplayRevision();
 
         // Prefer a snapshot taken between firmware writes. The Wavetable/Data
         // encoder can legitimately make the OS draw on every audio block,
@@ -146,8 +150,10 @@ bool WaveLcdComponent::copyFirmwareDisplay()
         // monitor for the entire gesture. Retry once to reduce tearing, then
         // publish the newest scan just as the physical LCD would while its RAM
         // is being changed continuously.
-        if (writesBefore != writesAfter || pageBefore != pageAfter)
+        if (writesBefore != writesAfter || pageBefore != pageAfter
+            || revisionBefore != revisionAfter)
         {
+            revisionBefore = revisionAfter;
             video = runtime.lcdVideoSnapshot();
             pageAfter = runtime.lcdDisplayPage();
             writesAfter = runtime.lcdVideoWriteCount();
@@ -155,6 +161,9 @@ bool WaveLcdComponent::copyFirmwareDisplay()
 
         framebuffer.loadHardwareVideoRam(video.data(), video.size(), pageAfter);
         displayedWriteCount = writesAfter;
+        // If publication raced this snapshot, leave its old revision cached
+        // so the next UI tick retries even after the final VRAM write.
+        displayedRevision = revisionBefore;
         displayedPage = pageAfter;
         hasDisplayedFrame = true;
         if (completingModeTransition)
@@ -162,8 +171,10 @@ bool WaveLcdComponent::copyFirmwareDisplay()
             postCommitGuardActive = true;
             postCommitWriteCount = writesAfter;
             postCommitPage = pageAfter;
-            postCommitLastChangeMs
-                = juce::Time::getMillisecondCounterHiRes();
+            postCommitLastChangeMs = juce::Time::getMillisecondCounterHiRes();
+            postCommitStartedMs = postCommitLastChangeMs;
+            postCommitProgram = owner.getCurrentProgram();
+            postCommitRevision = runtime.lcdDisplayRevision();
         }
     }
     rebuildPixelImage();

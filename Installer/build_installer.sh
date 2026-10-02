@@ -7,7 +7,7 @@
 # are stored in this script.
 #
 # Common overrides:
-#   VERSION=0.1.11
+#   VERSION=0.1.12
 #   BUILD_JOBS=8
 #   SKIP_PLUGIN_BUILD=1
 #   SKIP_WRAP=1
@@ -45,7 +45,7 @@ PACKAGES_DIR="$WORK_DIR/packages"
 RESOURCES_DIR="$WORK_DIR/resources"
 DMG_STAGING_DIR="$WORK_DIR/dmg"
 
-VERSION="${VERSION:-0.1.11}"
+VERSION="${VERSION:-0.1.12}"
 TEAM_ID="${TEAM_ID:-}"
 BUILD_CONFIG="${BUILD_CONFIG:-Release}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-$BUILD_CONFIG}"
@@ -276,6 +276,19 @@ stage_plugins() {
     "$STAGING_DIR/vst3/Library/Audio/Plug-Ins/VST3/$VST3_NAME"
   /usr/bin/ditto --noextattr --norsrc "$AAX_SOURCE" \
     "$STAGING_DIR/aax/Library/Application Support/Avid/Audio/Plug-Ins/$AAX_NAME"
+
+  local notices="$STAGING_DIR/standalone/Library/Application Support/DJW/Wave Emulation"
+  mkdir -p "$notices"
+  for file in LICENSE THIRD_PARTY_NOTICES.md; do
+    /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/$file" "$notices/$file"
+  done
+  /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/LICENSES" "$notices/LICENSES"
+  cat >"$notices/BUILD.txt" <<BUILD
+Wave Emulation $VERSION — macOS universal arm64/x86_64
+Source repository: https://github.com/mo0kid/wave
+Corresponding source archive: Wave-Emulation-$VERSION-Source.zip
+Instrument firmware and disk images are supplied separately by the user.
+BUILD
 }
 
 sign_staged_plugins() {
@@ -436,6 +449,9 @@ build_dmg() {
   mkdir -p "$DMG_STAGING_DIR"
   /usr/bin/ditto --noextattr --norsrc "$FINAL_PKG" \
     "$DMG_STAGING_DIR/$FINAL_PKG_NAME"
+  /usr/bin/ditto --noextattr --norsrc \
+    "$STAGING_DIR/standalone/Library/Application Support/DJW/Wave Emulation" \
+    "$DMG_STAGING_DIR/License and Source Information"
   if [ -n "$MANUAL_PDF" ]; then
     /usr/bin/ditto --noextattr --norsrc "$MANUAL_PDF" \
       "$DMG_STAGING_DIR/$(basename "$MANUAL_PDF")"

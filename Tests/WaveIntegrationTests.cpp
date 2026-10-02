@@ -1,6 +1,8 @@
 #include "PluginProcessor.h"
 #include "PanelWiring.h"
 #include "Firmware/DosFloppyImage.h"
+#include "UI/WaveLcdComponent.h"
+#include <juce_cryptography/juce_cryptography.h>
 
 #include <algorithm>
 #include <atomic>
@@ -10,6 +12,7 @@
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <chrono>
 #include <vector>
 #if JUCE_MAC
 #include <CoreFoundation/CoreFoundation.h>
@@ -17,6 +20,12 @@
 
 namespace
 {
+std::unique_ptr<WaveEmulationAudioProcessor> makeFactoryProcessor(const juce::File& preference = {})
+{
+    return std::make_unique<WaveEmulationAudioProcessor>(
+        preference, WaveEmulationAudioProcessor::InitialBank::embeddedFactory);
+}
+
 void require(bool condition, const char* message)
 {
     if (!condition)
@@ -31,9 +40,120 @@ void requireFinite(const juce::AudioBuffer<float>& audio)
                     "Plug-in processing produced non-finite audio");
 }
 
+void testOriginalFactoryWavetablesAndRecall()
+{
+    const auto checkBank = [](const WaveEmulationAudioProcessor& processor) {
+        const auto& bank = processor.getWavetableBank();
+        require(bank.hasOriginalWaveFactoryTables() && bank.importedTableCount() == 64,
+                "Startup or project recall replaced original Wave tables with a fallback");
+        std::vector<uint8_t> halfWaves;
+        for (int table = 0; table < 64; ++table)
+            for (int wave = 0; wave < 64; ++wave)
+                for (int sample = 0; sample < 64; ++sample)
+                    halfWaves.push_back(static_cast<uint8_t>(
+                        static_cast<int>(bank.rawSample(table, wave, sample)) + 128));
+        require(juce::SHA256(halfWaves.data(), halfWaves.size()).toHexString()
+                    == "e2d3bdd4d22053058458962df7dc9a7ad08e895190f7b08e7f6b1ef63d1976c3",
+                "Active factory bank differs from original Wave OS 1.700 output");
+    };
+    juce::TemporaryFile preference(".txt");
+    auto fresh = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+    checkBank(*fresh);
+    auto processor = makeFactoryProcessor(preference.getFile());
+    checkBank(*processor);
+    const auto ppg = juce::File::getCurrentWorkingDirectory().getChildFile(
+        "Firmware/wave_sys1_700/ppg-wave-2.3-v6-wavetables.rom");
+    require(processor->loadWavetableRom(ppg), "Stale PPG import fixture failed to load");
+    require(!processor->getWavetableBank().hasOriginalWaveFactoryTables(),
+            "An imported PPG bank was incorrectly labelled as original Wave data");
+    juce::MemoryBlock state;
+    processor->getStateInformation(state);
+    processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    checkBank(*processor);
+    auto restored = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+    restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    checkBank(*restored);
+}
+
+void testInstrumentAllocationPageDrivesAudioAndRecall()
+{
+    juce::TemporaryFile preference(".txt");
+    auto processor = makeFactoryProcessor(preference.getFile());
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int blocks) {
+        for (int block = 0; block < blocks; ++block)
+        {
+            juce::MidiBuffer midi;
+            processor->processBlock(audio, midi);
+        }
+    };
+    const auto click = [&](int code) {
+        const auto matrix = wave::panel::matrixIndexForDiagnosticCode(code);
+        processor->setPanelButton(matrix, true);
+        process(8);
+        processor->setPanelButton(matrix, false);
+        process(96);
+    };
+    process(96);
+    click(36); // Instrument Edit.
+    click(25); // Instrument 2, as in the reported screen.
+    click(23); // Page 2.
+    auto& firmware = const_cast<wave::firmware::MasterFirmwareRuntime&>(
+        processor->getMasterFirmwareRuntime());
+    require(firmware.currentInstrumentEditTarget() == 1
+                && firmware.currentInstrumentEditPage() == 1,
+            "Allocation fixture did not open Instrument 2 page 2");
+    // Isolate the edited Instrument from the other active factory layers.
+    for (int layer = 0; layer < 8; ++layer)
+        require(firmware.writePerformanceInstrumentByte(layer, 3u,
+                                                         layer == 1 ? 3 : 0),
+                "Could not isolate the allocation-test Instrument");
+    process(8);
+    const auto checkNotes = [&](WaveEmulationAudioProcessor& target, int mode) {
+        juce::MidiBuffer midi;
+        midi.addEvent(juce::MidiMessage::allSoundOff(1), 0);
+        midi.addEvent(juce::MidiMessage::noteOn(1, 60, 0.8f), 1);
+        midi.addEvent(juce::MidiMessage::noteOn(1, 67, 0.8f), 2);
+        midi.addEvent(juce::MidiMessage::noteOn(1, 55, 0.8f), 3);
+        target.processBlock(audio, midi);
+        auto held = 0;
+        auto note = -1;
+        for (const auto& voice : target.getVoiceStates())
+            if (voice.active && voice.keyDown && voice.layer == 1)
+            {
+                ++held;
+                note = voice.triggerNote;
+            }
+        require(held == (mode >= 17 ? 1 : 3),
+                "Alloc changed on the firmware page but not in audible voice allocation");
+        if (mode >= 17)
+            require(note == ((mode - 17) % 3 == 2 ? 67 : 55),
+                    "Firmware-selected mono priority did not reach the audio engine");
+    };
+    for (const auto mode : { 1, 17, 18, 19, 20, 21, 22 })
+    {
+        processor->setPanelFader(5, wave::panel::performanceFaderAdcChannels[5],
+                                 static_cast<float>(mode) / 22.0f, false);
+        process(64);
+        const auto record = firmware.currentPerformanceRecordOffset();
+        require(record.has_value()
+                    && (firmware.sharedProgramByte(*record + 64u + 32u + 15u) & 0x7fu)
+                           == static_cast<uint8_t>(mode),
+                "The Alloc fader did not commit its native Instrument field");
+        checkNotes(*processor, mode);
+    }
+    juce::MemoryBlock state;
+    processor->getStateInformation(state);
+    auto restored = makeFactoryProcessor(preference.getFile());
+    restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    restored->prepareToPlay(48000.0, 512);
+    checkNotes(*restored, 22);
+}
+
 void testAutomaticBootAudioAndState()
 {
-    auto processorStorage = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processorStorage = makeFactoryProcessor();
     auto& processor = *processorStorage;
     const auto& report = processor.getFirmwareReport();
     require(report.hasBothImages(),
@@ -83,9 +203,9 @@ void testAutomaticBootAudioAndState()
                 && localLong(0x4de18u) >= wave::firmware::MasterFirmwareRuntime::imageBase
                 && localLong(0x4de18u) < 0x00050000u,
             "Automatic startup skipped the genuine OS MIDI callback registration");
-    require(processor.getWavetableBank().isExternalRomLoaded()
-                && processor.getWavetableBank().importedTableCount() == 30,
-            "Reconstructed PPG Wave 2.3 V6 bank did not load automatically");
+    require(processor.getWavetableBank().hasOriginalWaveFactoryTables()
+                && processor.getWavetableBank().importedTableCount() == 64,
+            "Original Wave factory bank did not load automatically");
     require(processor.getFactorySetReport().validLayout
                 && processor.getFactorySetReport().validSounds == 256
                 && processor.getFactorySetReport().validPerformances == 256,
@@ -116,6 +236,8 @@ void testAutomaticBootAudioAndState()
     processor.getStateInformation(restoredState);
     processor.setStateInformation(restoredState.getData(),
                                   static_cast<int>(restoredState.getSize()));
+    require(processor.getWavetableBank().hasOriginalWaveFactoryTables(),
+            "Project state recall replaced the Wave factory bank");
     require(std::abs(processor.getPanelFaderValue(0) - 0.75f) < 1.0e-5f,
             "Restored state discarded the Control-X performance fader position");
     require((processor.getPerformanceFadersTouchedMask() & 0x01u) != 0u,
@@ -482,7 +604,7 @@ void testAutomaticBootAudioAndState()
     juce::MemoryBlock savedState;
     processor.getStateInformation(savedState);
 
-    auto restoredStorage = std::make_unique<WaveEmulationAudioProcessor>();
+    auto restoredStorage = makeFactoryProcessor();
     auto& restored = *restoredStorage;
     restored.setStateInformation(savedState.getData(),
                                  static_cast<int>(savedState.getSize()));
@@ -500,7 +622,7 @@ void testAutomaticBootAudioAndState()
 
 void testFactoryA092ChoirVibratoUsesCallerScale()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(91); // A092: Choir 2.
     require(processor->getProgramName(91).startsWith("Choir 2"),
@@ -548,7 +670,7 @@ void testFactoryA092ChoirVibratoUsesCallerScale()
 
 void testFactoryB057UsesMeasuredVcaAttackOne()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(184); // B057: Sarahvoice.
     require(processor->getProgramName(184).startsWithIgnoreCase("Sarahvoice"),
@@ -597,7 +719,7 @@ void testFactoryB057UsesMeasuredVcaAttackOne()
 
 void testA030UsesItsSetUserWavetable()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->setCurrentProgram(29); // A030, Sitar.
 
     const auto* wavetable
@@ -622,7 +744,7 @@ void testA030UsesItsSetUserWavetable()
 
 void testA044UsesNineteenTwentySpeechTable()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->setCurrentProgram(43); // A044, NINETEENTWENTY.
 
     const auto* wavetable
@@ -645,7 +767,7 @@ void testA044UsesNineteenTwentySpeechTable()
 
 void testFactoryPerformanceLayering()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41); // A042 -> three distinct full-range Sounds.
 
@@ -676,7 +798,7 @@ void testFactoryPerformanceLayering()
 
 void testRapidPerformanceLcdRefreshIsAtomic()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto settle = [&] (int blocks) {
@@ -690,6 +812,21 @@ void testRapidPerformanceLcdRefreshIsAtomic()
 
     processor->setCurrentProgram(11); // A012
     settle(64);
+    auto& runtime = const_cast<wave::firmware::MasterFirmwareRuntime&>(
+        processor->getMasterFirmwareRuntime()); // Test the transaction before its next CPU slice.
+    const auto frameBeforeRecall = runtime.lcdVideoSnapshot();
+    const auto pageBeforeRecall = runtime.lcdDisplayPage();
+    require(runtime.requestPerformanceSelection(11)
+                && runtime.localByte(0x54b40u) == 0u
+                && runtime.localByte(0x54b41u) == 11u
+                && !runtime.currentPerformanceId().has_value(),
+            "Reselection put an invalid @128 sentinel into the live firmware selection");
+    require(runtime.lcdVideoSnapshot() == frameBeforeRecall
+                && runtime.lcdDisplayPage() == pageBeforeRecall,
+            "Pending Performance recall published an incomplete LCD frame");
+    settle(64);
+    require(runtime.currentPerformanceId() == 11,
+            "Same-number recall did not commit its valid Performance ID");
     const auto referenceSelected
         = (static_cast<int>(processor->getMasterFirmwareRuntime().localByte(0x54b40u)) << 8)
           | processor->getMasterFirmwareRuntime().localByte(0x54b41u);
@@ -720,7 +857,7 @@ void testRapidPerformanceLcdRefreshIsAtomic()
 
 void testFirmwarePerformanceStepButtonsRefreshLcd()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -759,7 +896,7 @@ void testFirmwarePerformanceStepButtonsRefreshLcd()
 
 void testStoreButtonReachesFirmwareMenu()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -803,7 +940,7 @@ void testStoreButtonReachesFirmwareMenu()
 
 void testStoreRequesterStepButtonsChooseDestination()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -899,7 +1036,7 @@ void testStoreRequesterStepButtonsChooseDestination()
 
 void testPerformanceStoreNameAcrossBanks(int commitSamples, int commitOffset)
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int count) {
@@ -964,10 +1101,10 @@ void testPerformanceStoreNameAcrossBanks(int commitSamples, int commitOffset)
             "The current Performance name differs from the stored name");
 }
 
-void testStoreModeButtonExitAfterSave(bool sound = false)
+void testStoreModeButtonExitAfterSave(bool sound = false, int operatingMode = 39)
 {
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int count) {
@@ -989,8 +1126,16 @@ void testStoreModeButtonExitAfterSave(bool sound = false)
         process(96);
     };
     process(96);
-    if (sound)
-        click(36); // Instrument Edit.
+    if (operatingMode != 39)
+        click(operatingMode);
+    const auto screenCallback = [&] {
+        uint32_t callback = 0;
+        for (uint32_t byte = 0; byte < 4; ++byte)
+            callback = (callback << 8u)
+                       | processor->getMasterFirmwareRuntime().localByte(0x56bb0u + byte);
+        return callback;
+    };
+    const auto operatingScreenCallback = screenCallback();
     click(57); // Store.
     if (sound)
     {
@@ -1017,11 +1162,15 @@ void testStoreModeButtonExitAfterSave(bool sound = false)
     process(512);
     require(!processor->isFirmwareRequesterActive()
                 && processor->getPanelSelectedMode() == 57
-                && processor->getPanelLed(sound ? 22 : 51)
-                && !processor->getPanelLed(sound ? 51 : 22)
+                && processor->getPanelLed(operatingMode == 36 ? 22
+                                         : operatingMode == 33 ? 69 : 51)
+                && (operatingMode == 36 || !processor->getPanelLed(22))
+                && (operatingMode == 39 || !processor->getPanelLed(51))
                 && !processor->getPanelLed(87),
-            "Saving did not restore the record's operating-mode lamp");
-    if (!sound)
+            "Saving did not restore the preceding operating-mode lamp");
+    require(screenCallback() == operatingScreenCallback,
+            "Saving restored the mode lamp without its operating LCD page");
+    if (!sound && operatingMode == 39)
     {
         const auto selected = processor->getCurrentProgram();
         const auto plus = wave::panel::matrixIndexForDiagnosticCode(72);
@@ -1057,7 +1206,7 @@ void testStoreModeButtonExitAfterSave(bool sound = false)
 void testPerformanceOverwriteClearsInactiveSlots(int blockSize)
 {
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int count) {
@@ -1139,7 +1288,7 @@ void testPerformanceOverwriteClearsInactiveSlots(int blockSize)
 
 void testRepeatedSoundStoreCursor()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int count) {
@@ -1185,9 +1334,10 @@ void testRepeatedSoundStoreCursor()
         process(512);
         require(!processor->isFirmwareRequesterActive(),
                 "One OK press did not close the Sound naming requester");
-        require(processor->getPanelSelectedMode() == 57 && processor->getPanelLed(22)
+        require(processor->getPanelSelectedMode() == 57 && processor->getPanelLed(69)
+                    && !processor->getPanelLed(22)
                     && !processor->getPanelLed(87),
-                "Sound Store OK did not restore the Instrument Edit lamp");
+                "Sound Store OK did not restore the preceding Global Edit lamp");
     }
     click(71);
     require(processor->getPanelSelectedMode() == 39 && !processor->getPanelLed(87),
@@ -1196,7 +1346,7 @@ void testRepeatedSoundStoreCursor()
 
 void testPerformanceBrowserHasDistinctStoredRecords()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int count) {
@@ -1238,7 +1388,7 @@ void testPerformanceBrowserHasDistinctStoredRecords()
 
 void testStoreCancelRestoresNumericPerformancePreview()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -1282,7 +1432,7 @@ void testStoreCancelRestoresNumericPerformancePreview()
 
 void testKeyboardControllerShiftReachesFirmware()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     juce::MidiBuffer noMidi;
@@ -1313,7 +1463,7 @@ void testKeyboardControllerShiftReachesFirmware()
 
 void testKeyboardOctaveButtonsDriveLocalKeyboardRange()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks, juce::MidiBuffer* supplied = nullptr) {
@@ -1344,7 +1494,7 @@ void testKeyboardOctaveButtonsDriveLocalKeyboardRange()
 
     juce::MemoryBlock savedState;
     processor->getStateInformation(savedState);
-    auto restored = std::make_unique<WaveEmulationAudioProcessor>();
+    auto restored = makeFactoryProcessor();
     restored->setStateInformation(savedState.getData(),
                                   static_cast<int>(savedState.getSize()));
     restored->prepareToPlay(48000.0, 512);
@@ -1360,6 +1510,9 @@ void testKeyboardOctaveButtonsDriveLocalKeyboardRange()
                 && restored->getPanelLed(58),
             "Host state did not restore the firmware keyboard octave position");
 
+    // Running the restored processor above pauses this fixture's audio clock.
+    // Rebase its real-time MIDI collector before queuing an on-screen note.
+    process(1);
     processor->noteOnFromUi(60, 0.9f);
     process(4);
     require(processor->getFirstActiveMidiNote() == 72,
@@ -1402,34 +1555,187 @@ void testKeyboardOctaveButtonsDriveLocalKeyboardRange()
 
 void testLowerKeyboardAssignableButtonsDriveFirmware()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
-    processor->prepareToPlay(48000.0, 512);
-    juce::AudioBuffer<float> audio(2, 512);
-    const auto process = [&](int count) {
-        for (int block = 0; block < count; ++block)
-        {
-            audio.clear();
-            juce::MidiBuffer none;
-            processor->processBlock(audio, none);
-        }
-    };
-    process(96);
-    for (const auto [button, led] : std::array<std::pair<int, int>, 2> {
-             std::pair { 3, 16 }, std::pair { 4, 35 } })
+    juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    for (const auto toggle : { false, true })
     {
-        const auto before = processor->getPanelLed(led);
-        processor->setPanelButton(button, true);
+        auto processor = makeFactoryProcessor();
+        processor->prepareToPlay(48000.0, 512);
+        juce::AudioBuffer<float> audio(2, 512);
+        const auto process = [&](int count) {
+            for (int block = 0; block < count; ++block)
+            {
+                juce::MidiBuffer none;
+                processor->processBlock(audio, none);
+#if JUCE_MAC
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0001, true);
+#endif
+            }
+        };
+        process(96);
+        auto& runtime = const_cast<wave::firmware::MasterFirmwareRuntime&>(
+            processor->getMasterFirmwareRuntime());
+        const auto offset = runtime.currentPerformanceRecordOffset();
+        require(offset.has_value(), "Button fixture has no live Performance");
+        std::array<uint8_t, 512> performance {};
+        for (size_t byte = 0; byte < performance.size(); ++byte)
+            performance[byte] = runtime.sharedProgramByte(*offset + static_cast<uint32_t>(byte));
+        const auto instrument = runtime.currentPerformanceInstrument().value_or(-1);
+        require(instrument >= 0 && instrument < 8, "Button fixture has no selected Instrument");
+        for (int layer = 0; layer < 8; ++layer)
+            performance[static_cast<size_t>(64 + layer * 32 + 3)] = layer == instrument ? 3 : 0;
+        performance[4] = 70;
+        performance[5] = 71;
+        performance[6] = performance[7] = toggle ? 1 : 0;
+        require(runtime.installCurrentPerformanceRecord(performance),
+                "Could not install keyboard button modes");
+        // Isolate Button 1/2 as audible pitch sources on the selected Sound.
+        for (const auto [byte, value] : std::array<std::pair<uint32_t, uint8_t>, 5> {
+                 std::pair<uint32_t, uint8_t> { 5, 29 }, { 6, 38 }, { 7, 100 },
+                 { 8, 38 }, { 9, 64 } })
+            require(runtime.writeCurrentSoundRecordByte(byte, value),
+                    "Could not install the keyboard button pitch route");
+        process(32);
+        juce::MidiBuffer note;
+        note.addEvent(juce::MidiMessage::noteOn(1, 60, 0.9f), 0);
+        processor->processBlock(audio, note);
+        for (const auto [button, led, source] : std::array<std::tuple<int, int, uint8_t>, 2> {
+                 std::tuple<int, int, uint8_t> { 3, 16, 29 }, { 4, 35, 30 } })
+        {
+            require(runtime.writeCurrentSoundRecordByte(5, source), "Could not select Button source");
+            process(16);
+            const auto idlePitch = processor->getFirstActivePitchModulation();
+            require(!processor->getPanelLed(led), "Keyboard button started active");
+            processor->setPanelButton(button, true);
+            process(48);
+            require(processor->getPanelLed(led), "Keyboard button press did not light its lamp");
+            const auto activePitch = processor->getFirstActivePitchModulation();
+            require(activePitch > idlePitch + 0.05f,
+                    "Physical keyboard button did not drive its dedicated modulation source");
+            processor->setPanelButton(button, false);
+            process(48);
+            require(processor->getPanelLed(led) == toggle,
+                    "Keyboard button ignored Performance touch/toggle mode");
+            require(std::abs(processor->getFirstActivePitchModulation()
+                             - (toggle ? activePitch : idlePitch)) < 0.01f,
+                    "Button release left the wrong modulation state");
+            if (toggle)
+            {
+                // Hosts reset the audio engine without resetting the panel firmware.
+                processor->releaseResources();
+                processor->prepareToPlay(48000.0, 512);
+                juce::MidiBuffer retrigger;
+                retrigger.addEvent(juce::MidiMessage::noteOn(1, 60, 0.9f), 0);
+                processor->processBlock(audio, retrigger);
+                process(8);
+                require(processor->getFirstActivePitchModulation() > idlePitch + 0.05f,
+                        "Audio restart lost the latched keyboard button");
+                processor->setPanelButton(button, true);
+                process(48);
+                processor->setPanelButton(button, false);
+                process(48);
+                require(!processor->getPanelLed(led), "Second toggle press did not turn the button off");
+                processor->setPanelButton(button, true);
+                processor->setPanelButton(button, false);
+                process(48);
+                require(processor->getPanelLed(led), "A click between audio callbacks was lost");
+                // Two complete clicks queued together must toggle twice.
+                for (int click = 0; click < 2; ++click)
+                {
+                    processor->setPanelButton(button, true);
+                    processor->setPanelButton(button, false);
+                }
+                process(96);
+                require(processor->getPanelLed(led), "Rapid clicks collapsed into one toggle");
+                processor->setPanelButton(button, true);
+                processor->setPanelButton(button, false);
+                process(48);
+            }
+        }
+        // The selected live Performance assigns Button 2 to CC71, rather
+        // than the previous bridge's fixed CC81 or the startup SET's CC1.
+        const auto idlePitch = processor->getFirstActivePitchModulation();
+        juce::MidiBuffer controller;
+        controller.addEvent(juce::MidiMessage::controllerEvent(1, 71, 127), 0);
+        processor->processBlock(audio, controller);
         process(48);
-        processor->setPanelButton(button, false);
-        process(48);
-        require(processor->getPanelLed(led) != before,
-                "A lower assignable button did not reach its firmware mode/LED output");
+        require(processor->getFirstActivePitchModulation() > idlePitch + 0.05f,
+                "The processor ignored the live Performance's Button MIDI assignment");
     }
+}
+
+void testAssignableButtonMidiRouting()
+{
+    wave::dsp::WaldorfEngine engine;
+    engine.prepare(48000.0, 512);
+    wave::dsp::WaldorfEngine::PerformanceSnapshot performance;
+    auto& layer = performance.layers[0];
+    layer.enabled = true;
+    layer.source = 3;
+    layer.midiChannel = 2;
+    layer.sound.modulationRoutes[wave::parameters::osc1PitchMod1] = { 29, 38, 24.0f };
+    layer.sound.modulationRoutes[wave::parameters::osc2PitchMod1] = { 30, 38, 24.0f };
+    layer.sound.modulationRoutes[wave::parameters::osc1PitchMod2].amount = 0.0f;
+    layer.sound.modulationRoutes[wave::parameters::osc2PitchMod2].amount = 0.0f;
+    layer.sound.oscillatorOctaves = { 0, 0 };
+    layer.sound.oscillatorSemitones = { 0, 0 };
+    engine.setKeyboardButtonControllers(70, 71);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto send = [&](juce::MidiMessage message) {
+        juce::MidiBuffer midi;
+        midi.addEvent(message, 0);
+        engine.render(audio, midi, performance);
+        for (int block = 0; block < 4; ++block)
+            engine.render(audio, {}, performance);
+    };
+    send(juce::MidiMessage::noteOn(2, 60, 0.9f));
+    const auto check = [&](bool one, bool two) {
+        require((std::abs(engine.firstActivePitchModulation(0)) > 0.1f) == one
+                    && (std::abs(engine.firstActivePitchModulation(1)) > 0.1f) == two,
+                "Assigned keyboard button MIDI routing produced the wrong modifier state");
+    };
+    check(false, false);
+    send(juce::MidiMessage::controllerEvent(2, 80, 127));
+    send(juce::MidiMessage::controllerEvent(1, 70, 127));
+    check(false, false); // Neither the obsolete fixed CC nor another channel.
+    send(juce::MidiMessage::controllerEvent(2, 70, 127));
+    check(true, false);
+    send(juce::MidiMessage::controllerEvent(2, 70, 0));
+    send(juce::MidiMessage::controllerEvent(2, 71, 127));
+    check(false, true);
+    send(juce::MidiMessage::controllerEvent(2, 71, 0));
+    engine.setKeyboardButtonControllers(70, 70);
+    juce::MidiBuffer physicalControl;
+    physicalControl.addEvent(juce::MidiMessage::controllerEvent(1, 70, 127), 0);
+    engine.render(audio, {}, physicalControl, performance);
+    for (int block = 0; block < 4; ++block)
+        engine.render(audio, {}, performance);
+    check(false, false); // A physical wheel does not acquire a Button identity via CC aliasing.
+    engine.setKeyboardButtons(true, false);
+    for (int block = 0; block < 4; ++block)
+        engine.render(audio, {}, performance);
+    check(true, false); // Physical identity survives a shared MIDI assignment.
+    require(!engine.isSustainPedalDown(), "A physical Button press became a sustain pedal event");
+    send(juce::MidiMessage::controllerEvent(2, 70, 127));
+    check(true, true); // Recorded MIDI intentionally reaches both assigned sources.
+    send(juce::MidiMessage::controllerEvent(2, 70, 0));
+    check(false, false);
+    layer.source = 1;
+    send(juce::MidiMessage::controllerEvent(2, 70, 127));
+    check(true, false); // Switching to the keyboard source adopts its held button state.
+    engine.setKeyboardButtons(false, true);
+    for (int block = 0; block < 4; ++block)
+        engine.render(audio, {}, performance);
+    check(false, true);
+    layer.source = 2;
+    engine.setKeyboardButtons(true, false);
+    for (int block = 0; block < 4; ++block)
+        engine.render(audio, {}, performance);
+    check(false, true); // MIDI-only Instruments ignore physical keyboard controls.
 }
 
 void testGlideEditUsesFirmwareLamp()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int count) {
@@ -1455,7 +1761,7 @@ void testPluginMidiFollowsKeyboardOctaveButtons()
 {
     juce::AudioProcessor::setTypeOfNextNewPlugin(
         juce::AudioProcessor::wrapperType_VST3);
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     juce::AudioProcessor::setTypeOfNextNewPlugin(
         juce::AudioProcessor::wrapperType_Undefined);
     processor->prepareToPlay(48000.0, 128);
@@ -1504,7 +1810,7 @@ void testPluginMidiFollowsKeyboardOctaveButtons()
 
 void testShiftDisplaySevenOpensFirmwareServiceMenu()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     juce::MidiBuffer noMidi;
@@ -1523,7 +1829,9 @@ void testShiftDisplaySevenOpensFirmwareServiceMenu()
     const auto storeScreen = processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
 
     processor->setKeyboardControllerButton(0x52u, true);
-    processBlocks(8);
+    for (int block = 0; block < 64
+         && processor->getMasterFirmwareRuntime().localByte(0x59869u) == 0; ++block)
+        processBlocks(1);
     require(processor->getMasterFirmwareRuntime().localByte(0x59869u) != 0,
             "Firmware Shift virtual input did not assert the Store modifier");
     processor->setPanelButton(29, true); // Seventh button above the display.
@@ -1531,7 +1839,9 @@ void testShiftDisplaySevenOpensFirmwareServiceMenu()
     processor->setPanelButton(29, false);
     processBlocks(32);
     processor->setKeyboardControllerButton(0x52u, false);
-    processBlocks(8);
+    for (int block = 0; block < 64
+         && processor->getMasterFirmwareRuntime().localByte(0x59869u) != 0; ++block)
+        processBlocks(1);
     const auto readPointer = [&processor](uint32_t address) {
         const auto& runtime = processor->getMasterFirmwareRuntime();
         return (static_cast<uint32_t>(runtime.localByte(address)) << 24u)
@@ -1549,7 +1859,7 @@ void testShiftDisplaySevenOpensFirmwareServiceMenu()
 
 void testFirmwareVcfCalibrationTableFeedsAllVoices()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     const auto& runtime = processor->getMasterFirmwareRuntime();
     std::array<uint16_t, wave::dsp::WaldorfEngine::voiceCount> initialCodes{};
@@ -1602,7 +1912,7 @@ void testFirmwareVcfCalibrationTableFeedsAllVoices()
 
 void testFactoryA001VoiceCardsTrackTheSameFilter()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->selectFactoryPerformance(0, 1);
     const auto sound = wave::parameters::readSnapshot(processor->parameters);
@@ -1645,7 +1955,7 @@ void testFactoryA001VoiceCardsTrackTheSameFilter()
 
 void testFactoryA001HeldCutoffUsesFirmwareEnvelopeScale()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(96000.0, 256);
     processor->selectFactoryPerformance(0, 1);
     const auto sound = wave::parameters::readSnapshot(processor->parameters);
@@ -1666,7 +1976,7 @@ void testFactoryA001HeldCutoffUsesFirmwareEnvelopeScale()
 
 void testFactoryA001OverlappingChordNoteOffKeepsRetriggeredVoices()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->selectFactoryPerformance(0, 1);
 
@@ -1707,7 +2017,7 @@ void testFactoryA001OverlappingChordNoteOffKeepsRetriggeredVoices()
 
 void testFactoryA001CapturedChordSequenceKeepsEveryVcaOpen()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->setMidiInputActsAsLocalKeyboard(true);
     processor->prepareToPlay(96000.0, 256);
     processor->selectFactoryPerformance(0, 1);
@@ -1788,8 +2098,18 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true,
               ? juce::File(configuredSet)
               : juce::File::getCurrentWorkingDirectory().getChildFile("wave.set");
     juce::MemoryBlock setup;
-    require(factorySetFile.loadFileAsData(setup),
-            "Could not load the source SET for disk/DSP regression");
+    const auto suppliedDisk = juce::SystemStats::getEnvironmentVariable("WAVE_TEST_DISK_IMAGE", {});
+    if (suppliedDisk.isNotEmpty())
+    {
+        wave::firmware::DosFloppyImage::SetupFile diskSetup;
+        require(wave::firmware::DosFloppyImage::readWaveSetup(
+                    juce::File(suppliedDisk), diskSetup).wasOk(),
+                "Could not read supplied disk for disk/DSP regression");
+        setup = diskSetup.data;
+    }
+    else
+        require(factorySetFile.loadFileAsData(setup),
+                "Could not load the source SET for disk/DSP regression");
     auto* bytes = static_cast<uint8_t*>(setup.getData());
     const auto performanceOffset = performanceBankOffset + performanceSize; // A002.
     const auto* performance = bytes + performanceOffset;
@@ -1830,7 +2150,7 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true,
                 && firstImageFile.copyFileTo(imageFile),
             "Could not create disk/DSP regression image");
 
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     if (fromColdStart)
         processor->resetToColdStart();
@@ -1942,13 +2262,18 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true,
     constexpr uint32_t storedSoundBank = 0x18000u;
     constexpr uint32_t bankBSound1Name = storedSoundBank + 128u * 256u + 240u;
     require(processor->getMasterFirmwareRuntime().sharedProgramByte(
-                bankBSound1Name) == static_cast<uint8_t>('W')
+                bankBSound1Name) == bytes[soundBankOffset + 128u * soundSize + 240u]
                 && processor->getMasterFirmwareRuntime().sharedProgramByte(
-                       bankBSound1Name + 256u) == static_cast<uint8_t>('S'),
+                       bankBSound1Name + 256u) == bytes[soundBankOffset + 129u * soundSize + 240u],
             "Imported SET did not populate distinct firmware Sound names");
 
     const auto lcdWritesBeforeStep
         = processor->getMasterFirmwareRuntime().lcdVideoWriteCount();
+    constexpr std::array<uint32_t, 3> receiveSettings { 0x8806u, 0x880du, 0x8824u };
+    std::array<uint8_t, 3> originalReceiveSettings {};
+    for (size_t index = 0; index < receiveSettings.size(); ++index)
+        originalReceiveSettings[index] = processor->getMasterFirmwareRuntime()
+            .sharedWorkByte(receiveSettings[index]);
     processor->setPanelButton(
         wave::panel::matrixIndexForDiagnosticCode(72), true); // Plus serial code.
     for (int block = 0; block < 8; ++block)
@@ -1995,6 +2320,33 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true,
                            > writesBefore,
                 "Repeated Plus froze after importing a replacement disk SET");
     }
+    // Exercise both bank boundaries with the same panel contacts as the UI.
+    for (const auto start : { 0, 127, 128, 255 })
+    {
+        processor->setCurrentProgram(start);
+        for (int block = 0; block < 64; ++block)
+        {
+            juce::MidiBuffer noMidi;
+            processor->processBlock(audio, noMidi);
+        }
+        clickAndSettle(72);
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId()
+                    == (start + 1) % 256,
+                "Plus after disk load produced an invalid Performance bank/number");
+        clickAndSettle(69);
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == start,
+                "Minus after disk load produced an invalid Performance bank/number");
+    }
+    processor->setCurrentProgram(4);
+    for (int block = 0; block < 64; ++block)
+    {
+        juce::MidiBuffer noMidi;
+        processor->processBlock(audio, noMidi);
+    }
+    for (size_t index = 0; index < receiveSettings.size(); ++index)
+        require(processor->getMasterFirmwareRuntime().sharedWorkByte(receiveSettings[index])
+                    == originalReceiveSettings[index],
+                "Panel browsing changed the disk's external MIDI receive settings");
     for (int voice = 0; voice < wave::dsp::WaldorfEngine::voiceCount; ++voice)
         require(processor->getMasterFirmwareRuntime().filterCalibrationCode(voice)
                     == wave::dsp::WaldorfEngine::installedFilterCalibrationCodes[
@@ -2005,7 +2357,7 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true,
     processor->getStateInformation(persistentState);
     require(imageFile.deleteFile(),
             "Could not remove the source disk before the self-contained recall test");
-    auto restored = std::make_unique<WaveEmulationAudioProcessor>();
+    auto restored = makeFactoryProcessor();
     restored->setStateInformation(persistentState.getData(),
                                   static_cast<int>(persistentState.getSize()));
     require(restored->hasMountedDiskImage()
@@ -2050,13 +2402,21 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true,
     processor->processBlock(audio, coldStartMidi);
     require(processor->getActiveVoiceCount() == 0,
             "Cold start allocated a voice without a loaded sound set");
+    for (int block = 0; block < 32; ++block)
+    {
+        juce::MidiBuffer noMidi;
+        processor->processBlock(audio, noMidi);
+    }
+    for (int layer = 0; layer < 8; ++layer)
+        require(!processor->isPerformanceInstrumentActive(layer),
+                "Firmware INIT records repopulated the cold-start bank");
     require(directory.deleteRecursively(),
             "Could not remove disk/DSP regression directory");
 }
 
 void testSamePerformanceReselectionLeavesModalScreen()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -2113,7 +2473,7 @@ void testSamePerformanceReselectionLeavesModalScreen()
 
 void testPerformanceInstrumentSelection()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count) {
@@ -2285,7 +2645,7 @@ void testPerformanceInstrumentSelection()
 
 void testSelectedInstrumentSoundRecordOverridesOldPanelSnapshot()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41); // A042: several active Instruments.
     juce::AudioBuffer<float> audio(2, 512);
@@ -2349,7 +2709,7 @@ void testSelectedInstrumentSoundRecordOverridesOldPanelSnapshot()
 
 void testOutgoingInstrumentIsSavedFromFirmwareNotPanelMirror()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41); // A042: several active Instruments.
     juce::AudioBuffer<float> audio(2, 512);
@@ -2402,7 +2762,7 @@ void testOutgoingInstrumentIsSavedFromFirmwareNotPanelMirror()
 void requireInstrumentSelectionDoesNotChangeSound(int program,
                                                   const char* performanceName)
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(program);
     juce::AudioBuffer<float> audio(2, 512);
@@ -2497,7 +2857,7 @@ void testFactoryStereoInstrumentSelectionDoesNotChangeSound()
 
 void testA001DuplicateSoundAssignmentsHavePrivateInstrumentEdits()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(0); // A001: I1 and I2 both assign Sound a002.
     juce::AudioBuffer<float> audio(2, 512);
@@ -2546,7 +2906,7 @@ void testA001DuplicateSoundAssignmentsHavePrivateInstrumentEdits()
 
     juce::MemoryBlock hostState;
     processor->getStateInformation(hostState);
-    auto restored = std::make_unique<WaveEmulationAudioProcessor>();
+    auto restored = makeFactoryProcessor();
     restored->setStateInformation(hostState.getData(),
                                   static_cast<int>(hostState.getSize()));
     restored->prepareToPlay(48000.0, 512);
@@ -2582,7 +2942,7 @@ void testA001DuplicateSoundAssignmentsHavePrivateInstrumentEdits()
 
 void testInstrumentButtonsDoNotRewriteLayerOctaves()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41); // A042: three active Instruments.
     juce::AudioBuffer<float> audio(2, 512);
@@ -2648,7 +3008,7 @@ void testInstrumentButtonsDoNotRewriteLayerOctaves()
 
 void testInstrumentEditLayerSelection()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41); // A042: three active Instruments.
     juce::AudioBuffer<float> audio(2, 512);
@@ -2735,7 +3095,7 @@ void testInstrumentSourceKeepsOtherLayers()
                 && wave::firmware::DosFloppyImage::createWithWaveSetup(
                        imageFile, setFile).wasOk(),
             "Source test disk creation failed");
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     require(processor->mountDiskImage(imageFile).wasOk(),
             "Source test disk mount failed");
@@ -2819,7 +3179,7 @@ void testInstrumentSourceKeepsOtherLayers()
 
 void testPerformanceMuteAndSolo()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->setCurrentProgram(41); // A042: three active Instruments.
     std::array<int, 3> active { -1, -1, -1 };
     auto activeCount = 0;
@@ -2887,7 +3247,7 @@ void testPerformanceMuteAndSolo()
 
 void testA013ComparatorAutoPan()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(12); // A013 -> 2.3 Sweep oo WMF.
 
@@ -2914,7 +3274,7 @@ void testA013ComparatorAutoPan()
 
 void testFactoryVcaReleaseTail()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(0); // A001, release byte 47 in both layers.
     juce::AudioBuffer<float> audio(2, 512);
@@ -2955,7 +3315,7 @@ void testFactoryVcaReleaseTail()
 
 void testLegacyStartupStateReloadsExactFactoryPerformance()
 {
-    auto savedProcessor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto savedProcessor = makeFactoryProcessor();
     savedProcessor->setCurrentProgram(0); // A001: one left and one right layer.
     auto* pan = savedProcessor->parameters.getParameter(wave::parameters::pan);
     require(pan != nullptr, "Factory pan parameter is unavailable");
@@ -2969,7 +3329,7 @@ void testLegacyStartupStateReloadsExactFactoryPerformance()
     if (const auto xml = legacyState.createXml())
         juce::AudioProcessor::copyXmlToBinary(*xml, legacyBinary);
 
-    auto restored = std::make_unique<WaveEmulationAudioProcessor>();
+    auto restored = makeFactoryProcessor();
     restored->setStateInformation(legacyBinary.getData(),
                                   static_cast<int>(legacyBinary.getSize()));
     const auto* restoredPan = restored->parameters.getRawParameterValue(
@@ -2999,7 +3359,7 @@ void testLegacyStartupStateReloadsExactFactoryPerformance()
 
 void testFactoryMultimodeFilterLoading()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
 
     processor->setCurrentProgram(4); // A005 -> WaveStrings, Dual filter.
@@ -3040,7 +3400,7 @@ void testFactoryMultimodeFilterLoading()
 
 void testPanelEditButtonFirmwareRouting()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -3234,12 +3594,12 @@ void testArtworkControlsMatchCompleteWiringMap()
                 == wave::panel::keyboardPanelLeds.size(),
             "The SVG and lower keyboard-panel LED table have different marker counts");
 
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     const auto& runtime = processor->getMasterFirmwareRuntime();
     for (const auto& control : wave::panel::visibleSwitches)
     {
         const auto target = wave::panel::physicalMatrixIndex(control);
-        processor->setPanelButton(target, true);
+        const auto accepted = processor->setPanelButton(target, true);
         const auto oneShot = control.diagnosticCode == 69
                              || control.diagnosticCode == 72
                              || control.diagnosticCode == 21
@@ -3265,13 +3625,16 @@ void testArtworkControlsMatchCompleteWiringMap()
             const auto serial = wave::panel::physicalMatrixIndex(observed);
             const auto requested = runtime.panelButtonRequestedDown(serial);
             require(serial == target
-                        ? (oneShot || dualPurposeDisplayButton
+                        ? (!accepted ? !requested
+                           : oneShot || dualPurposeDisplayButton
                            || discreteModeButton || discreteEditButton
                            || control.diagnosticCode == 31
                            || control.diagnosticCode == 11
                            || requested)
                         : !requested,
-                    "A UI button asserted more than its one mapped matrix input");
+                    (std::string("A UI button's matrix state did not match its accepted routing: target ")
+                        + std::to_string(target) + ", observed "
+                        + std::to_string(serial)).c_str());
         }
         processor->setPanelButton(target, false);
         require(!runtime.panelButtonRequestedDown(target),
@@ -3298,7 +3661,7 @@ void testArtworkControlsMatchCompleteWiringMap()
 
 void testKnobModeSelectUsesFirmwarePanelPath()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -3400,7 +3763,7 @@ void testKnobModeSelectUsesFirmwarePanelPath()
 
 void testEditPageFadersDriveFirmwareValues()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -3506,7 +3869,7 @@ void testEditPageRefreshesAfterFirmwarePerformanceChange()
 {
     const auto makeProcessor = []
     {
-        auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+        auto processor = makeFactoryProcessor();
         processor->prepareToPlay(48000.0, 512);
         return processor;
     };
@@ -3571,7 +3934,7 @@ void testEditPageRefreshesAfterFirmwarePerformanceChange()
 
 void testOscillatorOctaveButtonsDriveFirmwareSoundRecord()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count) {
@@ -3675,7 +4038,7 @@ void testSavedStateRestoresBanks(const juce::File& file)
     require(bytes != nullptr && expected.load(*bytes).validLayout,
             "Saved native bank was rejected by the SET loader");
     juce::TemporaryFile preference(".txt");
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+    auto processor = makeFactoryProcessor(preference.getFile());
     processor->prepareToPlay(48000.0, 512);
     processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     const auto& runtime = processor->getMasterFirmwareRuntime();
@@ -3693,7 +4056,7 @@ void testReopenRestoresAllStoredBanks()
 {
     juce::ScopedJuceInitialiser_GUI initialiseJuce;
     juce::TemporaryFile preference(".txt");
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+    auto processor = makeFactoryProcessor(preference.getFile());
     processor->prepareToPlay(48000.0, 512);
     auto& runtime = const_cast<wave::firmware::MasterFirmwareRuntime&>(
         processor->getMasterFirmwareRuntime());
@@ -3728,7 +4091,7 @@ void testReopenRestoresAllStoredBanks()
     tree.removeProperty("firmwareDirectory", nullptr);
     juce::AudioProcessor::copyXmlToBinary(*tree.createXml(), state);
     processor.reset();
-    auto reopened = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+    auto reopened = makeFactoryProcessor(preference.getFile());
     reopened->prepareToPlay(48000.0, 512);
     reopened->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     const auto& restored = reopened->getMasterFirmwareRuntime();
@@ -3759,9 +4122,103 @@ void testReopenRestoresAllStoredBanks()
     }
 }
 
+void testWavetableSelectorSurvivesSoundStore(int selector = 17)
+{
+    juce::ScopedJuceInitialiser_GUI initialiseJuce;
+    auto processor = makeFactoryProcessor();
+    processor->setCurrentProgram(29); // Sitar.
+    processor->prepareToPlay(48000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int count) {
+        for (int block = 0; block < count; ++block) {
+            audio.clear();
+            juce::MidiBuffer none;
+            processor->processBlock(audio, none);
+#if JUCE_MAC
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0001, true);
+#endif
+        }
+    };
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        require(processor->setPanelButton(button, true), "Wavetable Store rejected a button");
+        process(8);
+        processor->setPanelButton(button, false);
+        process(96);
+    };
+    auto& runtime = const_cast<wave::firmware::MasterFirmwareRuntime&>(
+        processor->getMasterFirmwareRuntime());
+    const auto renderedSelector = [](WaveEmulationAudioProcessor& target) {
+        juce::MemoryBlock state;
+        target.getStateInformation(state);
+        const auto xml = juce::AudioProcessor::getXmlFromBinary(state.getData(),
+                                                              static_cast<int>(state.getSize()));
+        require(xml != nullptr, "Wavetable Store state is missing");
+        const auto tree = juce::ValueTree::fromXml(*xml);
+        const auto snapshot = tree.getProperty("machinePerformanceSnapshot");
+        const auto* bytes = snapshot.getBinaryData();
+        wave::dsp::WaldorfEngine::PerformanceSnapshot performance;
+        require(bytes != nullptr && bytes->getSize() == sizeof(performance),
+                "Wavetable Store DSP snapshot is missing");
+        std::memcpy(&performance, bytes->getData(), sizeof(performance));
+        return performance.layers[static_cast<size_t>(performance.editableLayer)].sound.wavetableIndex;
+    };
+    process(128);
+    if (selector >= 0)
+    {
+        processor->turnPanelEncoder(8, selector - static_cast<int>(runtime.currentSoundRecordByte(25)));
+        process(128);
+        require(runtime.currentSoundRecordByte(25) == selector,
+                "The native Data dial did not select the requested wavetable");
+    }
+    const auto editedSelector = renderedSelector(*processor);
+    require(editedSelector == (selector < 0 ? 95 : selector),
+            "The native wavetable selector did not reach audio playback");
+    const auto performanceRecord = runtime.currentPerformanceRecordOffset();
+    require(performanceRecord.has_value(), "The Sitar Performance record is missing");
+    const auto soundId = static_cast<uint32_t>(
+        runtime.sharedProgramByte(*performanceRecord + 64u)
+        | (runtime.sharedProgramByte(*performanceRecord + 65u) << 7u));
+    click(57);
+    click(79);
+    click(22);
+    require(processor->isFirmwareRequesterActive(), "Wavetable Sound Store did not open");
+    click(70);
+    click(71);
+    require(runtime.sharedProgramByte(0x18000u + soundId * 256u + 25u) == editedSelector,
+            "Sound Store saved a different wavetable from audio playback");
+    processor->setCurrentProgram(0);
+    process(128);
+    processor->setCurrentProgram(29);
+    process(128);
+    require(runtime.currentSoundRecordByte(25) == editedSelector
+                && renderedSelector(*processor) == editedSelector,
+            "Sound Store/recall changed the audible wavetable selector");
+    if (selector == -1 || selector == 17 || selector == 127)
+    {
+        juce::MemoryBlock state;
+        processor->getStateInformation(state);
+        auto reopened = makeFactoryProcessor();
+        reopened->prepareToPlay(48000.0, 512);
+        reopened->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+        for (int block = 0; block < 128; ++block)
+        {
+            audio.clear();
+            juce::MidiBuffer none;
+            reopened->processBlock(audio, none);
+#if JUCE_MAC
+            CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0001, true);
+#endif
+        }
+        require(reopened->getMasterFirmwareRuntime().currentSoundRecordByte(25) == editedSelector
+                    && renderedSelector(*reopened) == editedSelector,
+                "Project restore changed the stored wavetable selector");
+    }
+}
+
 void testStoredSoundParametersSurvivePerformanceRecall()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int count) {
@@ -3782,9 +4239,9 @@ void testStoredSoundParametersSurvivePerformanceRecall()
     click(22);
     auto& runtime = const_cast<wave::firmware::MasterFirmwareRuntime&>(
         processor->getMasterFirmwareRuntime());
-    // Distinct edits to detune, wave position, filter cutoff and wave envelope.
-    constexpr std::array<std::pair<uint32_t, uint8_t>, 4> edits {{
-        { 2u, 73u }, { 26u, 31u }, { 79u, 19u }, { 135u, 57u }
+    // Distinct edits to detune, wavetable, wave position, cutoff and wave envelope.
+    constexpr std::array<std::pair<uint32_t, uint8_t>, 5> edits {{
+        { 2u, 73u }, { 25u, 17u }, { 26u, 31u }, { 79u, 19u }, { 135u, 57u }
     }};
     for (const auto [offset, value] : edits)
         require(runtime.writeCurrentSoundRecordByte(offset, value), "Could not edit Sound fixture");
@@ -3838,7 +4295,7 @@ void testStoredSoundParametersSurvivePerformanceRecall()
 
 void testEditSectionKnobsDriveFirmwareValues()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -3909,7 +4366,7 @@ void testEditSectionKnobsDriveFirmwareValues()
 
 void testEndlessPanelDialDrivesFirmwareValue()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -3947,7 +4404,7 @@ void testEndlessPanelDialDrivesFirmwareValue()
 
 void testGlideEditPageDrivesNativeSoundAndDsp()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -3975,6 +4432,10 @@ void testGlideEditPageDrivesNativeSoundAndDsp()
     click(11); // Glide Edit.
     auto& firmware = const_cast<wave::firmware::MasterFirmwareRuntime&>(
         processor->getMasterFirmwareRuntime());
+    const std::array<uint32_t, 4> glideFaderOffsets { 233u, 235u, 236u, 237u };
+    std::array<uint8_t, 4> beforeFaders {};
+    for (size_t index = 0; index < beforeFaders.size(); ++index)
+        beforeFaders[index] = firmware.currentSoundRecordByte(glideFaderOffsets[index]);
     processor->setPanelFader(0, wave::panel::performanceFaderAdcChannels[0],
                              0.9f, false);
     processor->setPanelFader(1, wave::panel::performanceFaderAdcChannels[1],
@@ -3983,6 +4444,9 @@ void testGlideEditPageDrivesNativeSoundAndDsp()
                              0.9f, false);
     processor->setPanelFader(5, wave::panel::performanceFaderAdcChannels[5],
                              0.9f, false);
+    for (size_t index = 0; index < beforeFaders.size(); ++index)
+        require(firmware.currentSoundRecordByte(glideFaderOffsets[index]) == beforeFaders[index],
+                "Glide faders mutated the Sound outside the audio-thread timeline");
     process(64);
     require((firmware.currentSoundRecordByte(233) & 0x7fu) == 6
                 && (firmware.currentSoundRecordByte(235) & 0x7fu) == 1
@@ -4036,7 +4500,7 @@ void testGlideEditPageDrivesNativeSoundAndDsp()
 
 void testPhysicalGlideControlsWorkOutsideEditPage()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -4096,7 +4560,7 @@ void testPhysicalGlideControlsWorkOutsideEditPage()
 
 void testBriefGlideSwitchClicksSurviveFirmwareScan()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -4154,7 +4618,7 @@ void testBriefGlideSwitchClicksSurviveFirmwareScan()
 
 void testPlusTapAfterDataDialAdvancesOneStep()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -4226,7 +4690,7 @@ void testPlusTapAfterDataDialAdvancesOneStep()
 
 void testWaveLinkUsesFirmwareLatch()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -4261,7 +4725,7 @@ void testWaveLinkUsesFirmwareLatch()
 
 void testProgramStateDoesNotMasqueradeAsPanelMovement()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count) {
@@ -4289,7 +4753,7 @@ void testProgramStateDoesNotMasqueradeAsPanelMovement()
 
 void testHostStatePreservesRelativePanelPotPositions()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](WaveEmulationAudioProcessor& target, int blocks) {
@@ -4318,7 +4782,7 @@ void testHostStatePreservesRelativePanelPotPositions()
 
     juce::MemoryBlock state;
     processor->getStateInformation(state);
-    auto restored = std::make_unique<WaveEmulationAudioProcessor>();
+    auto restored = makeFactoryProcessor();
     restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
     restored->prepareToPlay(48000.0, 512);
     process(*restored, 64);
@@ -4366,7 +4830,7 @@ void testHostStatePreservesRelativePanelPotPositions()
 
 void testProgramRecallRejectsPreviousHostPanelEcho()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -4419,7 +4883,7 @@ void testProgramRecallRejectsPreviousHostPanelEcho()
 
 void testRecallInitModalAcceptsDisplaySoftKeys()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto processBlocks = [&](int count)
@@ -4458,7 +4922,7 @@ void testRecallInitModalAcceptsDisplaySoftKeys()
 
 void testFirmwareModifierSelectorDrivesDsp()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks, juce::MidiBuffer* first = nullptr)
@@ -4581,7 +5045,7 @@ void testFirmwareModifierSelectorDrivesDsp()
 
 void testEditedPerformanceFaderRoutingDrivesDsp()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(255); // MULTI INIT: only Instrument 1 is active.
 
@@ -4723,7 +5187,7 @@ void testEditedPerformanceFaderRoutingDrivesDsp()
 
 void testB019FilterEnvelopeAudibility()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(146); // B019: Chung Bass FB.
     juce::AudioBuffer<float> audio(2, 512);
@@ -4752,7 +5216,7 @@ void testB019FilterEnvelopeAudibility()
 
 void testB004StereoLayerBalance()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(131); // B004: Vox Bells, left/right/centre layers.
 
@@ -4783,7 +5247,7 @@ void testB004StereoLayerBalance()
 
 void testA004LocalKeyboardRouting()
 {
-    auto externalMidiProcessor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto externalMidiProcessor = makeFactoryProcessor();
     externalMidiProcessor->prepareToPlay(48000.0, 512);
     externalMidiProcessor->setCurrentProgram(3); // A004: channels 1/2, hard left/right.
     juce::AudioBuffer<float> externalAudio(2, 512);
@@ -4793,7 +5257,7 @@ void testA004LocalKeyboardRouting()
     require(externalMidiProcessor->getActiveVoiceCount() == 1,
             "A004 external MIDI channel 1 did not retain its genuine single-Instrument routing");
 
-    auto localKeyboardProcessor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto localKeyboardProcessor = makeFactoryProcessor();
     localKeyboardProcessor->setMidiInputActsAsLocalKeyboard(true);
     localKeyboardProcessor->prepareToPlay(48000.0, 512);
     localKeyboardProcessor->setCurrentProgram(3);
@@ -4822,7 +5286,7 @@ void testA004LocalKeyboardRouting()
 
 void testBriefPanelClicksSurviveFirmwareScan()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -4850,7 +5314,7 @@ void testBriefPanelClicksSurviveFirmwareScan()
 
 void testEditSectionLedsAreMutuallyExclusive()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -4897,7 +5361,7 @@ void testEditSectionLedsAreMutuallyExclusive()
 
 void testGroupEditUsesFirmwareSerialPageAndLed()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 128);
     juce::AudioBuffer<float> audio(2, 128);
     const auto process = [&](int blocks) {
@@ -4953,7 +5417,7 @@ void testGroupEditUsesFirmwareSerialPageAndLed()
 
 void testInstrumentModeRoundTripsKeepSelectionAndSolo()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41);
     juce::AudioBuffer<float> audio(2, 512);
@@ -5043,7 +5507,7 @@ void testInstrumentModeRoundTripsKeepSelectionAndSolo()
 
 void testSelectedInstrumentSoftkeyFlashesOrangeOff()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     processor->setCurrentProgram(41); // A042: multiple active Instruments.
 
@@ -5068,7 +5532,7 @@ void testSelectedInstrumentSoftkeyFlashesOrangeOff()
 
 void testModeLcdRedrawIsOneDisplayTransaction()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 128);
     juce::AudioBuffer<float> audio(2, 128);
     const auto processOne = [&] {
@@ -5122,7 +5586,7 @@ void testModeLcdRedrawIsOneDisplayTransaction()
 
 void testSequencerKeyDoesNotTrapPerformanceMode()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -5157,7 +5621,7 @@ void testSequencerKeyDoesNotTrapPerformanceMode()
 
 void testDiskLoadStepDoesNotRepeat()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -5196,13 +5660,546 @@ void testDiskLoadStepDoesNotRepeat()
             "Load selection kept scrolling after releasing -");
 }
 
+void checkDgUserWavetables(const WaveEmulationAudioProcessor& processor)
+{
+    const auto bank = processor.getWavetableBank().renderSnapshot();
+    std::vector<int8_t> factory;
+    for (int table = 0; table < 64; ++table)
+        for (int wave = 0; wave < 64; ++wave)
+            for (int sample = 0; sample < 128; ++sample)
+                factory.push_back(bank.rawSample(table, wave, sample));
+    require(juce::SHA256(factory.data(), factory.size()).toHexString()
+                == "f77d1bc6f90e3a1605915f7b9b0004d26955692d5f99bd176ec5564cc91387cc",
+            "DG_PE import changed original hardware factory waves");
+    require(processor.getWavetableBank().damagedUserTableCount() == 1,
+            "DG_PE's damaged user table was not identified");
+    for (int table = 64; table < 128; ++table)
+        for (int wave = 0; wave < 64; ++wave)
+            for (int sample = 0; sample < 128; ++sample)
+                require(bank.rawSample(table, wave, sample) == bank.rawSample(64, wave, sample),
+                        "DG_PE retained a previous disk's user wavetable");
+    for (int sample = 0; sample < 128; ++sample)
+        require(bank.rawSample(64, 0, sample) == processor.getWavetableBank().rawRomWaveSample(0, sample)
+                    && bank.rawSample(64, 60, sample) == processor.getWavetableBank().rawRomWaveSample(1, sample),
+                "DG_PE INIT user bank has the wrong ROM Wave anchors");
+}
+
+void checkImportedDiskPlaybackTuning(WaveEmulationAudioProcessor& processor, int programs)
+{
+    processor.prepareToPlay(48000.0, 512);
+    processor.setMidiInputActsAsLocalKeyboard(true);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto settle = [&] {
+        for (int block = 0; block < 64; ++block)
+        {
+            juce::MidiBuffer midi;
+            processor.processBlock(audio, midi);
+#if JUCE_MAC
+            if (block % 16 == 0)
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
+#endif
+        }
+    };
+    int checked = 0;
+    for (int program = 0; program < programs; ++program)
+    {
+        processor.setCurrentProgram(program);
+        settle();
+        for (const auto key : { 48, 60, 69, 72 })
+        {
+            juce::MidiBuffer midi;
+            midi.addEvent(juce::MidiMessage::allSoundOff(1), 0);
+            midi.addEvent(juce::MidiMessage::noteOn(1, key, 0.8f), 1);
+            processor.processBlock(audio, midi);
+            const auto performance = processor.getCurrentPerformanceSnapshot();
+            for (const auto& voice : processor.getVoiceStates())
+            {
+                if (!voice.active || !voice.keyDown || voice.layer < 0)
+                    continue;
+                const auto& layer = performance.layers[static_cast<size_t>(voice.layer)];
+                if (layer.tuningTable != 0)
+                    continue;
+                const auto expected = static_cast<float>(juce::jlimit(
+                    0, 127, voice.triggerNote + layer.transposeSemitones));
+                if (std::abs(voice.glidePitch - expected) >= 1.0e-4f)
+                    std::cerr << "Bad disk tuning: program=" << program
+                              << " key=" << key << " pitch=" << voice.glidePitch
+                              << " expected=" << expected << '\n';
+                require(std::abs(voice.glidePitch - expected) < 1.0e-4f,
+                        "A damaged disk tuning table remapped a played note");
+                ++checked;
+            }
+        }
+    }
+    require(checked > 0, "Disk tuning check did not play any Global Instruments");
+}
+
+void testVisibleLcdAfterPerformanceStep(const juce::File& stateFile = {})
+{
+    auto processor = makeFactoryProcessor();
+    if (stateFile != juce::File{})
+    {
+        juce::MemoryBlock state;
+        require(stateFile.loadFileAsData(state), "Could not read LCD browsing state");
+        processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    }
+    processor->prepareToPlay(96000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int blocks) {
+        for (int block = 0; block < blocks; ++block)
+        {
+            juce::MidiBuffer midi;
+            processor->processBlock(audio, midi);
+        }
+    };
+    const auto pollLcd = [] {
+        juce::Thread::sleep(20);
+        juce::Timer::callPendingTimersSynchronously();
+    };
+    processor->setCurrentProgram(43);
+    process(96);
+    wave::ui::WaveLcdComponent lcd(*processor);
+    lcd.setPanelEmbedded(true);
+    lcd.setSize(480, 64);
+    for (const auto mode : { 36, 39 })
+    {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(mode);
+        processor->setPanelButton(button, true);
+        pollLcd(); // Observe the start of the genuine mode transition.
+        process(8);
+        processor->setPanelButton(button, false);
+        process(96);
+        require(!processor->isPanelModeDisplayTransitionActive(),
+                "LCD browsing fixture did not finish its mode transition");
+        pollLcd(); // Commit the mode frame and arm its residual-redraw guard.
+    }
+    const auto& runtime = processor->getMasterFirmwareRuntime();
+    const auto plus = wave::panel::matrixIndexForDiagnosticCode(72);
+    for (int program = 44; program <= 48; ++program)
+    {
+        processor->setPanelButton(plus, true);
+        process(1);
+        processor->setPanelButton(plus, false);
+        process(96);
+        require(runtime.currentPerformanceId() == program,
+                "LCD browsing fixture did not complete native recall");
+        pollLcd();
+        const auto image = lcd.createComponentSnapshot(lcd.getLocalBounds());
+        const auto video = runtime.lcdVideoSnapshot();
+        wave::ui::LcdFramebuffer expected;
+        expected.loadHardwareVideoRam(video.data(), video.size(), runtime.lcdDisplayPage());
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 480; ++x)
+            {
+                const auto pixel = image.getPixelAt(x, y);
+                const auto dark = pixel.getRed() < 40 && pixel.getGreen() < 100;
+                require(dark == expected.pixel(x, y),
+                        "LCD redraw guard hid a completed +/- Performance recall");
+            }
+    }
+    // A continuing controller gesture must not extend the residual redraw
+    // hold forever, even when the Performance number stays unchanged.
+    for (const auto mode : { 36, 39 })
+    {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(mode);
+        processor->setPanelButton(button, true);
+        pollLcd();
+        process(8);
+        processor->setPanelButton(button, false);
+        process(96);
+        pollLcd();
+    }
+    const auto beforeGesture = runtime.lcdVideoSnapshot();
+    int redrawFrames = 0;
+    for (int frame = 0; frame < 32; ++frame)
+    {
+        const auto writes = runtime.lcdVideoWriteCount();
+        processor->setPanelFader(0, wave::panel::performanceFaderAdcChannels[0],
+                                frame % 2 == 0 ? 0.2f : 0.8f);
+        process(32);
+        if (runtime.lcdVideoWriteCount() > writes)
+            ++redrawFrames;
+        pollLcd();
+    }
+    require(redrawFrames >= 8, "Continuous LCD fixture did not sustain firmware redraws");
+    const auto video = runtime.lcdVideoSnapshot();
+    require(video != beforeGesture, "Continuous LCD fixture did not change visible firmware data");
+    const auto image = lcd.createComponentSnapshot(lcd.getLocalBounds());
+    wave::ui::LcdFramebuffer expected;
+    expected.loadHardwareVideoRam(video.data(), video.size(), runtime.lcdDisplayPage());
+    for (int y = 0; y < 64; ++y)
+        for (int x = 0; x < 480; ++x)
+        {
+            const auto pixel = image.getPixelAt(x, y);
+            const auto dark = pixel.getRed() < 40 && pixel.getGreen() < 100;
+            require(dark == expected.pixel(x, y),
+                    "Continuous firmware redraws kept the visible LCD frozen");
+        }
+
+}
+
+void testSavedDiskBrowsing(const juce::File& stateFile)
+{
+    juce::MemoryBlock state;
+    require(stateFile.loadFileAsData(state), "Could not read saved browsing state");
+    juce::TemporaryFile preference(".txt");
+    auto processor = makeFactoryProcessor(preference.getFile());
+    processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+    processor->prepareToPlay(96000.0, 512);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int blocks) {
+        for (int block = 0; block < blocks; ++block)
+        {
+            juce::MidiBuffer midi;
+            processor->processBlock(audio, midi);
+#if JUCE_MAC
+            if (block % 16 == 0)
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
+#endif
+        }
+    };
+    const auto& runtime = processor->getMasterFirmwareRuntime();
+    const auto plus = wave::panel::matrixIndexForDiagnosticCode(72);
+    const auto minus = wave::panel::matrixIndexForDiagnosticCode(69);
+    processor->setCurrentProgram(0);
+    process(96);
+    for (int program = 1; program < 128; ++program)
+    {
+        const auto before = runtime.lcdVideoSnapshot();
+        processor->setPanelButton(plus, true);
+        process(1);
+        processor->setPanelButton(plus, false);
+        process(32);
+        if (runtime.currentPerformanceId() != program || runtime.lcdVideoSnapshot() == before)
+            std::cerr << "Saved disk browse froze at A" << program + 1
+                      << " native=" << runtime.currentPerformanceId().value_or(-1)
+                      << " pc=" << std::hex << runtime.programCounter() << std::dec << '\n';
+        require(runtime.currentPerformanceId() == program && runtime.lcdVideoSnapshot() != before,
+                "Saved disk +/- browsing froze the LCD");
+    }
+    for (int program = 126; program >= 0; --program)
+    {
+        const auto before = runtime.lcdVideoSnapshot();
+        processor->setPanelButton(minus, true);
+        process(1);
+        processor->setPanelButton(minus, false);
+        process(32);
+        require(runtime.currentPerformanceId() == program && runtime.lcdVideoSnapshot() != before,
+                "Saved disk reverse browsing froze the LCD");
+    }
+}
+
+void testWtbImageConversion(const juce::File& wtb)
+{
+    juce::TemporaryFile preference(".txt");
+    juce::TemporaryFile image(".img");
+    auto processor = makeFactoryProcessor(preference.getFile());
+    const auto program = processor->getProgramName(0);
+    juce::MemoryBlock original;
+    require(wtb.loadFileAsData(original)
+                && processor->createDiskImageFromWavetable(wtb, image.getFile()).wasOk()
+                && processor->getMountedDiskImageFile() == image.getFile(),
+            "WTB conversion did not create and mount a disk image");
+    juce::MemoryBlock disk;
+    require(image.getFile().loadFileAsData(disk) && disk.getSize() == 720u * 1024u,
+            "WTB conversion did not produce a DD floppy");
+    const auto* bytes = static_cast<const uint8_t*>(disk.getData());
+    require(bytes[3592] == 'W' && bytes[3593] == 'T' && bytes[3594] == 'B'
+                && original == juce::MemoryBlock(bytes + 7168, original.getSize())
+                && processor->getProgramName(0) == program,
+            "WTB image lost its native extension, data, or the current Performance bank");
+    juce::MemoryBlock after;
+    require(wtb.loadFileAsData(after) && after == original, "WTB conversion changed the source file");
+}
+
+void testImportedDiskLcd(const juce::File& source, bool nativeDiskLoad,
+                         bool loadMachineSpecific = false, bool checkDg = false)
+{
+    juce::TemporaryFile copy(".img");
+    require(source.copyFileTo(copy.getFile()), "Could not copy LCD regression disk");
+    auto processor = makeFactoryProcessor();
+    processor->prepareToPlay(48000.0, 512);
+    wave::ui::WaveLcdComponent lcd(*processor);
+    lcd.setPanelEmbedded(true);
+    lcd.setSize(480, 64);
+    juce::AudioBuffer<float> audio(2, 512);
+    const auto process = [&](int blocks) {
+        for (int block = 0; block < blocks; ++block)
+        {
+            audio.clear();
+            juce::MidiBuffer midi;
+            processor->processBlock(audio, midi);
+#if JUCE_MAC
+            if (block % 16 == 0)
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
+#endif
+        }
+#if JUCE_MAC
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.001, false);
+#endif
+    };
+    const auto& runtime = processor->getMasterFirmwareRuntime();
+    const auto verifyDisplay = [&] {
+        for (int tick = 0; tick < 25; ++tick)
+        {
+            process(2);
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            juce::Timer::callPendingTimersSynchronously();
+        }
+        const auto image = lcd.createComponentSnapshot(lcd.getLocalBounds());
+        const auto video = runtime.lcdVideoSnapshot();
+        wave::ui::LcdFramebuffer expected;
+        expected.loadHardwareVideoRam(video.data(), video.size(), runtime.lcdDisplayPage());
+        for (int y = 0; y < 64; ++y)
+            for (int x = 0; x < 480; ++x)
+            {
+                const auto pixel = image.getPixelAt(x, y);
+                const auto dark = pixel.getRed() < 40 && pixel.getGreen() < 100;
+                require(dark == expected.pixel(x, y),
+                        "Imported disk left the visible LCD displaying an obsolete frame");
+            }
+    };
+    const auto diagnostic = [&](const char* where) {
+        if (std::getenv("WAVE_TEST_VERBOSE") == nullptr)
+            return;
+        uint32_t callback = 0;
+        for (uint32_t i = 0; i < 4; ++i)
+            callback = (callback << 8u) | runtime.localByte(0x56bb0u + i);
+        uint64_t hash = 1469598103934665603ull;
+        for (const auto byte : runtime.lcdVideoSnapshot())
+            hash = (hash ^ byte) * 1099511628211ull;
+        std::cerr << where << " program=" << processor->getCurrentProgram()
+                  << " name=" << processor->getProgramName(processor->getCurrentProgram())
+                  << " native=" << runtime.currentPerformanceId().value_or(-1)
+                  << " raw=" << ((runtime.localByte(0x54b40u) << 8u) | runtime.localByte(0x54b41u))
+                  << " mode=" << processor->getPanelSelectedMode()
+                  << " requester=" << processor->isFirmwareRequesterActive()
+                  << " transition=" << processor->isPanelModeDisplayTransitionActive()
+                  << " pc=" << std::hex << runtime.programCounter()
+                  << " callback=" << callback << " lcd=" << hash << std::dec
+                  << " writes=" << runtime.lcdVideoWriteCount()
+                  << " diskread=" << runtime.mountedDiskBytesRead()
+                  << " response=" << std::hex;
+        for (const auto address : { 0x56728u, 0x56738u })
+        {
+            uint32_t response = 0;
+            for (uint32_t i = 0; i < 4; ++i)
+                response = (response << 8u) | runtime.localByte(address + i);
+            std::cerr << response << ',';
+        }
+        std::cerr << std::dec << '\n';
+    };
+    const auto click = [&](int code) {
+        const auto button = wave::panel::matrixIndexForDiagnosticCode(code);
+        const auto accepted = processor->setPanelButton(button, true);
+        process(8);
+        processor->setPanelButton(button, false);
+        process(96);
+        require(accepted, "Imported disk rejected a mode or disk contact");
+        diagnostic("click");
+    };
+    process(64);
+    diagnostic("boot");
+    require(processor->mountDiskImage(copy.getFile()).wasOk(), "Could not mount LCD regression disk");
+    wave::firmware::DosFloppyImage::SetupFile setup;
+    wave::presets::WaveFactorySet diskSet;
+    require(wave::firmware::DosFloppyImage::readWaveSetup(copy.getFile(), setup).wasOk()
+                && diskSet.load(setup.data).validLayout
+                && processor->getProgramName(0) == juce::String(diskSet.performanceName(0, 0)),
+            "Imported SET was rejected while the firmware loaded a different bank");
+    process(64);
+    diagnostic("mounted");
+    if (checkDg)
+        checkDgUserWavetables(*processor);
+    if (nativeDiskLoad)
+    {
+        click(58);
+        click(22);
+        for (int choice = 0; choice < 12; ++choice)
+            click(72);
+        click(70);
+        click(70);
+        click(70);
+        process(4000);
+        diagnostic("loaded");
+        click(loadMachineSpecific ? 70 : 71);
+        process(4000);
+        diagnostic("calibration skipped");
+        require(runtime.mountedDiskBytesRead() >= 350000u,
+                "Native Total Recall did not transfer the SET");
+        require(processor->getPanelSelectedMode() == 39
+                    && !processor->isPanelModeDisplayTransitionActive(),
+                "Total Recall did not retire the Disk workspace and LCD transition");
+        verifyDisplay();
+        if (checkDg)
+            checkDgUserWavetables(*processor);
+    }
+    else
+    {
+        click(34);
+        click(70);
+    }
+    for (const auto program : { 0, 1, 2, 43, 44, 45, 44, 151, 127, 128, 255, 0 })
+    {
+        const auto before = runtime.lcdVideoSnapshot();
+        processor->setCurrentProgram(program);
+        process(96);
+        diagnostic("selected");
+        require(runtime.currentPerformanceId() == program,
+                "Imported disk Performance recall did not complete");
+        const auto record = runtime.currentPerformanceRecordOffset();
+        require(record.has_value(), "Imported disk has no selected native record");
+        const auto expectedPerformance = diskSet.performance(program / 128, program % 128);
+        for (uint32_t character = 0; character < 16; ++character)
+            require(runtime.sharedProgramByte(*record + 32u + character)
+                        == expectedPerformance[32u + character],
+                    "Imported disk retained the previous bank's native Performance name");
+        if (program != 0)
+            require(runtime.lcdVideoSnapshot() != before,
+                    "Imported disk froze the LCD during Performance recall");
+        verifyDisplay();
+        if (expectedPerformance[48] == 0)
+            for (int instrument = 0; instrument < 8; ++instrument)
+                require(!processor->isPerformanceInstrumentActive(instrument),
+                        "An empty imported slot retained a preceding Instrument");
+    }
+    for (const auto mode : { 36, 33, 39, 37, 39 })
+    {
+        const auto before = runtime.lcdVideoSnapshot();
+        click(mode);
+        require(runtime.lcdVideoSnapshot() != before,
+                "Imported disk froze the LCD during a mode change");
+        verifyDisplay();
+    }
+    if (checkDg)
+    {
+        processor->prepareToPlay(96000.0, 512);
+        processor->setCurrentProgram(0);
+        process(96);
+        const auto plus = wave::panel::matrixIndexForDiagnosticCode(72);
+        const auto minus = wave::panel::matrixIndexForDiagnosticCode(69);
+        for (int program = 1; program <= 52; ++program)
+        {
+            const auto before = runtime.lcdVideoSnapshot();
+            require(processor->setPanelButton(plus, true), "DG_PE browsing rejected +");
+            process(1);
+            processor->setPanelButton(plus, false);
+            process(32);
+            diagnostic("browsed");
+            require(processor->getCurrentProgram() == program
+                        && runtime.currentPerformanceId() == program
+                        && runtime.lcdVideoSnapshot() != before,
+                    "DG_PE +/- browsing froze the LCD");
+        }
+        for (const auto blocks : { 0, 1, 2, 4, 8, 16 })
+        {
+            processor->setCurrentProgram(40);
+            process(96);
+            for (int step = 0; step < 4; ++step)
+            {
+                processor->setPanelButton(plus, true);
+                process(blocks);
+                processor->setPanelButton(plus, false);
+                process(blocks);
+            }
+            process(96);
+            diagnostic("rapid browse");
+            require(processor->getCurrentProgram() == 44
+                        && runtime.currentPerformanceId() == 44,
+                    "Rapid DG_PE +/- browsing stranded firmware recall");
+            const auto before = runtime.lcdVideoSnapshot();
+            processor->setPanelButton(minus, true);
+            process(1);
+            processor->setPanelButton(minus, false);
+            process(96);
+            require(runtime.currentPerformanceId() == 43
+                        && runtime.lcdVideoSnapshot() != before,
+                    "DG_PE LCD did not recover after rapid browsing");
+        }
+        checkImportedDiskPlaybackTuning(*processor, 256);
+        processor->setCurrentProgram(0);
+        process(96);
+        juce::MemoryBlock state;
+        processor->getStateInformation(state);
+        juce::TemporaryFile preference(".txt");
+        auto restored = makeFactoryProcessor(preference.getFile());
+        restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+        checkDgUserWavetables(*restored);
+        checkImportedDiskPlaybackTuning(*restored, 3);
+        require(restored->reloadBankFromMountedImage().wasOk(), "DG_PE reload after DAW recall failed");
+        checkDgUserWavetables(*restored);
+    }
+}
+
+void testPartiallyDamagedDiskLcd()
+{
+    const auto* path = std::getenv("WAVE_FACTORY_SET");
+    require(path != nullptr, "Damaged-bank LCD test needs the factory SET fixture");
+    juce::MemoryBlock setup;
+    require(juce::File(juce::String::fromUTF8(path)).loadFileAsData(setup),
+            "Could not load the damaged-bank SET fixture");
+    constexpr size_t damagedOffset = 0x22e7cu + 151u * 512u;
+    require(setup.getSize() >= damagedOffset + 512u, "Damaged-bank fixture is too short");
+    auto* record = static_cast<uint8_t*>(setup.getData()) + damagedOffset;
+    std::fill_n(record, 512, uint8_t{ 0xff });
+    record[48] = 0x55;
+    juce::TemporaryFile setFile(".set"), disk(".img");
+    require(setFile.getFile().replaceWithData(setup.getData(), setup.getSize())
+                && wave::firmware::DosFloppyImage::createWithWaveSetup(
+                       disk.getFile(), setFile.getFile()).wasOk(),
+            "Could not create the damaged-bank disk fixture");
+    testImportedDiskLcd(disk.getFile(), true);
+    testImportedDiskLcd(disk.getFile(), true, true);
+}
+
+void testDamagedUserWavetableDisk()
+{
+    const auto* path = std::getenv("WAVE_FACTORY_SET");
+    juce::MemoryBlock setup;
+    require(path != nullptr && juce::File(juce::String::fromUTF8(path)).loadFileAsData(setup),
+            "Could not read the user-wavetable disk fixture");
+    auto* bytes = static_cast<uint8_t*>(setup.getData());
+    for (size_t table = 0; table < 64; ++table)
+    {
+        auto* record = bytes + 0x4387c + table * 138;
+        std::copy_n(reinterpret_cast<const uint8_t*>("INIT WTBL"), 9, record);
+        record[9] = 0x55;
+        std::fill_n(record + 10, 128, uint8_t{ 0xff });
+        record[10] = record[11] = record[130] = 0;
+        record[131] = 1;
+    }
+    // Reproduce DG_PE's displaced Performance overwriting user table 93.
+    auto* damaged = bytes + 0x4387c + 28u * 138u;
+    std::copy_n(bytes + 0x22e7c, 138, damaged);
+    damaged[9] = 0x55;
+    damaged[10] = 0x4c;
+    damaged[11] = 0x54;
+    std::copy_n(bytes + 0x22e7c, 512, bytes + 0x42e7c);
+    std::copy_n(bytes + 0x22e7c, 512, bytes + 0x4307c);
+    juce::TemporaryFile setFile(".SET");
+    juce::TemporaryFile image(".img");
+    require(setFile.getFile().replaceWithData(setup.getData(), setup.getSize())
+                && wave::firmware::DosFloppyImage::createWithWaveSetup(
+                       image.getFile(), setFile.getFile()).wasOk(),
+            "Could not create the damaged user-wavetable disk");
+    testImportedDiskLcd(image.getFile(), true, false, true);
+}
+
 void testDiskFormatNameCursor()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     const juce::TemporaryFile temporaryDisk(".img");
     const auto disk = temporaryDisk.getFile();
     require(wave::firmware::DosFloppyImage::createEmpty(disk).wasOk(), "Test disk creation failed");
+    juce::MemoryBlock beforeFormat;
+    require(disk.loadFileAsData(beforeFormat), "Could not read format test image");
+    // A format must erase this unused final sector without a host Save action.
+    std::fill_n(static_cast<uint8_t*>(beforeFormat.getData())
+                    + beforeFormat.getSize() - 512u,
+                512, static_cast<uint8_t>(0x6b));
+    require(disk.replaceWithData(beforeFormat.getData(), beforeFormat.getSize()),
+            "Could not prepare format test image");
     require(processor->mountDiskImage(disk).wasOk(), "Test disk mount failed");
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -5227,6 +6224,16 @@ void testDiskFormatNameCursor()
     process(3000); // Let the emulated floppy finish formatting the temporary medium.
     const auto& runtime = processor->getMasterFirmwareRuntime();
     require(processor->isFirmwareRequesterActive(), "Format name requester did not open");
+    const auto formatted = runtime.mountedDiskImageSnapshot();
+    require(formatted != beforeFormat, "Native disk format did not change the image");
+    const auto saveDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (runtime.mountedDiskImageIsDirty()
+           && std::chrono::steady_clock::now() < saveDeadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    juce::MemoryBlock savedFormat;
+    require(!runtime.mountedDiskImageIsDirty()
+                && disk.loadFileAsData(savedFormat) && savedFormat == formatted,
+            "Native Disk-page format did not automatically overwrite the mounted image");
     const auto cursor = runtime.localByte(0x5705fu);
     const auto character = runtime.localByte(0x56f30u + cursor);
     for (int step = 0; step < 8 && runtime.localByte(0x56f30u + cursor) == character; ++step)
@@ -5250,7 +6257,7 @@ void testDiskFormatNameCursor()
 
 void testDiskCancelReturnsPerformanceModeLed()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -5290,7 +6297,7 @@ void testDiskCancelReturnsPerformanceModeLed()
 
 void testExclusiveModesRejectOtherModeLeds()
 {
-    auto processor = std::make_unique<WaveEmulationAudioProcessor>();
+    auto processor = makeFactoryProcessor();
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -5343,7 +6350,10 @@ void testExclusiveModesRejectOtherModeLeds()
         require(processor->getPanelSelectedMode() == 39
                     && processor->getPanelLed(51)
                     && !processor->getPanelLed(exclusiveLeds[exclusive]),
-                "Exclusive mode Cancel did not restore Performance mode");
+                (std::string("Exclusive mode Cancel did not restore Performance mode: from ")
+                    + std::to_string(exclusiveModes[exclusive]) + " to "
+                    + std::to_string(processor->getPanelSelectedMode()) + ", old LED "
+                    + std::to_string(processor->getPanelLed(exclusiveLeds[exclusive]))).c_str());
     }
 }
 
@@ -5353,6 +6363,102 @@ int main(int argc, char** argv)
 {
     try
     {
+        if (argc > 1 && std::string_view(argv[1]) == "--glide")
+        {
+            testGlideEditPageDrivesNativeSoundAndDsp();
+            std::cout << "Glide page controls passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--wiring")
+        {
+            testArtworkControlsMatchCompleteWiringMap();
+            std::cout << "Artwork control wiring passed\n";
+            return 0;
+        }
+        if (argc >= 3 && std::string_view(argv[1]) == "--check-wtb-image")
+        {
+            testWtbImageConversion(juce::File(juce::String::fromUTF8(argv[2])));
+            std::cout << "WTB disk image conversion and mount passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--wtb-image")
+        {
+            juce::TemporaryFile wtb(".WTB");
+            std::vector<uint8_t> bytes(138u + 61u * 64u, 128);
+            std::fill_n(bytes.begin() + 10, 128, 0xff);
+            bytes[9] = 0x55;
+            require(wtb.getFile().replaceWithData(bytes.data(), bytes.size()), "Could not create WTB fixture");
+            testWtbImageConversion(wtb.getFile());
+            std::cout << "WTB disk image conversion and mount passed\n";
+            return 0;
+        }
+        if (argc >= 3 && std::string_view(argv[1]) == "--check-dg-wavetables")
+        {
+            juce::ScopedJuceInitialiser_GUI initialiseGui;
+            testImportedDiskLcd(juce::File(juce::String::fromUTF8(argv[2])), true, false, true);
+            std::cout << "DG_PE factory/user wavetables, native Total Recall and DAW recall passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--damaged-user-wavetables")
+        {
+            juce::ScopedJuceInitialiser_GUI initialiseGui;
+            testDamagedUserWavetableDisk();
+            std::cout << "Damaged user wavetable disk, native Total Recall and DAW recall passed\n";
+            return 0;
+        }
+        if (argc >= 3 && std::string_view(argv[1]) == "--check-disk-lcd")
+        {
+            juce::ScopedJuceInitialiser_GUI initialiseGui;
+            testImportedDiskLcd(juce::File(juce::String::fromUTF8(argv[2])), argc > 3,
+                               argc > 3 && std::string_view(argv[3]) == "native-machine");
+            std::cout << "Imported disk LCD regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--damaged-disk-lcd")
+        {
+            juce::ScopedJuceInitialiser_GUI initialiseGui;
+            testPartiallyDamagedDiskLcd();
+            std::cout << "Damaged SET Total Recall and visible LCD passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--disk-write-through")
+        {
+            testDiskFormatNameCursor();
+            std::cout << "Automatic disk write regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--voice-allocation")
+        {
+            testInstrumentAllocationPageDrivesAudioAndRecall();
+            std::cout << "Instrument allocation page, audio and recall passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--lcd-browsing")
+        {
+            testVisibleLcdAfterPerformanceStep(argc > 2
+                ? juce::File(juce::String::fromUTF8(argv[2])) : juce::File{});
+            std::cout << "Visible LCD Performance browsing passed\n";
+            return 0;
+        }
+        if (argc > 2 && std::string_view(argv[1]) == "--check-browsing-state")
+        {
+            testSavedDiskBrowsing(juce::File(juce::String::fromUTF8(argv[2])));
+            std::cout << "Saved disk sequential browsing passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--factory-wavetables")
+        {
+            testOriginalFactoryWavetablesAndRecall();
+            testA030UsesItsSetUserWavetable();
+            std::cout << "Original factory wavetable startup and recall passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--links")
+        {
+            testWaveLinkUsesFirmwareLatch();
+            std::cout << "Link button regression passed\n";
+            return 0;
+        }
         if (argc > 1 && std::string_view(argv[1]) == "--performance-overwrite")
         {
             testPerformanceOverwriteClearsInactiveSlots(16);
@@ -5375,7 +6481,12 @@ int main(int argc, char** argv)
         if (argc > 1 && std::string_view(argv[1]) == "--store-mode-exit")
         {
             testStoreModeButtonExitAfterSave();
+            testStoreModeButtonExitAfterSave(false, 36);
+            testStoreModeButtonExitAfterSave(false, 33);
             testStoreModeButtonExitAfterSave(true);
+            testStoreModeButtonExitAfterSave(true, 36);
+            testStoreModeButtonExitAfterSave(true, 33);
+            testRepeatedSoundStoreCursor();
             std::cout << "Store mode exit regression passed\n";
             return 0;
         }
@@ -5390,6 +6501,29 @@ int main(int argc, char** argv)
             testInstrumentButtonsDoNotRewriteLayerOctaves();
             testA001DuplicateSoundAssignmentsHavePrivateInstrumentEdits();
             std::cout << "Stored Sound parameter regressions passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--wavetable-recall")
+        {
+            for (const auto selector : { -1, 0, 17, 18, 63, 64, 95, 127 })
+                testWavetableSelectorSurvivesSoundStore(selector);
+            std::cout << "Stored wavetable selector regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--keyboard-controls")
+        {
+            testKeyboardControllerShiftReachesFirmware();
+            testKeyboardOctaveButtonsDriveLocalKeyboardRange();
+            testPluginMidiFollowsKeyboardOctaveButtons();
+            testShiftDisplaySevenOpensFirmwareServiceMenu();
+            std::cout << "Keyboard octave and Shift checks passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--keyboard-buttons")
+        {
+            testAssignableButtonMidiRouting();
+            testLowerKeyboardAssignableButtonsDriveFirmware();
+            std::cout << "Keyboard buttons regression passed\n";
             return 0;
         }
         if (argc > 1 && std::string_view(argv[1]) == "--performance-store-name")
@@ -5434,12 +6568,21 @@ int main(int argc, char** argv)
         }
         if (argc > 1 && std::string_view(argv[1]) == "--disk-total-recall")
         {
-            testDiskSetSerialSelectionUpdatesDsp(false);
+            if (juce::SystemStats::getEnvironmentVariable("WAVE_TEST_DISK_IMAGE", {}).isEmpty())
+                testDiskSetSerialSelectionUpdatesDsp(false);
             testDiskSetSerialSelectionUpdatesDsp(false, true);
             testDiskSetSerialSelectionUpdatesDsp(false, true, true);
             testDiskSetSerialSelectionUpdatesDsp(false, true, false, false);
             testDiskSetSerialSelectionUpdatesDsp(false, true, true, false);
             std::cout << "Disk Total Recall regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--performance-selection")
+        {
+            testRapidPerformanceLcdRefreshIsAtomic();
+            testFirmwarePerformanceStepButtonsRefreshLcd();
+            testSamePerformanceReselectionLeavesModalScreen();
+            std::cout << "Performance selection regressions passed\n";
             return 0;
         }
         if (argc > 1 && std::string_view(argv[1]) == "--instrument-source")
@@ -5475,11 +6618,16 @@ int main(int argc, char** argv)
         testPerformanceOverwriteClearsInactiveSlots(16);
         testPerformanceOverwriteClearsInactiveSlots(512);
         testStoreModeButtonExitAfterSave();
+        testStoreModeButtonExitAfterSave(false, 36);
+        testStoreModeButtonExitAfterSave(false, 33);
         testStoreModeButtonExitAfterSave(true);
+        testStoreModeButtonExitAfterSave(true, 36);
+        testStoreModeButtonExitAfterSave(true, 33);
         testRepeatedSoundStoreCursor();
         testStoreCancelRestoresNumericPerformancePreview();
         testKeyboardControllerShiftReachesFirmware();
         testLowerKeyboardAssignableButtonsDriveFirmware();
+        testAssignableButtonMidiRouting();
         testGlideEditUsesFirmwareLamp();
         testKeyboardOctaveButtonsDriveLocalKeyboardRange();
         testPluginMidiFollowsKeyboardOctaveButtons();
@@ -5496,6 +6644,8 @@ int main(int argc, char** argv)
         testOutgoingInstrumentIsSavedFromFirmwareNotPanelMirror();
         testFactoryStereoInstrumentSelectionDoesNotChangeSound();
         testStoredSoundParametersSurvivePerformanceRecall();
+        for (const auto selector : { -1, 0, 17, 18, 63, 64, 95, 127 })
+            testWavetableSelectorSurvivesSoundStore(selector);
         testA001DuplicateSoundAssignmentsHavePrivateInstrumentEdits();
         testInstrumentButtonsDoNotRewriteLayerOctaves();
         testInstrumentEditLayerSelection();

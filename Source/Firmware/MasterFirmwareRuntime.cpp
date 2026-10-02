@@ -145,6 +145,11 @@ bool MasterFirmwareRuntime::loadAndStart(const juce::MemoryBlock& masterImage)
     displayRefreshActive = false;
     displayRefreshComplete = false;
     pendingPerformanceRefresh = -1;
+    pendingPerformanceDisplayFrozen.store(false, std::memory_order_release);
+    lcdPresentationRevision.fetch_add(1, std::memory_order_release);
+    pendingPerformanceMidiAddress = 0;
+    internalPerformanceDispatch = false;
+    pendingPerformanceSelectionHandled = false;
     voiceLoaderReached = false;
     voiceBoardHandoffComplete = false;
     activeVoiceBoardCount = 0;
@@ -277,28 +282,30 @@ bool MasterFirmwareRuntime::requestPerformanceSelection(int programIndex) noexce
     if (!loaded || programIndex < 0 || programIndex >= 256)
         return false;
 
-    // OS 1.700's MIDI program-change handler combines the 7-bit program
-    // number with bit 0 of this genuine system-work byte (see $008B3C-$008B52)
-    // before calling the firmware's performance-selection routine.  Feeding
-    // the request through that handler is important: merely replacing the
-    // edit records leaves the OS's selected-performance state and its LCD
-    // callbacks pointing at the previous program.
-    constexpr uint32_t performanceBankOffset = 0x8820u;
-    auto& bank = sharedMemory->work[performanceBankOffset];
-    bank = static_cast<uint8_t>((bank & 0xfeu) | ((programIndex / 128) & 0x01));
-
-    // A request may deliberately reselect the same program number after its
-    // backing bank has changed (for example, cold-start A001 after a disk
-    // Total Recall). Do not let runCycles mistake the old matching number for
-    // completion before OS 1.700 has consumed the MIDI event and installed
-    // the new bank's display callbacks/data.
-    constexpr uint32_t selectedPerformanceAddress = 0x54b40u;
-    sharedMemory->mainRam[selectedPerformanceAddress] = 0xffu;
-    sharedMemory->mainRam[selectedPerformanceAddress + 1u] = 0xffu;
-
-    pushMidiByte(0, 0xc0u);
-    pushMidiByte(0, static_cast<uint8_t>(programIndex & 0x7f));
+    if (!pendingPerformanceDisplayFrozen.load(std::memory_order_acquire))
+    {
+        const auto frame = lcdVideoSnapshot();
+        for (size_t index = 0; index < frame.size(); ++index)
+            pendingPerformanceDisplay[index].store(frame[index], std::memory_order_relaxed);
+        pendingPerformanceDisplayPage.store(lcdDisplayPage(), std::memory_order_relaxed);
+        pendingPerformanceDisplayFrozen.store(true, std::memory_order_release);
+        lcdPresentationRevision.fetch_add(1, std::memory_order_release);
+    }
+    // Feed panel/host recall through the normal OS parser, tagging its data
+    // byte so external MIDI routing/maps cannot redirect this internal request.
+    // Keep the live selected ID valid until the OS installs the new one.
+    auto& bank = sharedMemory->work[0x8820u];
+    bank = static_cast<uint8_t>((bank & 0xfeu) | ((programIndex / 128) & 1));
     pendingPerformanceRefresh = programIndex;
+    pendingPerformanceSelectionHandled = false;
+    pushMidiByte(0, 0xc0u);
+    constexpr uint32_t writePointerAddress = 0x4dda4u;
+    const auto& ram = sharedMemory->mainRam;
+    pendingPerformanceMidiAddress = (static_cast<uint32_t>(ram[writePointerAddress]) << 24u)
+        | (static_cast<uint32_t>(ram[writePointerAddress + 1u]) << 16u)
+        | (static_cast<uint32_t>(ram[writePointerAddress + 2u]) << 8u)
+        | ram[writePointerAddress + 3u];
+    pushMidiByte(0, static_cast<uint8_t>(programIndex & 0x7f));
     return true;
 }
 
@@ -587,6 +594,17 @@ bool MasterFirmwareRuntime::interceptInstruction(M68000& activeCpu,
                                                  uint32_t programCounter) noexcept
 {
     constexpr uint32_t displayRefreshReturnSentinel = 0x0f0000u;
+    // The MIDI parser copies the packet to $514D0 before dispatch, but A2
+    // retains its input-ring cursor just past the consumed data byte. Only
+    // the specifically tagged internal event bypasses external MIDI settings.
+    if (programCounter == 0x008ac4u)
+        internalPerformanceDispatch = pendingPerformanceRefresh >= 0
+            && activeCpu.addressRegister(2) == pendingPerformanceMidiAddress + 1u;
+    if (programCounter == 0x008b58u && internalPerformanceDispatch)
+    {
+        internalPerformanceDispatch = false;
+    }
+
     if (displayRefreshActive && programCounter == displayRefreshReturnSentinel)
     {
         displayRefreshComplete = true;
@@ -730,10 +748,14 @@ int MasterFirmwareRuntime::runCycles(int cycles)
                                    << 8)
                                   | static_cast<int>(sharedMemory->mainRam[
                                       selectedPerformanceAddress + 1u]);
-            if (selected == pendingPerformanceRefresh)
+            if (pendingPerformanceSelectionHandled && selected == pendingPerformanceRefresh)
             {
-                redrawCurrentScreenWithFirmware();
-                pendingPerformanceRefresh = -1;
+                if (redrawCurrentScreenWithFirmware())
+                {
+                    pendingPerformanceRefresh = -1;
+                    pendingPerformanceDisplayFrozen.store(false, std::memory_order_release);
+                    lcdPresentationRevision.fetch_add(1, std::memory_order_release);
+                }
             }
         }
 
@@ -877,7 +899,7 @@ bool MasterFirmwareRuntime::writePerformanceInstrumentByte(
 
 std::optional<int> MasterFirmwareRuntime::currentPerformanceId() const noexcept
 {
-    if (!loaded || sharedMemory == nullptr)
+    if (!loaded || sharedMemory == nullptr || pendingPerformanceRefresh >= 0)
         return std::nullopt;
 
     constexpr uint32_t address = 0x54b40u;
@@ -1121,18 +1143,34 @@ uint8_t MasterFirmwareRuntime::lcdVideoByte(uint32_t offset) const noexcept
 MasterFirmwareRuntime::LcdVideoSnapshot MasterFirmwareRuntime::lcdVideoSnapshot() const noexcept
 {
     LcdVideoSnapshot snapshot{};
-    for (size_t index = 0; index < lcdVideoRam.size(); ++index)
-        snapshot[index] = lcdVideoRam[index].load(std::memory_order_relaxed);
+    const auto frozen = pendingPerformanceDisplayFrozen.load(std::memory_order_acquire);
+    const auto& source = frozen ? pendingPerformanceDisplay : lcdVideoRam;
+    for (size_t index = 0; index < source.size(); ++index)
+        snapshot[index] = source[index].load(std::memory_order_relaxed);
     return snapshot;
 }
 
 uint8_t MasterFirmwareRuntime::lcdDisplayPage() const noexcept
 {
-    return lcdPage.load(std::memory_order_relaxed);
+    return pendingPerformanceDisplayFrozen.load(std::memory_order_acquire)
+        ? pendingPerformanceDisplayPage.load(std::memory_order_relaxed)
+        : lcdPage.load(std::memory_order_relaxed);
 }
 
 uint8_t MasterFirmwareRuntime::read8(uint32_t address) noexcept
 {
+    if (pendingPerformanceRefresh >= 0 && !pendingPerformanceSelectionHandled
+        && (address == 0x54b40u || address == 0x54b41u))
+        // Preserve the OS's no-selection recall phase without storing an
+        // invalid ID in SRAM. The LCD publishes the completed frame only.
+        return 0xffu;
+
+    if (internalPerformanceDispatch
+        && (address == sharedWorkBase + 0x8824u // MIDI program reception mode.
+            || address == sharedWorkBase + 0x880du // External receive channel.
+            || address == sharedWorkBase + 0x8806u)) // External program map.
+        return 0u;
+
     if (address < sharedMemory->mainRam.size())
         return sharedMemory->mainRam[address];
     if (address >= sharedProgramBase && address < sharedProgramBase + sharedMemory->program.size())
@@ -1213,6 +1251,8 @@ void MasterFirmwareRuntime::write8(uint32_t address, uint8_t value) noexcept
     if (address < sharedMemory->mainRam.size())
     {
         sharedMemory->mainRam[address] = value;
+        if (address == 0x54b41u && internalPerformanceDispatch)
+            pendingPerformanceSelectionHandled = true;
         return;
     }
     if (address >= sharedProgramBase && address < sharedProgramBase + sharedMemory->program.size())

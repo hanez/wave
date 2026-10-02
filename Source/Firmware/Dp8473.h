@@ -3,8 +3,10 @@
 #include <juce_core/juce_core.h>
 
 #include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace wave::firmware
@@ -16,6 +18,9 @@ namespace wave::firmware
 class Dp8473 final
 {
 public:
+    Dp8473() = default;
+    ~Dp8473();
+
     juce::Result mount(const juce::File& imageFile);
     juce::Result flush();
     juce::Result eject();
@@ -70,8 +75,17 @@ private:
     [[nodiscard]] uint8_t readDataRegister(bool dma, bool terminalCount) noexcept;
     void writeDataRegister(uint8_t value, bool dma) noexcept;
     void setDirty() noexcept;
+    juce::Result flushWithSaveLock();
+    void saveLoop();
 
     mutable std::mutex mutex;
+    // Serialize host file writes and media changes independently of the
+    // controller lock: audio only touches the in-memory image.
+    std::mutex saveMutex;
+    std::condition_variable saveRequested;
+    std::thread saveThread;
+    bool stopping = false;
+    juce::String lastSaveError;
     juce::File imagePath;
     std::vector<uint8_t> image;
     Geometry geometry;

@@ -34,10 +34,14 @@ private:
     juce::Image pixelImage { juce::Image::ARGB, LcdFramebuffer::width,
                              LcdFramebuffer::height, true };
     uint64_t displayedWriteCount = 0;
+    uint64_t displayedRevision = 0;
     uint8_t displayedPage = 0;
     uint64_t postCommitWriteCount = 0;
     uint8_t postCommitPage = 0;
     double postCommitLastChangeMs = 0.0;
+    double postCommitStartedMs = 0.0;
+    uint64_t postCommitRevision = 0;
+    int postCommitProgram = -1;
     bool hasDisplayedFrame = false;
     bool modeTransitionWasActive = false;
     bool postCommitGuardActive = false;

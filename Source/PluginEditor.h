@@ -97,6 +97,7 @@ private:
     void showDiskImageChooser();
     void showCreateBlankDiskChooser();
     void showCreateDiskFromSetChooser();
+    void showCreateDiskFromWavetableChooser();
     void showDiskDestinationChooser(const juce::File& waveSetup);
     void showSaveDiskAsChooser();
     void showDiskError(const juce::String& title, const juce::Result& result);

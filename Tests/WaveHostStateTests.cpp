@@ -1,5 +1,6 @@
 #include "PluginProcessor.h"
 #include "PanelWiring.h"
+#include "Firmware/DosFloppyImage.h"
 
 #include <atomic>
 #include <cstdlib>
@@ -186,6 +187,10 @@ int main(int argc, char** argv)
         const auto* directory = std::getenv("WAVE_FIRMWARE_DIR");
         for (auto* processor : { first.get(), second.get() })
         {
+            if (!processor->hasMountedDiskImage()
+                || processor->getMountedDiskImageFile().getFileName() != "Blank Wave.img"
+                || processor->getNumPrograms() != 1)
+                throw std::runtime_error("Fresh instance did not start with an empty bank and blank disk");
             if (directory != nullptr
                 && !processor->loadFirmware(juce::File(directory)).hasBothImages())
                 throw std::runtime_error("Unable to load the supplied test firmware");
@@ -227,6 +232,116 @@ int main(int argc, char** argv)
                 || unrelatedPreference.getFile().loadFileAsString() != missingDefault)
                 throw std::runtime_error("Project recall replaced the default firmware preference");
         }
+        // Restore a one-patch image over an existing populated project bank.
+        // Zero slots must replace the old records rather than reject the bank.
+        {
+            constexpr size_t soundOffset = 0x12e7c, performanceOffset = 0x22e7c;
+            juce::MemoryBlock image(performanceOffset + 256 * 512, true);
+            auto* bytes = static_cast<uint8_t*>(image.getData());
+            bytes[soundOffset + 239] = 0x55;
+            bytes[performanceOffset + 48] = 0x55;
+            std::copy_n("ONLY PATCH", 10, bytes + performanceOffset + 32);
+            juce::TemporaryFile setupFile(".set"), diskFile(".img");
+            if (!setupFile.getFile().replaceWithData(image.getData(), image.getSize())
+                || wave::firmware::DosFloppyImage::createWithWaveSetup(
+                       diskFile.getFile(), setupFile.getFile()).failed()
+                || first->mountDiskImage(diskFile.getFile()).failed()
+                || !first->getProgramName(1).isEmpty())
+                throw std::runtime_error("Mounting a one-patch disk retained the previous bank");
+            juce::MemoryBlock state;
+            first->getStateInformation(state);
+            auto xml = juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize()));
+            auto tree = juce::ValueTree::fromXml(*xml);
+            tree.setProperty("machineHasActiveSet", true, nullptr);
+            tree.setProperty("machineActiveSetData", juce::var(image), nullptr);
+            tree.setProperty("factoryProgram", 0, nullptr);
+            for (const auto* key : { "machinePerformanceSnapshot", "machineFirmwareEditBuffers" })
+                tree.removeProperty(key, nullptr);
+            juce::AudioProcessor::copyXmlToBinary(*tree.createXml(), state);
+            if (!diskFile.getFile().deleteFile())
+                throw std::runtime_error("Could not remove one-patch source disk");
+            second->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            if (second->getNumPrograms() != 256 || second->getProgramName(0) != "ONLY PATCH"
+                || !second->getProgramName(1).isEmpty() || !second->getProgramName(255).isEmpty()
+                || !second->hasMountedDiskImage()
+                || second->getMountedDiskImageFile().getFileName() != diskFile.getFile().getFileName())
+                throw std::runtime_error("One-patch project inherited old Performance slots");
+            // An explicit empty-bank flag wins over an old saved bank payload.
+            tree.setProperty("machineHasActiveSet", false, nullptr);
+            for (const auto* key : { "machineDiskImageData", "machineDiskImageName", "mountedDiskImage" })
+                tree.removeProperty(key, nullptr);
+            juce::AudioProcessor::copyXmlToBinary(*tree.createXml(), state);
+            first->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            first->getStateInformation(state);
+            xml = juce::AudioProcessor::getXmlFromBinary(state.getData(), static_cast<int>(state.getSize()));
+            tree = juce::ValueTree::fromXml(*xml);
+            if (first->getNumPrograms() != 1 || tree.hasProperty("machineActiveSetData")
+                || tree.hasProperty("machineDiskImageData"))
+                throw std::runtime_error("Empty project resurrected a previous bank or disk");
+        }
+        if (const auto* imagePath = std::getenv("WAVE_TEST_DISK_IMAGE"))
+        {
+            wave::firmware::DosFloppyImage::SetupFile setup;
+            if (wave::firmware::DosFloppyImage::readWaveSetup(juce::File(imagePath), setup).failed())
+                throw std::runtime_error("Cannot read supplied project-recall disk fixture");
+            wave::presets::WaveFactorySet expected;
+            if (!expected.load(setup.data).validLayout)
+                throw std::runtime_error("Supplied disk fixture has no valid bank");
+            juce::TemporaryFile disk(".img"), isolatedPreference(".txt");
+            if (!juce::File(imagePath).copyFileTo(disk.getFile()))
+                throw std::runtime_error("Cannot copy project-recall disk fixture");
+            auto reader = std::make_unique<WaveEmulationAudioProcessor>(isolatedPreference.getFile());
+            reader->prepareToPlay(48000.0, 512);
+            if (reader->mountDiskImage(disk.getFile()).failed())
+                throw std::runtime_error("Cannot mount project-recall fixture copy");
+            juce::MemoryBlock state;
+            reader->getStateInformation(state);
+            auto reopened = std::make_unique<WaveEmulationAudioProcessor>(isolatedPreference.getFile());
+            reopened->prepareToPlay(48000.0, 512);
+            reopened->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            juce::AudioBuffer<float> audio(2, 512);
+            for (int block = 0; block < 32; ++block)
+            {
+                juce::MidiBuffer midi;
+                reopened->processBlock(audio, midi);
+            }
+            for (int program = 0; program < 256; ++program)
+                if (reopened->getProgramName(program)
+                    != juce::String(expected.performanceName(program / 128, program % 128)))
+                    throw std::runtime_error("Disk fixture reopened with a different Performance name");
+            const auto& runtime = reopened->getMasterFirmwareRuntime();
+            if (runtime.isLoaded())
+                for (size_t byte = 0; byte < expected.performanceBank().size(); ++byte)
+                    if (runtime.sharedProgramByte(0x28000u + static_cast<uint32_t>(byte))
+                        != expected.performanceBank()[byte])
+                        throw std::runtime_error("Disk fixture's recalled Performance bank inherited old bytes");
+            reopened->getStateInformation(state);
+            auto rereopened = std::make_unique<WaveEmulationAudioProcessor>(isolatedPreference.getFile());
+            rereopened->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            for (int program = 0; program < 256; ++program)
+                if (rereopened->getProgramName(program)
+                    != juce::String(expected.performanceName(program / 128, program % 128)))
+                    throw std::runtime_error("Saving the recalled disk fixture changed an INIT slot");
+            // Older state can contain a mixed bank even though its disk image
+            // is correct. Reload replaces all slots, not just the selected one.
+            auto cachedXml = juce::AudioProcessor::getXmlFromBinary(
+                state.getData(), static_cast<int>(state.getSize()));
+            auto contaminated = juce::ValueTree::fromXml(*cachedXml);
+            auto wrongBank = setup.data;
+            auto* wrong = static_cast<uint8_t*>(wrongBank.getData());
+            std::fill_n(wrong + 0x22e7c + 5 * 512 + 32, 16, static_cast<uint8_t>(' '));
+            std::copy_n("OLD DISK PATCH", 14, wrong + 0x22e7c + 5 * 512 + 32);
+            contaminated.setProperty("machineActiveSetData", juce::var(wrongBank), nullptr);
+            juce::AudioProcessor::copyXmlToBinary(*contaminated.createXml(), state);
+            rereopened->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            if (rereopened->reloadBankFromMountedImage().failed())
+                throw std::runtime_error("Could not reload correct bank from remembered image");
+            for (int program = 0; program < 256; ++program)
+                if (rereopened->getProgramName(program)
+                    != juce::String(expected.performanceName(program / 128, program % 128)))
+                    throw std::runtime_error("Reloading the image retained an older disk patch");
+            std::cout << "Supplied disk bank retained all 256 Performance slots across project recall\n";
+        }
         auto render = [](const std::atomic<bool>& stop, WaveEmulationAudioProcessor* processor)
         {
             juce::AudioBuffer<float> audio(2, 128);
@@ -250,6 +365,20 @@ int main(int argc, char** argv)
                 throw std::runtime_error("Host preset contained no state");
             auto restored = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
             restored->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            if (recall == 0)
+            {
+                auto legacy = juce::AudioProcessor::getXmlFromBinary(state.getData(),
+                                                                   static_cast<int>(state.getSize()));
+                legacy->setAttribute("ecoMode", true);
+                juce::MemoryBlock legacyState;
+                juce::AudioProcessor::copyXmlToBinary(*legacy, legacyState);
+                restored->setStateInformation(legacyState.getData(), static_cast<int>(legacyState.getSize()));
+                restored->getStateInformation(legacyState);
+                const auto cleaned = juce::AudioProcessor::getXmlFromBinary(
+                    legacyState.getData(), static_cast<int>(legacyState.getSize()));
+                if (cleaned->hasAttribute("ecoMode"))
+                    throw std::runtime_error("Recalled state retained the retired Eco setting");
+            }
             if (directory != nullptr && !restored->getFirmwareReport().hasBothImages())
                 throw std::runtime_error("Host preset lost the firmware reference");
             if (restored->getCurrentProgram() != first->getCurrentProgram())

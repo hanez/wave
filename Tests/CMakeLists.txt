@@ -42,8 +42,20 @@ if(WAVE_HAS_PRIVATE_ROMS)
             juce::juce_recommended_config_flags
             juce::juce_recommended_warning_flags)
     add_test(NAME WaveIntegrationTests COMMAND WaveIntegrationTests)
+    add_test(NAME WaveFactoryWavetableTests COMMAND WaveIntegrationTests --factory-wavetables)
+    add_test(NAME WaveLcdBrowsingTests COMMAND WaveIntegrationTests --lcd-browsing)
+    add_test(NAME WaveWtbDiskImageTests COMMAND WaveIntegrationTests --wtb-image)
+    add_test(NAME WaveDamagedUserWavetableTests COMMAND WaveIntegrationTests --damaged-user-wavetables)
+    set_tests_properties(WaveDamagedUserWavetableTests PROPERTIES TIMEOUT 120)
+    add_test(NAME WaveVoiceAllocationTests COMMAND WaveIntegrationTests --voice-allocation)
     add_test(NAME WaveDiskTotalRecallTests COMMAND WaveIntegrationTests --disk-total-recall)
+    add_test(NAME WaveDiskWriteThroughTests COMMAND WaveIntegrationTests --disk-write-through)
+    add_test(NAME WaveDamagedDiskLcdTests COMMAND WaveIntegrationTests --damaged-disk-lcd)
+    set_tests_properties(WaveDamagedDiskLcdTests PROPERTIES TIMEOUT 120)
+    add_test(NAME WavePerformanceSelectionTests COMMAND WaveIntegrationTests --performance-selection)
     add_test(NAME WaveStoreModeLampTests COMMAND WaveIntegrationTests --store-mode-exit)
+    add_test(NAME WaveKeyboardButtonTests COMMAND WaveIntegrationTests --keyboard-buttons)
+    add_test(NAME WaveStoredWavetableTests COMMAND WaveIntegrationTests --wavetable-recall)
     add_test(NAME WaveReopenBankTests COMMAND WaveIntegrationTests --reopen-banks)
 
     add_executable(WaveEditorTests WaveEditorTests.cpp)
@@ -55,6 +67,7 @@ if(WAVE_HAS_PRIVATE_ROMS)
             juce::juce_recommended_config_flags
             juce::juce_recommended_warning_flags)
     add_test(NAME WaveEditorTests COMMAND WaveEditorTests)
+    add_test(NAME WaveKeyboardButtonEditorTests COMMAND WaveEditorTests --keyboard-buttons)
 
     add_executable(WavePerformanceBenchmark WavePerformanceBenchmark.cpp)
     target_include_directories(WavePerformanceBenchmark PRIVATE ${CMAKE_SOURCE_DIR}/Source)
@@ -68,10 +81,10 @@ endif()
 if(WAVE_HAS_PRIVATE_ROMS)
     set_tests_properties(WaveCoreTests PROPERTIES ENVIRONMENT
         "WAVE_FIRMWARE_DIR=${CMAKE_SOURCE_DIR}/Firmware/wave_sys1_700;PPG_WAVETABLE_ROM=${CMAKE_SOURCE_DIR}/Firmware/wave_sys1_700/ppg-wave-2.3-v6-wavetables.rom;WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
-    set_tests_properties(WaveIntegrationTests WaveDiskTotalRecallTests WaveStoreModeLampTests WaveReopenBankTests PROPERTIES
+    set_tests_properties(WaveIntegrationTests WaveFactoryWavetableTests WaveLcdBrowsingTests WaveWtbDiskImageTests WaveDamagedUserWavetableTests WaveVoiceAllocationTests WaveDiskTotalRecallTests WaveDiskWriteThroughTests WaveDamagedDiskLcdTests WavePerformanceSelectionTests WaveStoreModeLampTests WaveStoredWavetableTests WaveKeyboardButtonTests WaveReopenBankTests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         ENVIRONMENT "WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
-    set_tests_properties(WaveEditorTests PROPERTIES
+    set_tests_properties(WaveEditorTests WaveKeyboardButtonEditorTests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         ENVIRONMENT "WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
 endif()

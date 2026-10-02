@@ -120,6 +120,13 @@ public:
     [[nodiscard]] uint8_t ioByte(uint32_t address) const noexcept;
     [[nodiscard]] uint8_t localByte(uint32_t address) const noexcept;
     [[nodiscard]] uint8_t sharedProgramByte(uint32_t offset) const noexcept;
+    // A queued recall has no committed ID yet; its live LCD frame stays valid.
+    // Audio-thread recall scheduling: keep each parser transaction intact
+    // until its completed display has been published.
+    [[nodiscard]] bool performanceSelectionPending() const noexcept
+    {
+        return pendingPerformanceRefresh >= 0;
+    }
     [[nodiscard]] std::optional<int> currentPerformanceId() const noexcept;
     [[nodiscard]] std::optional<uint32_t> currentPerformanceRecordOffset() const noexcept;
     [[nodiscard]] std::optional<int> currentPerformanceInstrument() const noexcept;
@@ -145,6 +152,12 @@ public:
     [[nodiscard]] bool panelButtonRequestedDown(int buttonId) const noexcept;
     [[nodiscard]] uint8_t lcdVideoByte(uint32_t offset) const noexcept;
     [[nodiscard]] uint8_t lcdDisplayPage() const noexcept;
+    // Changes when the visible source switches between a held recall frame
+    // and live VRAM, even if that switch performs no additional VRAM write.
+    [[nodiscard]] uint64_t lcdDisplayRevision() const noexcept
+    {
+        return lcdPresentationRevision.load(std::memory_order_acquire);
+    }
     [[nodiscard]] uint64_t lcdVideoWriteCount() const noexcept
     {
         return lcdWrites.load(std::memory_order_relaxed);
@@ -207,7 +220,8 @@ private:
     [[nodiscard]] bool usesInstructionInterception() const noexcept override
     {
         return initialisationLoaderActive || startupContinuationActive
-               || displayRefreshActive;
+               || displayRefreshActive || pendingPerformanceRefresh >= 0
+               || internalPerformanceDispatch;
     }
     bool interceptInstruction(M68000& activeCpu, uint32_t programCounter) noexcept override;
     bool redrawCurrentScreenWithFirmware();
@@ -220,6 +234,7 @@ private:
     SharedFirmwareMemory ownedSharedMemory;
     SharedFirmwareMemory* sharedMemory = &ownedSharedMemory;
     std::array<std::atomic<uint8_t>, lcdVideoWindowSize> lcdVideoRam{};
+    std::atomic<uint64_t> lcdPresentationRevision{ 0 };
     std::array<std::atomic<uint16_t>, 8> panelSwitchWords{};
     std::array<std::atomic<uint64_t>, 128> panelReleaseCycles{};
     std::array<std::atomic<bool>, 128> panelReleasePending{};
@@ -251,6 +266,12 @@ private:
     bool displayRefreshActive = false;
     bool displayRefreshComplete = false;
     int pendingPerformanceRefresh = -1;
+    std::array<std::atomic<uint8_t>, lcdVideoWindowSize> pendingPerformanceDisplay{};
+    std::atomic<uint8_t> pendingPerformanceDisplayPage { 0 };
+    std::atomic<bool> pendingPerformanceDisplayFrozen { false };
+    uint32_t pendingPerformanceMidiAddress = 0;
+    bool internalPerformanceDispatch = false;
+    bool pendingPerformanceSelectionHandled = false;
     bool voiceLoaderReached = false;
     bool customInitialisationRecords = false;
     bool voiceBoardHandoffComplete = false;

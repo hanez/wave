@@ -51,15 +51,63 @@ WaveFactorySet::Report WaveFactorySet::load(const void* bytes, size_t size)
                                         + static_cast<size_t>(index) * performanceSize;
         if (soundRecord[239] == 0x55u && nativeName(soundRecord + 240))
             ++report.validSounds;
+        else if (std::all_of(soundRecord, soundRecord + soundSize,
+                            [](uint8_t value) { return value == 0; }))
+            ++report.emptySounds;
+        else
+            ++report.invalidSounds;
         if (performanceRecord[48] == 0x55u && nativeName(performanceRecord + 32))
             ++report.validPerformances;
+        else if (std::all_of(performanceRecord, performanceRecord + performanceSize,
+                            [](uint8_t value) { return value == 0; }))
+            ++report.emptyPerformances;
+        else
+            ++report.invalidPerformances;
     }
 
     report.sha256 = juce::SHA256(bytes, size).toHexString();
-    report.validLayout = report.validSounds >= 250 && report.validPerformances == programCount;
+    report.validLayout = report.validSounds > 0 && report.validPerformances > 0
+                         && report.validSounds + report.emptySounds >= 250
+                         && report.validPerformances + report.emptyPerformances >= 250;
+    if (report.validLayout)
+    {
+        // A few damaged records must not strand Total Recall using the old
+        // host bank after the OS has loaded a new one. Quarantine only those
+        // slots in the working banks; retain the source disk bytes verbatim.
+        for (int index = 0; index < programCount; ++index)
+        {
+            auto* soundRecord = sounds.data() + static_cast<size_t>(index) * soundSize;
+            auto* performanceRecord = performances.data()
+                                      + static_cast<size_t>(index) * performanceSize;
+            if (soundRecord[239] != 0x55u || !nativeName(soundRecord + 240))
+                std::fill_n(soundRecord, soundSize, uint8_t{});
+            if (performanceRecord[48] != 0x55u || !nativeName(performanceRecord + 32))
+                std::fill_n(performanceRecord, performanceSize, uint8_t{});
+        }
+    }
     report.detail = report.validLayout
                         ? "Native Waldorf Wave SET: two 128-program sound banks and two 128-program performance banks"
                         : "SET bank markers or names do not match the Waldorf Wave layout";
+    if (report.validLayout && report.invalidSounds + report.invalidPerformances > 0)
+        report.detail += "; working bank omits " + juce::String(report.invalidSounds)
+                         + " malformed Sounds and " + juce::String(report.invalidPerformances)
+                         + " malformed Performances";
+    return report;
+}
+
+WaveFactorySet::Report WaveFactorySet::loadStateSnapshot(const juce::MemoryBlock& data)
+{
+    load(data);
+    if (data.getSize() >= minimumSize)
+    {
+        // Host snapshots represent exact SRAM, including records a disk
+        // import would quarantine. Do not change those saved machine bytes.
+        const auto* bytes = static_cast<const uint8_t*>(data.getData());
+        std::copy_n(bytes + soundBankOffset, sounds.size(), sounds.begin());
+        std::copy_n(bytes + performanceBankOffset, performances.size(), performances.begin());
+        report.validLayout = true;
+        report.detail = "Saved native Wave sound and performance SRAM banks";
+    }
     return report;
 }
 
@@ -99,7 +147,7 @@ std::string WaveFactorySet::nameAt(std::span<const uint8_t> record, size_t offse
     if (offset + 16 > record.size())
         return {};
     std::string result(reinterpret_cast<const char*>(record.data() + offset), 16);
-    while (!result.empty() && result.back() == ' ')
+    while (!result.empty() && (result.back() == ' ' || result.back() == '\0'))
         result.pop_back();
     return result;
 }

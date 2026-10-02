@@ -169,23 +169,53 @@ juce::Result DosFloppyImage::createEmpty(const juce::File& destination)
 juce::Result DosFloppyImage::createWithWaveSetup(const juce::File& destination,
                                                   const juce::File& source)
 {
+    return createWithWaveFile(destination, source, false);
+}
+
+juce::Result DosFloppyImage::createWithWaveWavetable(const juce::File& destination,
+                                                    const juce::File& source)
+{
+    return createWithWaveFile(destination, source, true);
+}
+
+juce::Result DosFloppyImage::createWithWaveFile(const juce::File& destination,
+                                               const juce::File& source,
+                                               bool wavetable)
+{
+    auto output = destination;
+    if (output.getFileExtension().isEmpty())
+        output = output.withFileExtension(".img");
+    if (output == source)
+        return juce::Result::fail("Save the disk image to a different file from its source.");
     const auto rootSectors = rootEntries * 32u / bytesPerSector;
     const auto rootStartSector = 1u + 2u * fatSectors;
     const auto dataStartSector = rootStartSector + rootSectors;
     const auto clusterBytes = bytesPerSector * sectorsPerCluster;
     const auto availableClusters = (totalSectors - dataStartSector) / sectorsPerCluster;
     if (!source.existsAsFile())
-        return juce::Result::fail("The selected Wave Setup file does not exist.");
+        return juce::Result::fail("The selected Wave file does not exist.");
     juce::MemoryBlock setup;
     if (!source.loadFileAsData(setup) || setup.getSize() == 0)
-        return juce::Result::fail("The Wave Setup file could not be read.");
+        return juce::Result::fail("The Wave file could not be read.");
+    if (wavetable)
+    {
+        constexpr size_t recordBytes = 138;
+        constexpr size_t halfWaveBytes = 64;
+        const auto* bytes = static_cast<const uint8_t*>(setup.getData());
+        if (!source.hasFileExtension(".wtb") || setup.getSize() < recordBytes
+            || (setup.getSize() - recordBytes) % halfWaveBytes != 0
+            || setup.getSize() > recordBytes + 1000u * halfWaveBytes
+            || bytes[9] != 0x55u)
+            return juce::Result::fail(
+                "Select a native Waldorf Wave .WTB file (a wavetable record with optional Wave data).");
+    }
     const auto requiredClusters = (setup.getSize() + clusterBytes - 1u) / clusterBytes;
     if (requiredClusters > availableClusters)
         return juce::Result::fail(
-            "The selected Wave Setup does not fit on a 720 KB DD floppy.");
+            "The selected Wave file does not fit on a 720 KB DD floppy.");
 
     auto disk = makeFormattedDisk();
-    std::copy_n(reinterpret_cast<const uint8_t*>("WAVE SET   "), 11,
+    std::copy_n(reinterpret_cast<const uint8_t*>(wavetable ? "WAVE WTB   " : "WAVE SET   "), 11,
                 disk.begin() + 43);
 
     auto* firstFat = disk.data() + bytesPerSector;
@@ -212,9 +242,6 @@ juce::Result DosFloppyImage::createWithWaveSetup(const juce::File& destination,
     std::copy_n(static_cast<const uint8_t*>(setup.getData()), setup.getSize(),
                 disk.begin() + static_cast<std::ptrdiff_t>(dataOffset));
 
-    auto output = destination;
-    if (output.getFileExtension().isEmpty())
-        output = output.withFileExtension(".img");
     if (!output.replaceWithData(disk.data(), disk.size()))
         return juce::Result::fail("The floppy image could not be written.");
     return juce::Result::ok();

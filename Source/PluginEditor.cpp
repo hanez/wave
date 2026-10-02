@@ -51,6 +51,8 @@ constexpr auto resetZoomMenuItem = 0x470a;
 constexpr auto toggleKeyboardMenuItem = 0x470b;
 constexpr auto loadPanelSkinMenuItem = 0x470c;
 constexpr auto defaultPanelSkinMenuItem = 0x470d;
+constexpr auto reloadDiskBankMenuItem = 0x470e;
+constexpr auto createDiskFromWavetableMenuItem = 0x470f;
 
 bool hitCircle(juce::Point<float> point, float x, float y) noexcept
 {
@@ -755,6 +757,7 @@ juce::PopupMenu WaveEmulationAudioProcessorEditor::getMenuForIndex(
     const auto mounted = ownerProcessor.hasMountedDiskImage();
     menu.addItem(createBlankDiskMenuItem, "New Blank 720 KB DD Disk Image...");
     menu.addItem(createDiskFromSetMenuItem, "Create Disk Image from Wave Setup...");
+    menu.addItem(createDiskFromWavetableMenuItem, "Create Disk Image from WTB...");
     menu.addSeparator();
     menu.addItem(mountDiskMenuItem, mounted ? "Mount Another Disk Image..."
                                             : "Mount Disk Image...");
@@ -763,6 +766,7 @@ juce::PopupMenu WaveEmulationAudioProcessorEditor::getMenuForIndex(
                                                                      .mountedDiskImageIsWritable());
     menu.addItem(saveDiskAsMenuItem, "Save Mounted Disk Image As...", mounted);
     menu.addItem(ejectDiskMenuItem, "Eject Disk", mounted);
+    menu.addItem(reloadDiskBankMenuItem, "Reload Performance Bank from Mounted Image", mounted);
     menu.addSeparator();
     menu.addItem(-1, ownerProcessor.getMountedDiskDescription(), false, false);
     menu.addSeparator();
@@ -797,6 +801,13 @@ void WaveEmulationAudioProcessorEditor::showSystemMenu()
 
 void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
 {
+    if (menuItemId == reloadDiskBankMenuItem)
+    {
+        const auto result = ownerProcessor.reloadBankFromMountedImage();
+        if (result.failed())
+            showDiskError("Reload Performance Bank", result);
+        return;
+    }
     if (menuItemId == loadPanelSkinMenuItem)
     {
         showPanelSkinChooser();
@@ -842,6 +853,11 @@ void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
     if (menuItemId == mountDiskMenuItem)
     {
         showDiskImageChooser();
+        return;
+    }
+    if (menuItemId == createDiskFromWavetableMenuItem)
+    {
+        showCreateDiskFromWavetableChooser();
         return;
     }
     if (menuItemId == saveDiskMenuItem)
@@ -981,15 +997,36 @@ void WaveEmulationAudioProcessorEditor::showDiskDestinationChooser(
             const auto destination = chooser.getResult();
             if (destination == juce::File{})
                 return;
-            const auto result = safe->ownerProcessor.createDiskImageFromWaveSetup(
-                waveSetup, destination);
+            const auto wavetable = waveSetup.hasFileExtension(".wtb");
+            const auto result = wavetable
+                ? safe->ownerProcessor.createDiskImageFromWavetable(waveSetup, destination)
+                : safe->ownerProcessor.createDiskImageFromWaveSetup(waveSetup, destination);
             if (result.failed())
                 safe->showDiskError("Could not create Wave disk image", result);
             else
                 juce::AlertWindow::showMessageBoxAsync(
                     juce::MessageBoxIconType::InfoIcon, "Wave disk ready",
-                    "The canonical 720 KB DD disk image was created and mounted.");
+                    wavetable
+                        ? "A 720 KB DD disk image was created and mounted. Use the Wave's Disk controls to load its WTB file."
+                        : "The canonical 720 KB DD disk image was created and mounted.");
             safe->menuItemsChanged();
+        });
+}
+
+void WaveEmulationAudioProcessorEditor::showCreateDiskFromWavetableChooser()
+{
+    waveSetChooser = std::make_unique<juce::FileChooser>(
+        "Choose a Waldorf Wave Wavetable", juce::File::getSpecialLocation(
+                                                juce::File::userDocumentsDirectory),
+        "*.wtb", true);
+    waveSetChooser->launchAsync(
+        juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
+        [safe = juce::Component::SafePointer(this)](const juce::FileChooser& chooser) {
+            if (safe == nullptr)
+                return;
+            const auto selected = chooser.getResult();
+            if (selected.existsAsFile())
+                safe->showDiskDestinationChooser(selected);
         });
 }
 

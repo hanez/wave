@@ -1,6 +1,7 @@
 #include "Dp8473.h"
 
 #include <algorithm>
+#include <chrono>
 
 namespace wave::firmware
 {
@@ -25,51 +26,103 @@ uint32_t little32(const std::vector<uint8_t>& bytes, size_t offset) noexcept
 }
 }
 
+Dp8473::~Dp8473()
+{
+    {
+        const std::scoped_lock lock(mutex);
+        stopping = true;
+    }
+    saveRequested.notify_one();
+    if (saveThread.joinable())
+        saveThread.join();
+    (void) flush();
+}
+
+void Dp8473::saveLoop()
+{
+    std::unique_lock lock(mutex);
+    while (!stopping)
+    {
+        saveRequested.wait(lock, [this] { return stopping || dirty; });
+        if (stopping)
+            break;
+
+        // Batch a floppy's sector transfers, with a bounded delay even while
+        // the firmware continues writing. Never perform file I/O on audio.
+        if (saveRequested.wait_for(lock, std::chrono::milliseconds(100),
+                                   [this] { return stopping; }))
+            break;
+        lock.unlock();
+        const auto saved = flush();
+        lock.lock();
+        if (saved.failed())
+            saveRequested.wait_for(lock, std::chrono::seconds(1),
+                                   [this] { return stopping; });
+    }
+}
+
 juce::Result Dp8473::mount(const juce::File& file)
 {
     if (!file.existsAsFile())
         return juce::Result::fail("The selected disk image does not exist.");
 
-    // The selected path may be the image already in the drive. Commit its
-    // pending sector writes before reading it, so a remount cannot install
-    // the older on-disk bytes after successfully flushing the newer image.
-    const auto previousFlush = flush();
-    if (previousFlush.failed())
-        return previousFlush;
+    const std::scoped_lock saveLock(saveMutex);
+    for (;;)
+    {
+        // The selected path may be the image already in the drive. Commit its
+        // pending sector writes before reading it, so a remount cannot install
+        // the older on-disk bytes after successfully flushing the newer image.
+        const auto previousFlush = flushWithSaveLock();
+        if (previousFlush.failed())
+            return previousFlush;
 
-    juce::MemoryBlock bytes;
-    if (!file.loadFileAsData(bytes))
-        return juce::Result::fail("The selected disk image could not be read.");
+        juce::MemoryBlock bytes;
+        if (!file.loadFileAsData(bytes))
+            return juce::Result::fail("The selected disk image could not be read.");
 
-    std::vector<uint8_t> loaded(bytes.getSize());
-    if (!loaded.empty())
-        std::copy_n(static_cast<const uint8_t*>(bytes.getData()), loaded.size(),
-                    loaded.begin());
-    Geometry detected;
-    if (!geometryForImage(loaded, detected))
-        return juce::Result::fail(
-            "This is not a supported raw MS-DOS floppy image (720 KB, 800 KB, "
-            "1.44 MB, or a valid FAT BPB geometry).");
+        std::vector<uint8_t> loaded(bytes.getSize());
+        if (!loaded.empty())
+            std::copy_n(static_cast<const uint8_t*>(bytes.getData()), loaded.size(),
+                        loaded.begin());
+        Geometry detected;
+        if (!geometryForImage(loaded, detected))
+            return juce::Result::fail(
+                "This is not a supported raw MS-DOS floppy image (720 KB, 800 KB, "
+                "1.44 MB, or a valid FAT BPB geometry).");
 
-    const std::scoped_lock lock(mutex);
-    imagePath = file;
-    image = std::move(loaded);
-    geometry = detected;
-    writable = file.hasWriteAccess();
-    dirty = false;
-    bytesRead = 0;
-    ++revision;
-    // The Wave polls the drive-status input before it will issue any FDC
-    // command.  Leaving the change line asserted here deadlocks the firmware:
-    // it keeps displaying "Please insert Disk!" and never seeks/recalibrates,
-    // which are the only controller commands that otherwise clear the latch.
-    // A host mount represents the completed insertion, so present ready media.
-    diskChanged = false;
-    resetController();
-    return juce::Result::ok();
+        const std::scoped_lock lock(mutex);
+        // A completed audio-thread transfer during the read must also reach the
+        // old image before it is replaced (including a remount of the same path).
+        if (dirty)
+            continue;
+        if (!saveThread.joinable())
+            saveThread = std::thread([this] { saveLoop(); });
+        imagePath = file;
+        image = std::move(loaded);
+        geometry = detected;
+        writable = file.hasWriteAccess();
+        dirty = false;
+        lastSaveError.clear();
+        bytesRead = 0;
+        ++revision;
+        // The Wave polls the drive-status input before it will issue any FDC
+        // command.  Leaving the change line asserted here deadlocks the firmware:
+        // it keeps displaying "Please insert Disk!" and never seeks/recalibrates,
+        // which are the only controller commands that otherwise clear the latch.
+        // A host mount represents the completed insertion, so present ready media.
+        diskChanged = false;
+        resetController();
+        return juce::Result::ok();
+    }
 }
 
 juce::Result Dp8473::flush()
+{
+    const std::scoped_lock saveLock(saveMutex);
+    return flushWithSaveLock();
+}
+
+juce::Result Dp8473::flushWithSaveLock()
 {
     juce::File destination;
     std::vector<uint8_t> snapshot;
@@ -85,31 +138,56 @@ juce::Result Dp8473::flush()
         snapshotRevision = revision;
     }
 
-    if (!destination.replaceWithData(snapshot.data(), snapshot.size()))
-        return juce::Result::fail("The mounted disk image could not be saved.");
+    // Only replace the original after a complete, successful write. JUCE's
+    // File::replaceWithData does not check its temporary-file write result.
+    const juce::TemporaryFile temporary(destination, juce::TemporaryFile::useHiddenFile);
+    auto saved = false;
+    {
+        juce::FileOutputStream stream(temporary.getFile());
+        if (stream.openedOk() && stream.write(snapshot.data(), snapshot.size()))
+        {
+            stream.flush();
+            saved = stream.getStatus().wasOk();
+        }
+    }
+    if (saved)
+        saved = temporary.overwriteTargetFileWithTemporary();
 
     const std::scoped_lock lock(mutex);
-    if (imagePath == destination && revision == snapshotRevision)
+    if (!saved)
+    {
+        lastSaveError = "The mounted disk image could not be saved.";
+        return juce::Result::fail(lastSaveError);
+    }
+    lastSaveError.clear();
+    if (revision == snapshotRevision)
         dirty = false;
     return juce::Result::ok();
 }
 
 juce::Result Dp8473::eject()
 {
-    const auto saved = flush();
-    if (saved.failed())
-        return saved;
-    const std::scoped_lock lock(mutex);
-    imagePath = juce::File{};
-    image.clear();
-    geometry = {};
-    writable = false;
-    dirty = false;
-    bytesRead = 0;
-    diskChanged = true;
-    ++revision;
-    resetController();
-    return juce::Result::ok();
+    const std::scoped_lock saveLock(saveMutex);
+    for (;;)
+    {
+        const auto saved = flushWithSaveLock();
+        if (saved.failed())
+            return saved;
+        const std::scoped_lock lock(mutex);
+        if (dirty)
+            continue;
+        imagePath = juce::File{};
+        image.clear();
+        geometry = {};
+        writable = false;
+        dirty = false;
+        lastSaveError.clear();
+        bytesRead = 0;
+        diskChanged = true;
+        ++revision;
+        resetController();
+        return juce::Result::ok();
+    }
 }
 
 juce::MemoryBlock Dp8473::mountedImageSnapshot() const
@@ -583,6 +661,7 @@ void Dp8473::setDirty() noexcept
 {
     dirty = true;
     ++revision;
+    saveRequested.notify_one();
 }
 
 bool Dp8473::drqAsserted() const noexcept
@@ -641,6 +720,8 @@ juce::String Dp8473::mountedDescription() const
         description += " (read-only)";
     if (dirty)
         description += " *";
+    if (lastSaveError.isNotEmpty())
+        description += " (save failed; retrying)";
     return description;
 }
 } // namespace wave::firmware

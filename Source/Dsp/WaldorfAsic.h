@@ -19,15 +19,21 @@ public:
     static constexpr int samplesPerWave = 128;
 
     WavetableBank();
+    // Capture samples once per render block; oscillator sampling needs no locks.
+    // Import metadata belongs to the source bank, not this sample-only view.
+    [[nodiscard]] WavetableBank renderSnapshot() const noexcept;
 
     bool loadSigned8BitRom(const void* data, size_t size) noexcept;
     bool loadFirst32Signed8BitRom(const void* data, size_t size) noexcept;
     bool loadPpgWaveRom(const void* data, size_t size) noexcept;
     bool loadRomImage(const void* data, size_t size) noexcept;
+    bool loadWaveFactoryRom(const void* data, size_t size);
+    [[nodiscard]] bool hasOriginalWaveFactoryTables() const noexcept { return originalWaveFactoryTables; }
     bool loadWaveSetUserTables(const void* data, size_t size) noexcept;
     [[nodiscard]] bool isExternalRomLoaded() const noexcept { return externalRomLoaded; }
     [[nodiscard]] int importedTableCount() const noexcept { return importedTables; }
     [[nodiscard]] bool hasWaveSetUserTables() const noexcept { return waveSetUserTablesLoaded; }
+    [[nodiscard]] int damagedUserTableCount() const noexcept { return damagedUserTables; }
     [[nodiscard]] const juce::String& sourceDescription() const noexcept { return source; }
 
     [[nodiscard]] float sample(int table, float position, double phase,
@@ -35,19 +41,24 @@ public:
     [[nodiscard]] int8_t sampleCode(int table, float position, double phase,
                                     bool smoothPosition = true) const noexcept;
     [[nodiscard]] int8_t rawSample(int table, int position, int sampleIndex) const noexcept;
+    [[nodiscard]] int8_t rawRomWaveSample(int wave, int sampleIndex) const noexcept;
 
 private:
     static constexpr size_t totalSamples = static_cast<size_t>(numTables)
                                            * wavesPerTable * samplesPerWave;
     using SampleStorage = std::array<int8_t, totalSamples>;
     std::shared_ptr<SampleStorage> samples;
+    std::shared_ptr<const std::vector<int8_t>> romWaves;
     bool externalRomLoaded = false;
+    bool originalWaveFactoryTables = false;
     bool waveSetUserTablesLoaded = false;
+    int damagedUserTables = 0;
     int importedTables = 0;
     juce::String source { "PPG V6 lower tables + procedural upper tables" };
 
     [[nodiscard]] static size_t index(int table, int position, int sampleIndex) noexcept;
-    void detachSamples();
+    explicit WavetableBank(std::shared_ptr<SampleStorage> snapshot) noexcept;
+    [[nodiscard]] std::shared_ptr<SampleStorage> copySamples() const;
 };
 
 // Bandlimited conversion from the fixed ASIC clock to the host clock. Feed
@@ -56,7 +67,7 @@ private:
 class AsicResampler
 {
 public:
-    void prepare(double hostSampleRate);
+    void prepare(double hostSampleRate, double internalSampleRate = 250000.0);
     void reset() noexcept;
     void push(float sample) noexcept;
     [[nodiscard]] float read(double fractionalTick) const noexcept;

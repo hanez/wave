@@ -207,6 +207,8 @@ void WaldorfEngine::prepare(double sampleRate, int maximumBlockSize)
     parallelCardRenders = 0;
     lastPlayedNotesByLayer.fill(-1);
     layerGlideTrajectories.fill({});
+    heldNotesByLayer.fill({});
+    allocationModesByLayer.fill(0);
     startVoiceCardWorkers(sampleRate, maximumRenderBlockSize);
 }
 
@@ -227,10 +229,26 @@ void WaldorfEngine::reset()
     modWheelAmount = 0.0f;
     channelPressureAmount = 0.0f;
     midiControllerAmounts.fill(0.0f);
+    buttonAmountsByLayer.fill({});
+    buttonSourcesByLayer.fill(0);
+    appliedKeyboardButtonStates.fill(-1);
     midiControllerAmounts[16] = 64.0f / 127.0f;
     lastPlayedNotesByLayer.fill(-1);
     layerGlideTrajectories.fill({});
+    heldNotesByLayer.fill({});
+    allocationModesByLayer.fill(0);
     sustainPedal = false;
+}
+
+void WaldorfEngine::setKeyboardButtons(bool button1, bool button2) noexcept
+{
+    keyboardButtonStates = { button1 ? 1 : 0, button2 ? 1 : 0 };
+}
+
+void WaldorfEngine::setKeyboardButtonControllers(int button1, int button2) noexcept
+{
+    keyboardButtonControllers = { juce::jlimit(1, 120, button1),
+                                  juce::jlimit(1, 120, button2) };
 }
 
 float WaldorfEngine::tunedNoteForLayer(const PerformanceLayer& layer,
@@ -386,6 +404,27 @@ void WaldorfEngine::render(juce::AudioBuffer<float>& output, const juce::MidiBuf
 {
     output.clear();
     synchroniseActiveVoiceTuning(performance);
+    for (size_t layer = 0; layer < performance.layers.size(); ++layer)
+    {
+        const auto source = performance.layers[layer].source;
+        if (source == 1 || source == 3)
+            for (size_t button = 0; button < keyboardButtonStates.size(); ++button)
+                if (appliedKeyboardButtonStates[button] != keyboardButtonStates[button]
+                    || buttonSourcesByLayer[layer] != source)
+                    buttonAmountsByLayer[layer][button] = static_cast<float>(keyboardButtonStates[button]);
+        buttonSourcesByLayer[layer] = source;
+    }
+    appliedKeyboardButtonStates = keyboardButtonStates;
+    for (size_t layer = 0; layer < performance.layers.size(); ++layer)
+    {
+        const auto mode = performance.layers[layer].allocationMode;
+        if (mode == allocationModesByLayer[layer])
+            continue;
+        allocationModesByLayer[layer] = mode;
+        if (mode >= 17 && performance.layers[layer].enabled)
+            if (const auto* selected = heldNotesByLayer[layer].selected(mode))
+                startLayerNote(*selected, layer, performance, false);
+    }
     auto cursor = 0;
     const auto sampleCount = output.getNumSamples();
 
@@ -424,9 +463,8 @@ void WaldorfEngine::Voice::prepare(double newSampleRate, int index)
     noiseState = 0x9e3779b9u ^ (static_cast<uint32_t>(index) * 0x45d9f3bu);
     oscillator1.prepare(sampleRate);
     oscillator2.prepare(sampleRate);
-    // Only the digital ASIC/DAC/reconstruction boundary runs at the original
-    // 250 kHz domain. The substantially more expensive CEM voice circuit
-    // remains at its own existing 2x-host integration rate.
+    // Keep the oscillator and reconstruction path at the original 250 kHz.
+    // Lowering this rate aliases wavetable harmonics before resampling.
     highpassFilter.prepare(OscillatorChipProxy::modelClockRate());
     reconstruction.prepare(OscillatorChipProxy::modelClockRate(), tolerance);
     asicResampler.prepare(sampleRate);
@@ -519,7 +557,8 @@ void WaldorfEngine::Voice::start(int midiNote, int midiChannel, float noteVeloci
                                  bool shouldQuantiseGlide,
                                  float inheritedGlideStepPerSample,
                                  int inheritedGlideSamplesRemaining, float modWheel,
-                                 float channelPressure, float pitchBend)
+                                 float channelPressure, float pitchBend,
+                                 bool retriggerEnvelopes)
 {
     const auto isStealingActiveVoice = active;
     const auto& parameters = layer.sound;
@@ -592,8 +631,11 @@ void WaldorfEngine::Voice::start(int midiNote, int midiChannel, float noteVeloci
                           + oscillator * 0x632be59bd9b4e019ull;
         return static_cast<double>(hash & 0xffffu) / 65536.0;
     };
-    oscillator1.reset(startPhase(0));
-    oscillator2.reset(startPhase(1));
+    if (!isStealingActiveVoice || retriggerEnvelopes)
+    {
+        oscillator1.reset(startPhase(0));
+        oscillator2.reset(startPhase(1));
+    }
 
     // A reassigned hardware voice does not discharge its analogue filter,
     // reconstruction network, sample-and-hold capacitors or VCA in one CPU
@@ -607,6 +649,11 @@ void WaldorfEngine::Voice::start(int midiNote, int midiChannel, float noteVeloci
         circuit.reset();
         baseCutoffInitialised = false;
     }
+
+    // Single-trigger legato and returning to a held key preserve the digital
+    // envelopes, LFOs, oscillator phase and pending filter-envelope delay.
+    if (isStealingActiveVoice && !retriggerEnvelopes)
+        return;
 
     envelopeParameters.attack = parameters.attackSeconds;
     envelopeParameters.decay = parameters.decaySeconds;
@@ -1252,6 +1299,169 @@ float WaldorfEngine::Voice::noise() noexcept
            / static_cast<float>(std::numeric_limits<int32_t>::max());
 }
 
+void WaldorfEngine::HeldNotes::add(HeldNote note) noexcept
+{
+    if (count == notes.size())
+    {
+        std::move(notes.begin() + 1, notes.end(), notes.begin());
+        --count;
+    }
+    notes[count++] = note;
+}
+
+void WaldorfEngine::HeldNotes::remove(uint64_t trigger) noexcept
+{
+    size_t destination = 0;
+    for (size_t source = 0; source < count; ++source)
+        if (notes[source].trigger != trigger)
+            notes[destination++] = notes[source];
+    count = destination;
+}
+
+const WaldorfEngine::HeldNote* WaldorfEngine::HeldNotes::selected(int mode) const noexcept
+{
+    if (count == 0)
+        return nullptr;
+    const auto priority = (mode - 17) % 3;
+    const auto* result = &notes[count - 1];
+    if (priority == 0)
+        return result;
+    for (size_t index = 0; index < count; ++index)
+        if ((priority == 1 && notes[index].note < result->note)
+            || (priority == 2 && notes[index].note > result->note))
+            result = &notes[index];
+    return result;
+}
+
+void WaldorfEngine::startLayerNote(const HeldNote& held, size_t layerIndex,
+                                   const PerformanceSnapshot& performance,
+                                   bool noteOnEvent)
+{
+    const auto& layer = performance.layers[layerIndex];
+    const auto midiNote = held.note;
+    const auto triggerId = held.trigger;
+    auto* allocated = chooseVoice(static_cast<int>(layerIndex), performance);
+    if (allocated == nullptr)
+        return;
+    const auto monophonic = layer.allocationMode >= 17;
+    const auto hadHeldVoice = allocated->active && allocated->keyDown;
+    if (monophonic)
+    {
+        // Reuse one physical voice, including its release tail. Mode changes
+        // must also retire any previous polyphonic voices of this Instrument.
+        for (auto& candidate : voices)
+            if (&candidate != allocated && candidate.active
+                && candidate.layerIndex == static_cast<int>(layerIndex))
+                candidate.reset();
+        if (hadHeldVoice && allocated->triggerId == triggerId)
+            return; // A non-priority key must not retrigger low/high modes.
+    }
+    const auto retrigger = !monophonic || !hadHeldVoice
+                           || (noteOnEvent && layer.allocationMode < 20);
+    const auto translatedNote = juce::jlimit(
+        0, 127, midiNote + layer.transposeSemitones);
+    const auto tunedTargetNote = tunedNoteForLayer(
+        layer, translatedNote, triggerId, static_cast<int>(layerIndex));
+    const auto previousNote
+        = lastPlayedNotesByLayer[layerIndex];
+    const auto hasHeldLayerVoice = std::any_of(
+        voices.begin(), voices.end(), [layerIndex](const auto& candidate) {
+            return candidate.active && candidate.keyDown
+                   && candidate.layerIndex == static_cast<int>(layerIndex);
+        });
+    const auto glideMode = juce::jlimit(1, 6, layer.sound.glideTypeMode);
+    const auto midiControlled = glideMode == 3 || glideMode == 4;
+    const auto fingered = glideMode == 5 || glideMode == 6;
+    const auto midiPortamentoEnabled
+        = midiControllerAmounts[65] >= 0.5f;
+    const auto shouldGlide
+        = layer.sound.glideEnabled && previousNote >= 0
+          && (!fingered || hasHeldLayerVoice)
+          && (!midiControlled || midiPortamentoEnabled);
+    const auto rate = midiControlled
+                          ? midiControllerAmounts[5] * 127.0f
+                          : layer.sound.glideRateValue;
+
+    auto glideFromNote = tunedTargetNote;
+    if (shouldGlide)
+    {
+        glideFromNote = layerGlideTrajectories[layerIndex].initialised
+                            ? layerGlideTrajectories[layerIndex].targetNote
+                            : tunedNoteForLayer(
+                                  layer, previousNote, triggerId - 1u,
+                                  static_cast<int>(layerIndex));
+    }
+    float inheritedGlideStepPerSample = 0.0f;
+    int inheritedGlideSamplesRemaining = 0;
+    auto& glideTrajectory = layerGlideTrajectories[layerIndex];
+    if (shouldGlide && glideTrajectory.initialised
+        && glideTrajectory.samplesRemaining > 0)
+    {
+        // Portamento belongs to the instrument layer, not to the
+        // particular hardware voice that happened to start it. A new
+        // key therefore begins at the live glide accumulator even if
+        // the preceding voice has already completed its VCA release.
+        glideFromNote = glideTrajectory.currentNote;
+
+        // Repeating the same destination must not restart either the
+        // curve or its timer. When the destination changes, Voice::start
+        // computes a fresh leg from this live position instead.
+        if (std::abs(glideTrajectory.targetNote
+                     - tunedTargetNote) <= 1.0e-5f)
+        {
+            inheritedGlideStepPerSample = glideTrajectory.stepPerSample;
+            inheritedGlideSamplesRemaining = glideTrajectory.samplesRemaining;
+        }
+    }
+
+    auto& voice = *allocated;
+    voice.start(midiNote, held.channel,
+                performanceVelocity(held.velocity, layer.velocityTable),
+                ++noteOrder, triggerId, static_cast<int>(layerIndex), layer,
+                tunedTargetNote, glideFromNote,
+                rate, layer.sound.glideTimeModeValue != 0,
+                glideMode == 2 || glideMode == 4 || glideMode == 6,
+                inheritedGlideStepPerSample, inheritedGlideSamplesRemaining,
+                modWheelAmount, channelPressureAmount, pitchBendSemitones, retrigger);
+
+    const auto destinationChanged
+        = shouldGlide && glideTrajectory.initialised
+          && glideTrajectory.samplesRemaining > 0
+          && std::abs(glideTrajectory.targetNote
+                      - tunedTargetNote) > 1.0e-5f;
+    if (destinationChanged)
+    {
+        // Released voices can remain audible for a substantial VCA
+        // tail. Leaving those voices on the abandoned trajectory makes
+        // the instrument audibly keep rising after a lower key has
+        // redirected the layer glide. The hardware layer clock changes
+        // direction as one unit, so attach every release tail to the
+        // newly calculated leg while leaving held polyphonic notes alone.
+        for (auto& candidate : voices)
+        {
+            if (&candidate == &voice || !candidate.active
+                || candidate.keyDown
+                || candidate.layerIndex != static_cast<int>(layerIndex))
+                continue;
+
+            candidate.currentGlideNote = voice.currentGlideNote;
+            candidate.targetGlideNote = voice.targetGlideNote;
+            candidate.glideStepPerSample = voice.glideStepPerSample;
+            candidate.glideSamplesRemaining = voice.glideSamplesRemaining;
+            candidate.glideQuantised = voice.glideQuantised;
+            candidate.updatePitch(layer.sound, pitchBendSemitones);
+        }
+    }
+    glideTrajectory.currentNote = voice.currentGlideNote;
+    glideTrajectory.targetNote = voice.targetGlideNote;
+    glideTrajectory.stepPerSample = voice.glideStepPerSample;
+    glideTrajectory.samplesRemaining = voice.glideSamplesRemaining;
+    glideTrajectory.triggerId = triggerId;
+    glideTrajectory.initialised = true;
+    lastPlayedNotesByLayer[layerIndex] = translatedNote;
+    voice.updatePitch(layer.sound, pitchBendSemitones);
+}
+
 void WaldorfEngine::handleMidi(const juce::MidiMessage& message,
                                const PerformanceSnapshot& performance,
                                bool localKeyboard)
@@ -1275,108 +1485,14 @@ void WaldorfEngine::handleMidi(const juce::MidiMessage& message,
                     && message.getChannel() != layer.midiChannel))
                 continue;
 
-            const auto translatedNote = juce::jlimit(
-                0, 127, midiNote + layer.transposeSemitones);
-            const auto tunedTargetNote = tunedNoteForLayer(
-                layer, translatedNote, triggerId, static_cast<int>(layerIndex));
-            const auto previousNote
-                = lastPlayedNotesByLayer[layerIndex];
-            const auto hasHeldLayerVoice = std::any_of(
-                voices.begin(), voices.end(), [layerIndex](const auto& candidate) {
-                    return candidate.active && candidate.keyDown
-                           && candidate.layerIndex == static_cast<int>(layerIndex);
-                });
-            const auto glideMode = juce::jlimit(1, 6, layer.sound.glideTypeMode);
-            const auto midiControlled = glideMode == 3 || glideMode == 4;
-            const auto fingered = glideMode == 5 || glideMode == 6;
-            const auto midiPortamentoEnabled
-                = midiControllerAmounts[65] >= 0.5f;
-            const auto shouldGlide
-                = layer.sound.glideEnabled && previousNote >= 0
-                  && (!fingered || hasHeldLayerVoice)
-                  && (!midiControlled || midiPortamentoEnabled);
-            const auto rate = midiControlled
-                                  ? midiControllerAmounts[5] * 127.0f
-                                  : layer.sound.glideRateValue;
-
-            auto glideFromNote = tunedTargetNote;
-            if (shouldGlide)
-            {
-                glideFromNote = layerGlideTrajectories[layerIndex].initialised
-                                    ? layerGlideTrajectories[layerIndex].targetNote
-                                    : tunedNoteForLayer(
-                                          layer, previousNote, triggerId - 1u,
-                                          static_cast<int>(layerIndex));
-            }
-            float inheritedGlideStepPerSample = 0.0f;
-            int inheritedGlideSamplesRemaining = 0;
-            auto& glideTrajectory = layerGlideTrajectories[layerIndex];
-            if (shouldGlide && glideTrajectory.initialised
-                && glideTrajectory.samplesRemaining > 0)
-            {
-                // Portamento belongs to the instrument layer, not to the
-                // particular hardware voice that happened to start it. A new
-                // key therefore begins at the live glide accumulator even if
-                // the preceding voice has already completed its VCA release.
-                glideFromNote = glideTrajectory.currentNote;
-
-                // Repeating the same destination must not restart either the
-                // curve or its timer. When the destination changes, Voice::start
-                // computes a fresh leg from this live position instead.
-                if (std::abs(glideTrajectory.targetNote
-                             - tunedTargetNote) <= 1.0e-5f)
-                {
-                    inheritedGlideStepPerSample = glideTrajectory.stepPerSample;
-                    inheritedGlideSamplesRemaining = glideTrajectory.samplesRemaining;
-                }
-            }
-
-            auto& voice = chooseVoice();
-            voice.start(midiNote, localKeyboard ? 0 : message.getChannel(),
-                        performanceVelocity(message.getFloatVelocity(), layer.velocityTable),
-                        ++noteOrder, triggerId, static_cast<int>(layerIndex), layer,
-                        tunedTargetNote, glideFromNote,
-                        rate, layer.sound.glideTimeModeValue != 0,
-                        glideMode == 2 || glideMode == 4 || glideMode == 6,
-                        inheritedGlideStepPerSample, inheritedGlideSamplesRemaining,
-                        modWheelAmount, channelPressureAmount, pitchBendSemitones);
-
-            const auto destinationChanged
-                = shouldGlide && glideTrajectory.initialised
-                  && glideTrajectory.samplesRemaining > 0
-                  && std::abs(glideTrajectory.targetNote
-                              - tunedTargetNote) > 1.0e-5f;
-            if (destinationChanged)
-            {
-                // Released voices can remain audible for a substantial VCA
-                // tail. Leaving those voices on the abandoned trajectory makes
-                // the instrument audibly keep rising after a lower key has
-                // redirected the layer glide. The hardware layer clock changes
-                // direction as one unit, so attach every release tail to the
-                // newly calculated leg while leaving held polyphonic notes alone.
-                for (auto& candidate : voices)
-                {
-                    if (&candidate == &voice || !candidate.active
-                        || candidate.keyDown
-                        || candidate.layerIndex != static_cast<int>(layerIndex))
-                        continue;
-
-                    candidate.currentGlideNote = voice.currentGlideNote;
-                    candidate.targetGlideNote = voice.targetGlideNote;
-                    candidate.glideStepPerSample = voice.glideStepPerSample;
-                    candidate.glideSamplesRemaining = voice.glideSamplesRemaining;
-                    candidate.glideQuantised = voice.glideQuantised;
-                    candidate.updatePitch(layer.sound, pitchBendSemitones);
-                }
-            }
-            glideTrajectory.currentNote = voice.currentGlideNote;
-            glideTrajectory.targetNote = voice.targetGlideNote;
-            glideTrajectory.stepPerSample = voice.glideStepPerSample;
-            glideTrajectory.samplesRemaining = voice.glideSamplesRemaining;
-            glideTrajectory.triggerId = triggerId;
-            glideTrajectory.initialised = true;
-            lastPlayedNotesByLayer[layerIndex] = translatedNote;
-            voice.updatePitch(layer.sound, pitchBendSemitones);
+            auto& held = heldNotesByLayer[layerIndex];
+            held.add({ midiNote, localKeyboard ? 0 : message.getChannel(),
+                       message.getFloatVelocity(), triggerId });
+            const auto* selected = layer.allocationMode >= 17
+                                       ? held.selected(layer.allocationMode)
+                                       : &held.notes[held.count - 1];
+            if (selected != nullptr)
+                startLayerNote(*selected, layerIndex, performance, true);
         }
         return;
     }
@@ -1385,22 +1501,33 @@ void WaldorfEngine::handleMidi(const juce::MidiMessage& message,
     {
         const auto channel = localKeyboard ? 0 : message.getChannel();
         auto oldestTrigger = std::numeric_limits<uint64_t>::max();
-        for (const auto& voice : voices)
-            if (voice.active && voice.keyDown
-                && voice.triggerNote == message.getNoteNumber()
-                && voice.triggerChannel == channel)
-                oldestTrigger = std::min(oldestTrigger, voice.triggerId);
-
-        // A MIDI stream may retrigger a pitch before the earlier Note Off is
-        // delivered. Release only the oldest matching keystroke and all of
-        // its Performance layers. Releasing every voice with this pitch also
-        // kills the freshly allocated note and can collapse a three-note
-        // chord to one audible note.
+        for (const auto& held : heldNotesByLayer)
+            for (size_t index = 0; index < held.count; ++index)
+                if (held.notes[index].note == message.getNoteNumber()
+                    && held.notes[index].channel == channel)
+                    oldestTrigger = std::min(oldestTrigger, held.notes[index].trigger);
         if (oldestTrigger != std::numeric_limits<uint64_t>::max())
-            for (auto& voice : voices)
-                if (voice.active && voice.keyDown
-                    && voice.triggerId == oldestTrigger)
-                    voice.release(sustainPedal);
+            for (size_t layerIndex = 0; layerIndex < performance.layers.size(); ++layerIndex)
+            {
+                auto& held = heldNotesByLayer[layerIndex];
+                held.remove(oldestTrigger);
+                const auto& layer = performance.layers[layerIndex];
+                if (layer.allocationMode >= 17)
+                {
+                    if (const auto* selected = held.selected(layer.allocationMode))
+                        startLayerNote(*selected, layerIndex, performance, false);
+                    else
+                        for (auto& voice : voices)
+                            if (voice.active && voice.keyDown
+                                && voice.layerIndex == static_cast<int>(layerIndex))
+                                voice.release(sustainPedal);
+                }
+                else
+                    for (auto& voice : voices)
+                        if (voice.active && voice.keyDown && voice.triggerId == oldestTrigger
+                            && voice.layerIndex == static_cast<int>(layerIndex))
+                            voice.release(sustainPedal);
+            }
         return;
     }
 
@@ -1422,12 +1549,14 @@ void WaldorfEngine::handleMidi(const juce::MidiMessage& message,
             voice.reset();
         lastPlayedNotesByLayer.fill(-1);
         layerGlideTrajectories.fill({});
+        heldNotesByLayer.fill({});
         sustainPedal = false;
         return;
     }
 
     if (message.isAllNotesOff())
     {
+        heldNotesByLayer.fill({});
         for (auto& voice : voices)
             voice.release(sustainPedal);
         return;
@@ -1437,6 +1566,20 @@ void WaldorfEngine::handleMidi(const juce::MidiMessage& message,
     {
         const auto controller = message.getControllerNumber();
         const auto value = message.getControllerValue();
+        for (size_t layer = 0; layer < performance.layers.size(); ++layer)
+        {
+            const auto& instrument = performance.layers[layer];
+            // Physical keyboard controls already have dedicated identities;
+            // only received MIDI translates CC assignments into button sources.
+            if (localKeyboard || !instrument.enabled
+                || (instrument.source != 2 && instrument.source != 3)
+                || (instrument.midiChannel != 0
+                    && instrument.midiChannel != message.getChannel()))
+                continue;
+            for (size_t button = 0; button < keyboardButtonControllers.size(); ++button)
+                if (controller == keyboardButtonControllers[button])
+                    buttonAmountsByLayer[layer][button] = static_cast<float>(value) / 127.0f;
+        }
         midiControllerAmounts[static_cast<size_t>(juce::jlimit(0, 127, controller))]
             = static_cast<float>(value) / 127.0f;
         if (controller == 1)
@@ -1481,6 +1624,7 @@ void WaldorfEngine::renderRangeChunk(juce::AudioBuffer<float>& output,
     if (rangeSamples <= 0)
         return;
 
+    renderingWavetableBank = wavetableBank.renderSnapshot();
     renderingVoiceCount = 0;
     const auto hasSoloedInstrument = std::any_of(
         performance.layers.begin(), performance.layers.end(), [](const auto& layer) {
@@ -1497,13 +1641,13 @@ void WaldorfEngine::renderRangeChunk(juce::AudioBuffer<float>& output,
             continue;
         }
         const auto& layer = performance.layers[static_cast<size_t>(voice.layerIndex)];
-        const auto audible = !layer.muted && layer.audioOutput == 0
+        const auto audible = layer.enabled && !layer.muted && layer.audioOutput == 0
                              && (!hasSoloedInstrument || layer.soloed);
         voice.currentFreeWheel
             = juce::jlimit(-1.0f, 1.0f,
                            midiControllerAmounts[16] * 2.0f - 1.0f);
-        voice.currentButton1 = midiControllerAmounts[80];
-        voice.currentButton2 = midiControllerAmounts[81];
+        voice.currentButton1 = buttonAmountsByLayer[static_cast<size_t>(voice.layerIndex)][0];
+        voice.currentButton2 = buttonAmountsByLayer[static_cast<size_t>(voice.layerIndex)][1];
         voice.currentVolumeController = midiControllerAmounts[7];
         voice.currentPanController
             = juce::jlimit(-1.0f, 1.0f,
@@ -1665,7 +1809,7 @@ void WaldorfEngine::renderVoiceCard(int board, int sampleCount) noexcept
             Cem3387::StereoSample voiceSample;
             if (voice.active)
                 voiceSample = voice.process(
-                    wavetableBank, *rendering.parameters, rendering.modWheel,
+                    renderingWavetableBank, *rendering.parameters, rendering.modWheel,
                     rendering.pressure, rendering.pitchBend);
             else
                 voice.advanceIdleLfos(*rendering.parameters);
@@ -1833,9 +1977,10 @@ WaldorfEngine::VoiceProbe WaldorfEngine::probeVoice(
     const auto performanceGain = layer.audioOutput == 0 ? layer.gain : 0.0f;
     result.minimumCutoffHz = std::numeric_limits<float>::max();
     double energy = 0.0;
+    const auto bank = wavetableBank.renderSnapshot();
     for (int sample = 0; sample < samples; ++sample)
     {
-        const auto output = voice.process(wavetableBank, layer.sound,
+        const auto output = voice.process(bank, layer.sound,
                                           0.0f, 0.0f, 0.0f);
         result.minimumCutoffHz = juce::jmin(result.minimumCutoffHz,
                                             voice.controlAnalogueCutoff);
@@ -1859,6 +2004,11 @@ bool WaldorfEngine::loadWavetableRom(const juce::MemoryBlock& data) noexcept
     return wavetableBank.loadRomImage(data.getData(), data.getSize());
 }
 
+bool WaldorfEngine::loadWaveFactoryRom(const juce::MemoryBlock& data)
+{
+    return wavetableBank.loadWaveFactoryRom(data.getData(), data.getSize());
+}
+
 bool WaldorfEngine::loadWaveSetUserTables(const juce::MemoryBlock& data) noexcept
 {
     // A native Wave SET places its four 256-byte STT-format tables directly
@@ -1875,13 +2025,21 @@ bool WaldorfEngine::loadWaveSetUserTables(const juce::MemoryBlock& data) noexcep
         for (size_t table = 0; table < tableCount; ++table)
         {
             const auto* source = bytes + tuningBankOffset + table * tableSize;
+            auto valid = true;
+            for (size_t key = 0; key < 128u; ++key)
+                valid = valid && source[key * 2u] <= 127u
+                        && source[key * 2u + 1u] >= 14u
+                        && source[key * 2u + 1u] <= 114u;
+            // A displaced Sound/Performance record can still look like
+            // seven-bit tuning data. Do not mask/clamp it into a scale that
+            // silently changes every Global Instrument's keyboard pitch.
+            // The value-initialised table supplies equal temperament instead.
+            if (!valid)
+                continue;
             for (size_t key = 0; key < 128u; ++key)
             {
-                const auto destinationNote = static_cast<int>(source[key * 2u] & 0x7fu);
-                const auto detuneCents
-                    = juce::jlimit(14, 114,
-                                   static_cast<int>(source[key * 2u + 1u] & 0x7fu))
-                      - 64;
+                const auto destinationNote = static_cast<int>(source[key * 2u]);
+                const auto detuneCents = static_cast<int>(source[key * 2u + 1u]) - 64;
                 (*decoded)[table][key]
                     = static_cast<float>((destinationNote - static_cast<int>(key)) * 100
                                          + detuneCents);
@@ -1912,26 +2070,51 @@ void WaldorfEngine::applyFirmwareHardwareWrite(int board, uint32_t address,
     ++appliedFirmwareWrites;
 }
 
-WaldorfEngine::Voice& WaldorfEngine::chooseVoice()
+WaldorfEngine::Voice* WaldorfEngine::chooseVoice(
+    int layerIndex, const PerformanceSnapshot& performance)
 {
-    if (const auto inactive = std::find_if(voices.begin(), voices.end(),
-                                           [](const auto& voice) { return !voice.active; });
-        inactive != voices.end())
-        return *inactive;
-
-    // Dynamic allocation protects notes whose keys are still held. Released
-    // and sustain-held tails are the hardware-like first candidates for reuse.
-    if (const auto released = std::min_element(
-            voices.begin(), voices.end(), [](const auto& a, const auto& b) {
-                if (a.keyDown != b.keyDown)
-                    return !a.keyDown;
-                return a.startOrder < b.startOrder;
-            });
-        released != voices.end() && !released->keyDown)
-        return *released;
-
-    return *std::min_element(voices.begin(), voices.end(), [](const auto& a, const auto& b) {
+    const auto mode = performance.layers[static_cast<size_t>(layerIndex)].allocationMode;
+    Voice* own = nullptr;
+    int ownCount = 0;
+    const auto older = [](const Voice& a, const Voice& b) {
+        if (a.keyDown != b.keyDown)
+            return !a.keyDown;
         return a.startOrder < b.startOrder;
-    });
+    };
+    for (auto& voice : voices)
+        if (voice.active && voice.layerIndex == layerIndex)
+        {
+            ++ownCount;
+            if (own == nullptr || (mode >= 17 ? voice.startOrder > own->startOrder
+                                              : older(voice, *own)))
+                own = &voice;
+        }
+    if (mode >= 17 && own != nullptr)
+        return own;
+    for (auto& voice : voices)
+        if (!voice.active)
+            return &voice;
+
+    // Dynamic Instruments can only reuse their own sounding voices. Poly N
+    // permits reclaiming up to N voices from other Instruments when full;
+    // it does not limit ordinary polyphony while free voices are available.
+    if (mode == 0 || (mode < 17 && ownCount >= mode))
+        return own;
+    Voice* other = nullptr;
+    for (auto& voice : voices)
+    {
+        if (voice.layerIndex == layerIndex)
+            continue;
+        const auto otherMode = performance.layers[static_cast<size_t>(voice.layerIndex)]
+                                   .allocationMode;
+        if (otherMode >= 17)
+            continue; // Mono voices are protected, even from another mono part.
+        const auto previousMode = other == nullptr ? 0
+            : performance.layers[static_cast<size_t>(other->layerIndex)].allocationMode;
+        if (other == nullptr || (otherMode == 0 && previousMode != 0)
+            || ((otherMode == 0) == (previousMode == 0) && older(voice, *other)))
+            other = &voice;
+    }
+    return other != nullptr ? other : own;
 }
 } // namespace wave::dsp

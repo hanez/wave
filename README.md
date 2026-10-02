@@ -8,17 +8,14 @@ A JUCE C++ research instrument that recreates the documented Waldorf Wave signal
 
 | Platform | Download | Included formats |
 | --- | --- | --- |
-| Windows x64 — 0.1.10 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.10/Wave-Emulation-0.1.10-Windows-x64.zip) | Standalone EXE and VST3 |
-| macOS 13.0 or later, Apple Silicon and Intel — 0.1.11 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.11/DJW.Wave.Emulation.0.1.11.dmg) | Standalone app, AU, VST3 and AAX |
+| Windows x64 — 0.1.12 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.12/Wave-Emulation-0.1.12-Windows-x64.zip) | Standalone EXE and VST3 |
+| macOS 13.0 or later, Apple Silicon and Intel — 0.1.12 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.12/DJW.Wave.Emulation.0.1.12.dmg) | Standalone app, AU, VST3 and AAX |
 
-See the [Windows 0.1.10 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.10)
-and [macOS 0.1.11 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.11)
-for release notes. The Windows build's
-[corresponding source](https://github.com/mo0kid/wave/releases/download/v0.1.10/Wave-Emulation-0.1.10-Source.zip)
-includes its modified dependencies; use that archive to reproduce the released
-Windows binaries. The accompanying
-[SHA-256 checksums](https://github.com/mo0kid/wave/releases/download/v0.1.10/SHA256SUMS.txt)
-cover the Windows ZIP, its source archive and Windows release notes.
+See the [0.1.12 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.12)
+for release notes. The [corresponding source](https://github.com/mo0kid/wave/releases/download/v0.1.12/Wave-Emulation-0.1.12-Source.zip)
+includes the modified dependencies used for both platforms. The accompanying
+[SHA-256 checksums](https://github.com/mo0kid/wave/releases/download/v0.1.12/SHA256SUMS.txt)
+cover the installers, Windows ZIP, source archive and release documentation.
 
 Supply your own Wave OS 1.700 firmware and sound disks. Neither platform's
 release includes firmware, ROM archives or Wave factory sound SETs.
@@ -27,8 +24,9 @@ Enjoying Wave Emulation? [Leave a tip on Ko-fi](https://ko-fi.com/djw_audio) to 
 
 <a href="https://ko-fi.com/djw_audio"><img src="https://storage.ko-fi.com/cdn/kofi5.png?v=3" height="36" alt="Support development with a tip on Ko-fi"></a>
 
-The public build includes the decoded PPG V6 wavetable sample bank, with
-procedural fallback for the remaining tables. It contains no executable firmware,
+Loading authenticated Wave OS 1.700 firmware generates all 64 original factory
+wavetables using the firmware’s own routines. Before firmware is loaded, the public
+build uses the decoded PPG V6 sample bank and procedural fallback tables. It contains no executable firmware,
 ROM archives, Wave factory sound sets, or upper Wave factory wavetable payload.
 See [data provenance and format](data/README.md). You can load your own
 Wave OS 1.700 firmware (`w2sys.bin` and `wdv.sys`) and wavetable images locally.
@@ -77,6 +75,14 @@ Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
 
+## What's new in 0.1.12
+
+Version 0.1.12 fixes original factory/user wavetable loading, saved
+wavetable selections, LCD browsing and Store state, Instrument voice allocation,
+and Button 1/2 touch/toggle and MIDI routing. It adds WTB-to-disk-image conversion
+and automatic flushing of emulated disk writes. The full internal oscillator
+sampling rate is retained. See [the release notes](docs/release-0.1.12.md).
+
 ## What's new in 0.1.11
 
 [Version 0.1.11](https://github.com/mo0kid/wave/releases/tag/v0.1.11) restores complete Performance and Sound banks when reopening, including native Store names containing NUL bytes. It fixes Total Recall after cancelling optional machine-specific adjustments, mode lamps after Store, repeated + browsing after Store, and pending writes when remounting the same disk image.
@@ -91,9 +97,9 @@ standalone EXE and VST3 DLL, addressing the **Ordinal 345 not found** startup
 error reported on Windows 10 in [issue #2](https://github.com/mo0kid/wave/issues/2).
 The build workflow now checks both manifests before running tests.
 
-Windows 10 runtime confirmation is pending. The native MSVC CI build also
-reports CPU-test crashes that remain under investigation. The macOS download
-remains version 0.1.8.
+At publication of 0.1.10, Windows 10 runtime confirmation and native MSVC CPU-test
+issues remained under investigation. See the current release validation report
+for the checks completed for 0.1.12.
 
 ## Version history
 
@@ -142,15 +148,6 @@ withdrawn; users of that version should update to 0.1.5.
 
 ## CPU load in Logic Pro
 
-Enable **System → Eco Mode (applies to new notes)** to reduce voice CPU usage.
-Eco runs the oscillator, digital high-pass, and reconstruction stages at
-62.5 kHz instead of 250 kHz. The resonant CEM filter retains its existing
-integration rate, and firmware timing is unchanged. Eco is a sound-quality
-tradeoff: bright sounds, high notes, and noise can differ from the full-rate
-model. Full quality is the default, and the choice is saved with the project.
-Held notes and their release tails keep the quality they started with; changing
-the setting affects newly triggered notes.
-
 Wave can split voice processing across three threads at higher polyphony.
 Light loads and very short audio segments run serially to avoid worker overhead;
 the firmware timeline also remains sequential. A single busy bar in Logic's
@@ -189,12 +186,43 @@ included PPG wavetables are sound data, not the Wave operating system.
    Setup...** to create and mount a 720 KB DD image, then confirm the SET import
    with the Wave panel's **OK** button. Creating a blank disk instead provides
    no system firmware or factory sounds.
+5. For a native Wave `.wtb` file, choose **Create Disk Image from WTB...**,
+   select the file and save the new `.img`. The image is mounted automatically;
+   load the WTB using the Wave panel's Disk controls. WTB bytes, including any
+   attached Wave data, are preserved unchanged.
 
-Until a sound SET is imported, the public build starts with one INIT
+Additional sound banks and wavetables are available from the **Sounds**
+download on [Waldorf's legacy Wave page](https://waldorfmusic.com/legacy-wave/).
+The archive includes contributions credited to Dirk Gehl and Peter Eulert,
+Till Kopper, and other sound designers. Download and extract it from Waldorf,
+then use the SET or WTB conversion instructions above to create disk images.
+These third-party banks are not bundled with this project; their contents
+remain subject to the original authors' terms and are not covered by this
+repository's licence.
+
+Fresh instances start with a mounted **Blank Wave.img** and one INIT
 performance. Performance -/+ cannot select another patch from that empty bank.
-Each plug-in instance has its own sound-bank state; loading a disk in the
-standalone does not load it
-into a DAW instance. Saving the DAW project preserves that instance's bank.
+Each plug-in instance has its own sound-bank state. Saving a DAW project embeds
+that instance's mounted disk image and bank, so reopening restores them even if
+the original image has moved. The standalone restores its last saved session.
+For an older session containing stale bank entries, **System > Reload Performance
+Bank from Mounted Image** replaces the bank with the mounted image's SET;
+save the project afterwards to retain the corrected bank.
+
+A SET with a few malformed records can still load its valid bank. Those damaged
+slots are treated as empty in the working sound/performance banks, with the
+source image preserved. Selecting an empty Performance clears its Instruments
+and completes the native LCD recall instead of retaining the preceding patch.
+
+Wave Disk-page writes (including Save, Delete and Format) automatically overwrite
+the currently mounted image. Sector writes are batched and saved in the
+background, with a complete temporary file replacing the image only after a
+successful write. Read-only images remain write-protected. If saving fails, the
+System menu's disk status reports it; pending changes stay in memory and are
+retried. **Save Mounted Disk Image** also commits pending changes immediately.
+Recalled DAW disks remain private copies of the project's embedded snapshot;
+use **Save Mounted Disk Image As...** to save that copy to an external image,
+which then becomes the mounted file for subsequent writes.
 
 The app can open without firmware and provide its behavioural synthesis
 fallback, but that does not run the original Wave operating system. Mounting a
@@ -216,14 +244,14 @@ This sample is honest about a hard distinction:
 - The current bridge supplies `INIT.SND` and `INIT.PFM` through a narrowly scoped virtual system-disk service, and the genuine OS 1.700 loader opens, reads, and closes both files. Until original factory files are available, their contents are byte-exact copies of the genuine safe sound and performance records embedded in OS 1.700; they are conservative defaults, not claimed factory banks. The same records are preloaded as a defensive fallback. The CPU board's DP8473 floppy controller is modelled for mounted raw MS-DOS disk images; the separate boot-time `WDV.SYS` copy remains bypassed because the authenticated WDV body is installed directly into shared SRAM before the genuine master instructions resume at the verified post-copy handoff. This is not presented as a complete main-OS boot.
 - The CPU-board LCD is represented as two byte-wide 5563 SRAMs forming a 16-bit word, four 4 KiB pages, two parallel 74LS166 shifters, and the firmware page latch at `$BE0001`. The genuine OS renderer proves a 64-byte hardware scanline: 60 visible bytes for 480 pixels followed by four blanking bytes. Writes in the `$FEA00000-$FEA03FFF` video window automatically replace the model diagnostics with correctly decoded firmware scanout.
 - The oscillator ASIC is an undocumented black box. Its internal algorithms cannot be recovered or claimed from the available documentation. The DSP is explicitly an external behavioural proxy, using Waldorf's documented 250 kHz rate and ES2 eight-bit numerical mix-overflow boundary; its exact accumulator ordering and truncation remain to be validated against real-hardware measurements. Firmware register traces reveal only the external contract.
-- The included procedural wavetable bank is a neutral fallback. The loader accepts a user-supplied exact 64 or 128 x 64 x 128 signed-eight-bit dump, a 32 x 64 x 128 first-table dump, or a raw PPG Wave 2.2/2.3 EPROM image. Raw PPG images are decoded from their 768-byte sparse table directory and 256 stored 64-sample half waves. The V6 firmware's recursive midpoint averaging, complemented half-cycle, calculated tables 28/29, and byte-exact triangle/pulse/square/saw tail are reproduced, yielding all 30 original lower tables. Native Wave SET images also install all 64 user Wavetables and their 1000-Wave pool. The lower 30 PPG tables are included as decoded samples. Remaining tables retain procedural fallback data until a user imports a bank.
+- Loading the authenticated Wave OS 1.700 firmware installs all 64 original factory wavetables by executing its own 68000 table routines, including slot 60 and the original triangle/square/saw standards. Saved PPG paths cannot replace this bank during startup or project recall. Native Wave SET images supply their own 64 user tables and 1000-Wave pool. Without Wave firmware, the included lower 30 PPG tables and procedural upper tables remain a fallback. Explicit imports of signed-eight-bit 64/128-table banks, first-32-table banks and PPG EPROM images remain available for research. See [wavetable verification](docs/wavetable-authenticity.md) for provenance, hashes and limits.
 - The filter path implements all four sound-record modes: analogue 24 dB low-pass, digital 12 dB high-pass, linked serial band-pass with width, and Dual mode with independently modulated HP/LP cutoffs. The WDV frequency table establishes semitone-spaced cutoff values beginning at 20 Hz. The fixed CEM3387 three-pole 1 dB Chebyshev reconstruction section and nonlinear resonant four-pole low-pass are separate from the pre-analogue ASIC high-pass. Envelope selection, velocity, key tracking, both modulation routes, resonance modulation, and maximum-resonance self-oscillation are active. Unknown ASIC arithmetic and unmeasured component tolerances remain explicit calibration hypotheses.
 - The mixed-signal path explicitly models eight-bit multiplexed conversion, signed ES2 mixer wrap, sample-and-hold behaviour, three-pole reconstruction and AC coupling, the distinct VCF input saturation around 70% mixer output, AD7545-style 12-bit CV quantisation, nonlinear four-pole CEM3387 filtering, VCA bleed/noise, panning, output coupling, slew, and rails. Values without measurements remain documented calibration hypotheses.
 - MIDI bytes are delivered to the master UART at their host-sample offsets while the behavioural audio engine receives the same event timeline. This preserves a useful audible instrument during protocol research without falsely claiming that every high-level WDV voice-record field has already been named.
 - `ReferenceComparator` and `reference-captures/README.md` provide the real-hardware validation path: alignment, fitted gain, normalized correlation, RMS error, and peak error. Set `WAVE_REFERENCE_CAPTURE` when running tests to compare a capture.
 - The live LCD scanout is 480 x 64 at one bit per pixel. Before genuine firmware produces video writes, the same framebuffer shows the sound and firmware diagnostic pages.
 
-That makes this a useful, buildable hardware-model foundation rather than a false claim of bit-perfect emulation. A real-Wave capture set, factory wavetable data supplied by its owner, and oscillator-chip bus/audio measurements are still required before the words “sample accurate” or “circuit accurate” would be defensible.
+That makes this a useful, buildable hardware-model foundation rather than a false claim of bit-perfect emulation. A real-Wave capture set and oscillator-chip bus/audio measurements are still required before the words “sample accurate” or “circuit accurate” would be defensible.
 
 ## Build
 
@@ -237,22 +265,26 @@ ctest --test-dir build --output-on-failure
 
 For private development only, place your own images in
 `Firmware/wave_sys1_700`, an optional factory set at `wave.set`, and an optional
-private upper-table header at `Firmware/private/FactoryUpperWavetables.h`.
+legacy upper-table fallback at `Firmware/private/FactoryUpperWavetables.h`.
+The authenticated firmware supplies the complete original bank at startup.
 Configure a separate build with `-DWAVE_EMBED_PRIVATE_ASSETS=ON` to embed them.
 Do not distribute artifacts from that build. The installer explicitly disables
 private embedding. Firmware-backed integration/editor tests are enabled only
 when all three private ROM inputs are present and embedding is enabled.
 
 The private build also provides `WavePerformanceBenchmark`. Its arguments are
-block size, voice count, DSP resonance (0–1), and Eco mode (0 or 1):
+block size, voice count, DSP resonance (0–1), sample rate, rendered seconds,
+and full-processor program index (defaults: 512, 48, 0.18, 48000, 2, 12):
 
 ```sh
-build/Tests/WavePerformanceBenchmark 512 48 0.18 0
-build/Tests/WavePerformanceBenchmark 512 48 0.18 1
+build/Tests/WavePerformanceBenchmark 512 48 0.18 48000 2 12
 ```
 
 Compare repeated Release runs on the same machine. The benchmark reports
-whether firmware is loaded and how many voices actually rendered. The resonance
+elapsed rendering time separately from process CPU time summed across all
+threads, whether firmware is loaded, and how many voices actually rendered.
+CPU time per second of rendered audio measures processor work; elapsed time
+also includes scheduling and worker waits. The resonance
 argument controls the standalone DSP fixture; the full-processor fixture uses
 its selected Performance.
 
@@ -400,9 +432,19 @@ Review the uploaded editor PNGs for rendering problems as well.
 
 ## MIDI and wavetable loading
 
+Instrument Page 2's **Alloc** setting controls audible allocation independently
+for each Instrument. Dynamic mode reuses only that Instrument's sounding voices
+when the shared pool is full. Poly 1–16 sets its allowance for reclaiming voices
+from other Instruments; it does not cap normal polyphony. The six mono modes
+provide last/lowest/highest-key priority with retrigger or single-trigger
+envelopes, held-key return, sustain and fingered glide. The setting is retained
+in the native Performance record and DAW state.
+
 The Standalone automatically enables present and newly connected MIDI inputs. The on-screen keyboard plays MIDI notes 36–96, and the computer keyboard mapping `A W S E D F T G Y H U J K` plays C4 through C5. Host MIDI supports note velocity, sustain pedal, pitch bend, mod wheel, channel pressure, all-notes-off, and all-sound-off.
 
-If a legal PPG EPROM or expanded wavetable image is placed beside the selected firmware files with a `.bin` or `.rom` extension, it is detected automatically. Names containing `ppg` or `wavetable` are tried first. The image path is retained in plug-in state without modifying the supplied SVG interface.
+The lower-panel **Button 1** and **Button 2** feed their dedicated Sound modulation sources. Their touch/toggle modes and incoming MIDI controller assignments come from the current Performance's Controls page. Physical button presses remain independent when the two MIDI assignments coincide; received MIDI then addresses both assigned sources. Instruments follow their keyboard/MIDI source and MIDI channel settings.
+
+If the firmware does not supply the authenticated OS 1.700 factory bank, a legal PPG EPROM or expanded wavetable image placed beside the selected firmware files with a `.bin` or `.rom` extension is detected automatically. Names containing `ppg` or `wavetable` are tried first. The image path is retained in plug-in state without modifying the supplied SVG interface.
 
 For the original seven-file PPG Wave 2.3 V6 EPROM archive, run `scripts/import-ppg-wave-23-v6-rom.sh`. It combines the physical `w23_64`/`w23_66` wavetable pair and the adjacent V6 program-ROM bytes exposed by the original out-of-range wavetable-13 references, then places the resulting private image beside the Waldorf firmware for automatic loading.
 

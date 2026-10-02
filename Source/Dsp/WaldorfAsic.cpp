@@ -3,6 +3,7 @@
 #include "FactoryUpperWavetables.h"
 #endif
 #include "PpgWaveRom.h"
+#include "WaveFactoryRom.h"
 #include <PpgData.h>
 
 #include <algorithm>
@@ -11,6 +12,12 @@
 #include <map>
 #include <mutex>
 #include <vector>
+
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#elif defined(__SSE2__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 namespace wave::dsp
 {
@@ -192,25 +199,58 @@ WavetableBank::WavetableBank()
         return generated;
     }();
     samples = sharedFallback;
+#if WAVE_HAS_PRIVATE_UPPER_TABLES
+    source = "PPG V6 lower tables + legacy Wave upper fallback";
+#endif
 }
 
-void WavetableBank::detachSamples()
+WavetableBank::WavetableBank(std::shared_ptr<SampleStorage> snapshot) noexcept
+    : samples(std::move(snapshot)), source()
 {
-    if (samples.use_count() > 1)
-        samples = std::make_shared<SampleStorage>(*samples);
+}
+
+WavetableBank WavetableBank::renderSnapshot() const noexcept
+{
+    return WavetableBank(std::atomic_load_explicit(&samples, std::memory_order_acquire));
+}
+
+std::shared_ptr<WavetableBank::SampleStorage> WavetableBank::copySamples() const
+{
+    return std::make_shared<SampleStorage>(
+        *std::atomic_load_explicit(&samples, std::memory_order_acquire));
+}
+
+bool WavetableBank::loadWaveFactoryRom(const void* data, size_t size)
+{
+    std::vector<int8_t> decoded;
+    std::vector<int8_t> decodedRomWaves;
+    if (!WaveFactoryRom::decode(data, size, decoded)
+        || !WaveFactoryRom::decodeRomWaves(data, size, decodedRomWaves))
+        return false;
+    romWaves = std::make_shared<const std::vector<int8_t>>(std::move(decodedRomWaves));
+    auto imported = copySamples();
+    std::copy(decoded.begin(), decoded.end(), imported->begin());
+    std::atomic_store_explicit(&samples, std::move(imported), std::memory_order_release);
+    originalWaveFactoryTables = true;
+    externalRomLoaded = true;
+    importedTables = factoryTableCount;
+    source = "Original Waldorf Wave OS 1.700 factory tables 1–64";
+    return true;
 }
 
 bool WavetableBank::loadSigned8BitRom(const void* data, size_t size) noexcept
 {
     constexpr auto factorySamples = static_cast<size_t>(factoryTableCount)
                                     * wavesPerTable * samplesPerWave;
-    if (data == nullptr || (size != samples->size() && size != factorySamples))
+    if (data == nullptr || (size != totalSamples && size != factorySamples))
         return false;
-    detachSamples();
-    std::memcpy(samples->data(), data, size);
+    auto imported = copySamples();
+    std::memcpy(imported->data(), data, size);
+    std::atomic_store_explicit(&samples, std::move(imported), std::memory_order_release);
+    originalWaveFactoryTables = false;
     externalRomLoaded = true;
-    importedTables = size == samples->size() ? numTables : factoryTableCount;
-    source = size == samples->size()
+    importedTables = size == totalSamples ? numTables : factoryTableCount;
+    source = size == totalSamples
                  ? "User-supplied 128-table signed 8-bit image"
                  : "User-supplied 64-table signed 8-bit image";
     return true;
@@ -221,8 +261,10 @@ bool WavetableBank::loadFirst32Signed8BitRom(const void* data, size_t size) noex
     constexpr auto first32Samples = static_cast<size_t>(32) * wavesPerTable * samplesPerWave;
     if (data == nullptr || size != first32Samples)
         return false;
-    detachSamples();
-    std::memcpy(samples->data(), data, first32Samples);
+    auto imported = copySamples();
+    std::memcpy(imported->data(), data, first32Samples);
+    std::atomic_store_explicit(&samples, std::move(imported), std::memory_order_release);
+    originalWaveFactoryTables = false;
     externalRomLoaded = true;
     importedTables = 32;
     source = "User-supplied first-32-table signed 8-bit image";
@@ -240,8 +282,10 @@ bool WavetableBank::loadPpgWaveRom(const void* data, size_t size) noexcept
         if (!result.success)
             return false;
 
-        detachSamples();
-        std::copy(decoded.begin(), decoded.end(), samples->begin());
+        auto imported = copySamples();
+        std::copy(decoded.begin(), decoded.end(), imported->begin());
+        std::atomic_store_explicit(&samples, std::move(imported), std::memory_order_release);
+        originalWaveFactoryTables = false;
         externalRomLoaded = true;
         importedTables = result.decodedTables;
         source = "User-supplied PPG Wave 2.3 V6 EPROM (30 lower tables reconstructed)";
@@ -258,7 +302,7 @@ bool WavetableBank::loadRomImage(const void* data, size_t size) noexcept
     constexpr auto factorySamples = static_cast<size_t>(factoryTableCount)
                                     * wavesPerTable * samplesPerWave;
     constexpr auto first32Samples = static_cast<size_t>(32) * wavesPerTable * samplesPerWave;
-    if (size == samples->size() || size == factorySamples)
+    if (size == totalSamples || size == factorySamples)
         return loadSigned8BitRom(data, size);
     if (size == first32Samples)
         return loadFirst32Signed8BitRom(data, size);
@@ -271,78 +315,108 @@ bool WavetableBank::loadWaveSetUserTables(const void* data, size_t size) noexcep
         return false;
 
     const auto* bytes = static_cast<const uint8_t*>(data);
+    std::array<bool, userTableCount> validTables{};
+    auto damagedCount = 0;
     for (int table = 0; table < userTableCount; ++table)
     {
         const auto record = waveSetUserTableOffset
                             + static_cast<size_t>(table) * waveSetUserTableRecordBytes;
-        if (bytes[record + 9] != 0x55u)
-            return false;
+        auto valid = bytes[record + 9] == 0x55u;
+        for (int wave = 0; wave < wavesPerTable && valid; ++wave)
+        {
+            const auto offset = record + 10 + static_cast<size_t>(wave) * 2;
+            const auto reference = static_cast<uint16_t>(
+                (static_cast<uint16_t>(bytes[offset]) << 8u) | bytes[offset + 1]);
+            valid = reference == 0xffffu || reference < 300u + waveSetUserWaveCount
+                    || (reference >= 0x1000u
+                        && reference < 0x1000u + waveSetUserWaveCount);
+        }
+        validTables[static_cast<size_t>(table)] = valid;
+        if (!valid)
+            ++damagedCount;
     }
 
-    detachSamples();
+    // Reject unrelated data without changing the bank. A damaged individual
+    // record is replaced by INIT, rather than abandoning a half-imported SET.
+    if (damagedCount == userTableCount)
+        return false;
+    auto imported = copySamples();
     for (int userTable = 0; userTable < userTableCount; ++userTable)
     {
         const auto destinationTable = factoryTableCount + userTable;
         const auto record = waveSetUserTableOffset
                             + static_cast<size_t>(userTable) * waveSetUserTableRecordBytes;
         std::array<bool, wavesPerTable> populated{};
+        const auto valid = validTables[static_cast<size_t>(userTable)];
 
         for (int wave = 0; wave < wavesPerTable; ++wave)
         {
             const auto referenceOffset = record + 10 + static_cast<size_t>(wave) * 2;
-            const auto reference = static_cast<uint16_t>(
-                (static_cast<uint16_t>(bytes[referenceOffset]) << 8u)
-                | bytes[referenceOffset + 1]);
+            // Native INIT WTBL has ROM Wave 0 at position 0 and Wave 1
+            // at position 60. All other positions are interpolated/defaults.
+            const auto reference = valid
+                ? static_cast<uint16_t>((static_cast<uint16_t>(bytes[referenceOffset]) << 8u)
+                                        | bytes[referenceOffset + 1])
+                : static_cast<uint16_t>(wave == 0 ? 0 : wave == 60 ? 1 : 0xffffu);
             if (reference == 0xffffu)
                 continue;
 
-            if (reference < 0x1000u)
+            if (reference < 300u)
             {
-                // Factory Wave references are a flat 0..4095 Wave number,
-                // not an encoded table/position byte pair.
+                // R000..R299 index the original ROM's individual Wave pool,
+                // rather than interpolated positions in the factory tables.
                 const auto sourceTable = static_cast<int>(reference) / wavesPerTable;
                 const auto sourceWave = static_cast<int>(reference) % wavesPerTable;
-                if (sourceTable >= factoryTableCount)
-                    return false;
                 for (int sampleIndex = 0; sampleIndex < samplesPerWave; ++sampleIndex)
-                    (*samples)[index(destinationTable, wave, sampleIndex)]
-                        = (*samples)[index(sourceTable, sourceWave, sampleIndex)];
+                    (*imported)[index(destinationTable, wave, sampleIndex)]
+                        = romWaves != nullptr
+                            ? (*romWaves)[static_cast<size_t>(reference) * samplesPerWave
+                                          + static_cast<size_t>(sampleIndex)]
+                            : (*imported)[index(sourceTable, sourceWave, sampleIndex)];
             }
-            else if (reference < 0x2000u)
+            else
             {
-                const auto userWave = static_cast<size_t>(reference & 0x0fffu);
-                if (userWave >= waveSetUserWaveCount)
-                    return false;
+                // Native U000..U999 are numbered 300..1299. Retain support
+                // for 0x1000-based references in historical SET snapshots.
+                const auto userWave = reference >= 0x1000u
+                    ? static_cast<size_t>(reference & 0x0fffu)
+                    : static_cast<size_t>(reference - 300u);
                 const auto* halfWave = bytes + waveSetUserWaveOffset
                                        + userWave * waveSetHalfWaveSamples;
                 for (int sampleIndex = 0; sampleIndex < 64; ++sampleIndex)
                 {
                     const auto value = halfWave[static_cast<size_t>(sampleIndex)];
-                    (*samples)[index(destinationTable, wave, sampleIndex)]
+                    (*imported)[index(destinationTable, wave, sampleIndex)]
                         = static_cast<int8_t>(static_cast<int>(value) - 128);
-                    (*samples)[index(destinationTable, wave, 127 - sampleIndex)]
+                    (*imported)[index(destinationTable, wave, 127 - sampleIndex)]
                         = static_cast<int8_t>(static_cast<int>(
                                                   static_cast<uint8_t>(~value))
                                               - 128);
                 }
             }
-            else
-            {
-                return false;
-            }
             populated[static_cast<size_t>(wave)] = true;
         }
 
-        // Empty tail positions have the Wave's standard pulse, square and
+        // Empty tail positions have the Wave's standard triangle, square and
         // saw waves. Explicit user choices still take precedence.
         for (int wave = 61; wave < wavesPerTable; ++wave)
         {
             if (populated[static_cast<size_t>(wave)])
                 continue;
             for (int sampleIndex = 0; sampleIndex < samplesPerWave; ++sampleIndex)
-                (*samples)[index(destinationTable, wave, sampleIndex)]
-                    = (*samples)[index(0, wave, sampleIndex)];
+                (*imported)[index(destinationTable, wave, sampleIndex)]
+                    = (*imported)[index(0, wave, sampleIndex)];
             populated[static_cast<size_t>(wave)] = true;
+        }
+
+        // Sparse records must not inherit the previous disk's leading waves.
+        if (!populated[0])
+        {
+            for (int sampleIndex = 0; sampleIndex < samplesPerWave; ++sampleIndex)
+                (*imported)[index(destinationTable, 0, sampleIndex)]
+                    = romWaves != nullptr ? (*romWaves)[static_cast<size_t>(sampleIndex)]
+                                          : (*imported)[index(0, 0, sampleIndex)];
+            populated[0] = true;
         }
 
         // Wave OS repeatedly creates the midpoint of each remaining gap.
@@ -366,20 +440,23 @@ bool WavetableBank::loadWaveSetUserTables(const void* data, size_t size) noexcep
                 if (right - left > 1)
                 {
                     const auto midpoint = left + (right - left) / 2;
-                    for (int sampleIndex = 0; sampleIndex < samplesPerWave; ++sampleIndex)
+                    for (int sampleIndex = 0; sampleIndex < 64; ++sampleIndex)
                     {
                         const auto leftUnsigned = static_cast<unsigned>(
-                            static_cast<int>((*samples)[index(destinationTable, left,
+                            static_cast<int>((*imported)[index(destinationTable, left,
                                                                sampleIndex)])
                             + 128);
                         const auto rightUnsigned = static_cast<unsigned>(
-                            static_cast<int>((*samples)[index(destinationTable, right,
+                            static_cast<int>((*imported)[index(destinationTable, right,
                                                                sampleIndex)])
                             + 128);
-                        (*samples)[index(destinationTable, midpoint, sampleIndex)]
+                        const auto value = static_cast<uint8_t>(
+                            (leftUnsigned + rightUnsigned) >> 1u);
+                        (*imported)[index(destinationTable, midpoint, sampleIndex)]
+                            = static_cast<int8_t>(static_cast<int>(value) - 128);
+                        (*imported)[index(destinationTable, midpoint, 127 - sampleIndex)]
                             = static_cast<int8_t>(static_cast<int>(
-                                                      (leftUnsigned + rightUnsigned) >> 1u)
-                                                  - 128);
+                                                      static_cast<uint8_t>(~value)) - 128);
                     }
                     populated[static_cast<size_t>(midpoint)] = true;
                     complete = false;
@@ -391,6 +468,8 @@ bool WavetableBank::loadWaveSetUserTables(const void* data, size_t size) noexcep
         }
     }
 
+    std::atomic_store_explicit(&samples, std::move(imported), std::memory_order_release);
+    damagedUserTables = damagedCount;
     waveSetUserTablesLoaded = true;
     if (!source.contains("Wave SET user tables"))
         source += " + Wave SET user tables";
@@ -434,25 +513,37 @@ int8_t WavetableBank::rawSample(int table, int position, int sampleIndex) const 
                             juce::jlimit(0, samplesPerWave - 1, sampleIndex))];
 }
 
+int8_t WavetableBank::rawRomWaveSample(int wave, int sampleIndex) const noexcept
+{
+    wave = juce::jlimit(0, 299, wave);
+    sampleIndex = juce::jlimit(0, samplesPerWave - 1, sampleIndex);
+    if (romWaves != nullptr)
+        return (*romWaves)[static_cast<size_t>(wave) * samplesPerWave
+                           + static_cast<size_t>(sampleIndex)];
+    return rawSample(wave / wavesPerTable, wave % wavesPerTable, sampleIndex);
+}
+
 size_t WavetableBank::index(int table, int position, int sampleIndex) noexcept
 {
     return (static_cast<size_t>(table) * wavesPerTable + static_cast<size_t>(position))
            * samplesPerWave + static_cast<size_t>(sampleIndex);
 }
 
-void AsicResampler::prepare(double hostSampleRate)
+void AsicResampler::prepare(double hostSampleRate, double internalSampleRate)
 {
     // Coefficients are shared by all voices and only built during prepare.
     static std::mutex cacheMutex;
-    static std::map<double, std::weak_ptr<const Kernel>> cache;
+    static std::map<std::pair<double, double>, std::weak_ptr<const Kernel>> cache;
     const auto rate = juce::jmax(1.0, hostSampleRate);
+    const auto internalRate = juce::jmax(1.0, internalSampleRate);
+    const auto key = std::make_pair(rate, internalRate);
     const std::lock_guard<std::mutex> lock(cacheMutex);
-    kernel = cache[rate].lock();
+    kernel = cache[key].lock();
     if (kernel == nullptr)
     {
         auto next = std::make_shared<Kernel>();
-        const auto bandwidth = juce::jmin(rate, OscillatorChipProxy::modelClockRate());
-        const auto ratio = OscillatorChipProxy::modelClockRate() / bandwidth;
+        const auto bandwidth = juce::jmin(rate, internalRate);
+        const auto ratio = internalRate / bandwidth;
         // Blackman-windowed sinc: flat through 0.40 * bandwidth, with a
         // transition centred at 0.45 and rejection by host Nyquist. Bound
         // storage for pathological non-audio rates; normal audio rates use
@@ -481,7 +572,7 @@ void AsicResampler::prepare(double hostSampleRate)
                 coefficients[tap] = static_cast<float>(coefficients[tap] / sum);
         }
         kernel = next;
-        cache[rate] = kernel;
+        cache[key] = kernel;
     }
     // Mirroring the ring keeps the dot products contiguous without per-tap
     // modulus operations. No allocations or coefficient generation in render.
@@ -511,10 +602,34 @@ float AsicResampler::read(double fractionalTick) const noexcept
     const auto* first = kernel->coefficients.data() + index * kernel->taps;
     const auto* second = first + kernel->taps;
     const auto* samples = history.data() + head;
-    // Independent lanes let the compiler vectorise both dot products without
-    // enabling fast-math or reassociating a single serial accumulation.
+    // Explicit four-lane accumulation avoids compiler-generated lane extraction
+    // inside the tap loop. Unaligned loads are required by the rotating history.
+    // Preserve the four independent sums and their final reduction order.
     std::array<float, 4> a {};
     std::array<float, 4> b {};
+#if defined(__ARM_NEON)
+    auto va = vdupq_n_f32(0.0f);
+    auto vb = vdupq_n_f32(0.0f);
+    for (int tap = 0; tap < kernel->taps; tap += 4)
+    {
+        const auto input = vld1q_f32(samples + tap);
+        va = vaddq_f32(va, vmulq_f32(input, vld1q_f32(first + tap)));
+        vb = vaddq_f32(vb, vmulq_f32(input, vld1q_f32(second + tap)));
+    }
+    vst1q_f32(a.data(), va);
+    vst1q_f32(b.data(), vb);
+#elif defined(__SSE2__) || defined(_M_X64)
+    auto va = _mm_setzero_ps();
+    auto vb = _mm_setzero_ps();
+    for (int tap = 0; tap < kernel->taps; tap += 4)
+    {
+        const auto input = _mm_loadu_ps(samples + tap);
+        va = _mm_add_ps(va, _mm_mul_ps(input, _mm_loadu_ps(first + tap)));
+        vb = _mm_add_ps(vb, _mm_mul_ps(input, _mm_loadu_ps(second + tap)));
+    }
+    _mm_storeu_ps(a.data(), va);
+    _mm_storeu_ps(b.data(), vb);
+#else
     for (int tap = 0; tap < kernel->taps; tap += 4)
     {
         for (int lane = 0; lane < 4; ++lane)
@@ -523,6 +638,7 @@ float AsicResampler::read(double fractionalTick) const noexcept
             b[static_cast<size_t>(lane)] += samples[tap + lane] * second[tap + lane];
         }
     }
+#endif
     const auto firstSum = (a[0] + a[1]) + (a[2] + a[3]);
     const auto secondSum = (b[0] + b[1]) + (b[2] + b[3]);
     return firstSum + blend * (secondSum - firstSum);

@@ -6,7 +6,7 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
         "Minimum supported macOS version" FORCE)
 endif()
 
-project(WaveEmulationSample VERSION 0.1.11 LANGUAGES C CXX)
+project(WaveEmulationSample VERSION 0.1.12 LANGUAGES C CXX)
 
 include(FetchContent)
 
@@ -151,6 +151,8 @@ set(WAVE_CORE_SOURCES
     Source/Dsp/ReferenceComparator.h
     Source/Dsp/PpgWaveRom.cpp
     Source/Dsp/PpgWaveRom.h
+    Source/Dsp/WaveFactoryRom.cpp
+    Source/Dsp/WaveFactoryRom.h
     Source/Dsp/WaldorfAsic.cpp
     Source/Dsp/WaldorfAsic.h
     Source/Dsp/WaldorfEngine.cpp
@@ -217,6 +219,9 @@ target_include_directories(DecodePpgWavetables PRIVATE Source)
 
 add_executable(CreateWaveDisk EXCLUDE_FROM_ALL Tools/CreateWaveDisk.cpp)
 target_link_libraries(CreateWaveDisk PRIVATE WaveCore juce::juce_recommended_config_flags)
+
+add_executable(DecodeWaveFactoryWavetables EXCLUDE_FROM_ALL Tools/DecodeWaveFactoryWavetables.cpp)
+target_link_libraries(DecodeWaveFactoryWavetables PRIVATE WaveCore juce::juce_recommended_config_flags)
 
 if(MSVC)
     target_compile_options(WaveCore PRIVATE /W4 /permissive-)

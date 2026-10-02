@@ -22,9 +22,16 @@ public:
     // manual, containing one Wave Setup file in an ordinary 8.3 directory.
     static juce::Result createWithWaveSetup(const juce::File& destinationImage,
                                             const juce::File& waveSetupFile);
+    // Packages a native Wave .WTB unchanged for loading via the Disk pages.
+    static juce::Result createWithWaveWavetable(const juce::File& destinationImage,
+                                                const juce::File& wavetableFile);
     // Reads the first ordinary .SET file from a FAT12 floppy image. This is
     // used by the audio engine as the same bank source the firmware sees.
     static juce::Result readWaveSetup(const juce::File& imageFile,
                                       SetupFile& setupFile);
+private:
+    static juce::Result createWithWaveFile(const juce::File& destinationImage,
+                                           const juce::File& sourceFile,
+                                           bool wavetable);
 };
 } // namespace wave::firmware

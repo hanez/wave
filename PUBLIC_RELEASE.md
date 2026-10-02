@@ -35,8 +35,11 @@ for reviewing newly added data or secrets.
 Public builds default to `WAVE_EMBED_PRIVATE_ASSETS=OFF` and
 `WAVE_SIGN_RELEASE_ARTIFACTS=OFF`, even if private assets are present locally.
 The approved decoded PPG sample bank in `data/` is included.
-The upper Wave factory tables use the procedural fallback unless explicitly enabled
-in a private development build. Users may import their own wavetable data.
+Loading the authenticated Wave OS 1.700 firmware supplied by the user generates
+all 64 original factory tables by executing the firmware's own routines. Before
+Wave firmware is loaded, the public build uses its PPG/procedural fallback.
+Firmware and derived factory-table payloads are not included in the snapshot.
+See [wavetable authenticity](docs/wavetable-authenticity.md) for verification details.
 
 Publish only the new snapshot repository after reviewing its files. No remote
 is configured by the exporter. Existing private installers and DMGs may embed
