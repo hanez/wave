@@ -4416,6 +4416,8 @@ void testGlideEditPageDrivesNativeSoundAndDsp()
         }
     };
     const auto click = [&](int diagnosticCode) {
+        const auto glideBefore = processor->getMasterFirmwareRuntime()
+                                     .currentSoundRecordByte(238u) & 0x01u;
         const auto button = wave::panel::matrixIndexForDiagnosticCode(diagnosticCode);
         processor->setPanelButton(button, true);
         process(8);
@@ -4425,6 +4427,15 @@ void testGlideEditPageDrivesNativeSoundAndDsp()
              ++block)
             process(1);
         process(8);
+        // LCD completion can precede retirement of the mode-button serial
+        // transaction. Glide waits for that transaction, so await its native
+        // acknowledgement rather than assuming a fixed host-block latency.
+        for (int block = 0;
+             diagnosticCode == 6 && block < 128
+             && (processor->getMasterFirmwareRuntime()
+                     .currentSoundRecordByte(238u) & 0x01u) == glideBefore;
+             ++block)
+            process(1);
     };
 
     process(96);
