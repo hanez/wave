@@ -1652,7 +1652,8 @@ void WaldorfEngine::renderRangeChunk(juce::AudioBuffer<float>& output,
             continue;
         }
         const auto& layer = performance.layers[static_cast<size_t>(voice.layerIndex)];
-        const auto audible = layer.enabled && !layer.muted && layer.audioOutput == 0
+        const auto audible = layer.enabled && !layer.muted
+                             && layer.audioOutput == PerformanceLayer::mainAudioOut
                              && (!hasSoloedInstrument || layer.soloed);
         voice.currentFreeWheel
             = juce::jlimit(-1.0f, 1.0f,
@@ -1985,7 +1986,7 @@ WaldorfEngine::VoiceProbe WaldorfEngine::probeVoice(
     voice.start(midiNote, 1, velocity, order, order, layerIndex, layer,
                 tunedNote, tunedNote, 0.0f,
                 false, false, 0.0f, 0, 0.0f, 0.0f, 0.0f);
-    const auto performanceGain = layer.audioOutput == 0 ? layer.gain : 0.0f;
+    const auto performanceGain = layer.audioOutput == PerformanceLayer::mainAudioOut ? layer.gain : 0.0f;
     result.minimumCutoffHz = std::numeric_limits<float>::max();
     double energy = 0.0;
     const auto bank = wavetableBank.renderSnapshot();
