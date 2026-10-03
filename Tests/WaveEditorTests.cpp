@@ -508,7 +508,8 @@ void testInstrumentPageOneFaderDoesNotLeakIntoOtherPages()
         wave::panel::performanceFaderAdcChannels[audioOutFader], 0.92f, false);
     processBlocks(*processor, audio, 1200);
 
-    constexpr auto audioOutRecordOffset = size_t { 8 };
+    // Audio Out is Instrument part byte +0xC (firmware table 0x14BCA).
+    constexpr auto audioOutRecordOffset = size_t { 12 };
     require((processor->getMasterFirmwareRuntime().sharedProgramByte(
                  base + static_cast<uint32_t>(audioOutRecordOffset))
              & 0x7fu)

@@ -1177,9 +1177,6 @@ uint8_t MasterFirmwareRuntime::read8(uint32_t address) noexcept
         return sharedMemory->program[address - sharedProgramBase];
     if (address >= sharedWorkBase && address < sharedWorkBase + sharedMemory->work.size())
         return sharedMemory->work[address - sharedWorkBase];
-    if (address >= sharedExtensionBase
-        && address < sharedExtensionBase + sharedMemory->extension.size())
-        return sharedMemory->extension[address - sharedExtensionBase];
     if (address >= lcdVideoBase && address < lcdVideoBase + lcdVideoRam.size())
         return lcdVideoRam[address - lcdVideoBase].load(std::memory_order_relaxed);
 
@@ -1263,12 +1260,6 @@ void MasterFirmwareRuntime::write8(uint32_t address, uint8_t value) noexcept
     if (address >= sharedWorkBase && address < sharedWorkBase + sharedMemory->work.size())
     {
         sharedMemory->work[address - sharedWorkBase] = value;
-        return;
-    }
-    if (address >= sharedExtensionBase
-        && address < sharedExtensionBase + sharedMemory->extension.size())
-    {
-        sharedMemory->extension[address - sharedExtensionBase] = value;
         return;
     }
     if (address >= lcdVideoBase && address < lcdVideoBase + lcdVideoRam.size())

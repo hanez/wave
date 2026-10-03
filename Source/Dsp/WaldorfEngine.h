@@ -49,7 +49,10 @@ public:
         float detuneCents = 0.0f;
         float gain = 1.0f;
         float auxGain = 0.0f;
-        int audioOutput = 0;
+        // Firmware "Audio Out" (Instrument part byte +0xC): 0 Aux only,
+        // 1 main, 2 sub 1, 3 sub 2. Only main reaches the plugin output.
+        static constexpr int mainAudioOut = 1;
+        int audioOutput = mainAudioOut;
         int keyLow = 0;
         int keyHigh = 127;
         int velocityLow = 1;
@@ -78,6 +81,15 @@ public:
         float outputDb = -7.0f;
         float circuitAgeAmount = 0.18f;
     };
+
+    // Phase-load code the WDV writes to the ASIC at key-on (OS 1.700 0xF92 for
+    // Wave 1, 0x1074 for Wave 2). `programmed` is Startphase (sound byte 27/43,
+    // 0 = free start), `storedAmount` the route amount byte (0..127, 64 = off)
+    // and `source` the 16-bit modulation word. Returns 0 for a free start
+    // (nothing is written), otherwise the byte the firmware sends: the sum is
+    // formed in 16-bit words, so Wave 1 wraps to 8 bits where Wave 2 saturates.
+    [[nodiscard]] static int startPhaseCode(int programmed, int storedAmount, int source,
+                                            bool secondOscillator) noexcept;
 
     struct VoiceProbe
     {
@@ -257,7 +269,6 @@ private:
         bool active = false;
         float currentWavePosition = 0.0f;
         std::array<float, 2> currentLfoValues{};
-        std::array<float, 2> waveStartOffsets{};
         std::array<float, 2> currentPitchModulations{};
         float currentGlideNote = 0.0f;
         float targetGlideNote = 0.0f;
@@ -297,7 +308,7 @@ private:
         int filterEnvelopeDelaySamples = 0;
         int vcaDrainSamplesRemaining = 0;
         int controlFilterMode = 0;
-        bool waveStartOffsetsPending = false;
+        bool startPhaseModPending = false;
         bool filterEnvelopePending = false;
         bool filterEnvelopeTriggered = false;
     };

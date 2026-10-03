@@ -3,22 +3,33 @@
 #include <juce_dsp/juce_dsp.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 namespace wave::dsp
 {
 namespace
 {
 // WDV OS 1.700 stores modulation amounts in a 128-word table at 0x25e8.
-// Apart from the saturated -64 endpoint, its exact relationship is
-// sign(amount) * amount^2 / 4096. The pitch routine applies that curve twice,
-// then both oscillator callers at $0e34/$0eea arithmetic-shift its result
-// right by three before adding it to the pitch accumulator.
+// Apart from the saturated -64 endpoint and three typos, its relationship is
+// sign(amount) * amount^2 / 4096 (8 * n^2 of 32768). The typos are index 6
+// (amount -58: -29912 instead of -26912), index 126 (+62: 31000 instead of
+// 30752) and index 127 (+63: 32767 instead of 31752). The pitch routine
+// applies the result squared, then both oscillator callers at $0e14/$0eca
+// arithmetic-shift it right by three before adding it to the pitch
+// accumulator.
 float wdvAmountDepth(float amount) noexcept
 {
     const auto limited = juce::jlimit(-64.0f, 63.0f, amount);
-    return std::copysign(limited * limited / 4096.0f, limited);
+    static constexpr std::array<std::pair<float, float>, 3> tableTypos {{
+        { -58.0f, -3000.0f }, { 62.0f, 248.0f }, { 63.0f, 1015.0f }
+    }};
+    auto depth = std::copysign(limited * limited / 4096.0f, limited);
+    for (const auto& [index, error] : tableTypos)
+        depth += error / 32768.0f * juce::jmax(0.0f, 1.0f - std::abs(limited - index));
+    return depth;
 }
 
 float wdvPitchDepthSemitones(float amount) noexcept
@@ -483,6 +494,32 @@ void WaldorfEngine::Voice::prepare(double newSampleRate, int index)
     reset();
 }
 
+int WaldorfEngine::startPhaseCode(int programmed, int storedAmount, int source,
+                                  bool secondOscillator) noexcept
+{
+    if (programmed <= 0)
+        return 0;
+
+    const auto word = [](int value) { return static_cast<int16_t>(static_cast<uint16_t>(value)); };
+    // WDV 0x246C: source word times the amount table at 0x25E8 (saturated at
+    // -32767), keeping the high word and doubling it in a 16-bit add.
+    auto modulation = 0;
+    if (storedAmount != 64 && source != 0)
+    {
+        const auto table = juce::jlimit(
+            -32767, 32767,
+            juce::roundToInt(wdvAmountDepth(static_cast<float>(storedAmount - 64)) * 32768.0f));
+        modulation = word(((source * table) >> 16) * 2);
+    }
+    const auto code = word(word(programmed << 8) + modulation) >> 8;
+    if (code == 0)
+        return 1;
+    // 0xFB8 compares signed (ble) in Wave 1, 0x109C unsigned (bcs) in Wave 2.
+    if (!secondOscillator)
+        return std::min(code, 127) & 0xff;
+    return code > 0 && code < 127 ? code : 127;
+}
+
 void WaldorfEngine::Voice::reset()
 {
     oscillator1.reset();
@@ -510,7 +547,6 @@ void WaldorfEngine::Voice::reset()
     active = false;
     currentWavePosition = 0.0f;
     currentLfoValues.fill(0.0f);
-    waveStartOffsets.fill(0.0f);
     currentPitchModulations.fill(0.0f);
     currentGlideNote = 0.0f;
     targetGlideNote = 0.0f;
@@ -544,7 +580,7 @@ void WaldorfEngine::Voice::reset()
     vcaDrainSamplesRemaining = 0;
     controlFilterMode = 0;
     asicClockPhase = 1.0;
-    waveStartOffsetsPending = false;
+    startPhaseModPending = false;
     filterEnvelopePending = false;
     filterEnvelopeTriggered = false;
 }
@@ -684,8 +720,7 @@ void WaldorfEngine::Voice::start(int midiNote, int midiChannel, float noteVeloci
     for (size_t lfo = 0; lfo < lfos.size(); ++lfo)
         lfos[lfo].noteOn(parameters.lfos[lfo].sync,
                          parameters.lfos[lfo].phaseDegrees);
-    waveStartOffsets.fill(0.0f);
-    waveStartOffsetsPending = true;
+    startPhaseModPending = true;
 }
 
 void WaldorfEngine::Voice::release(bool allowSustain)
@@ -889,24 +924,37 @@ Cem3387::StereoSample WaldorfEngine::Voice::process(
     {
         // Start modifiers are sampled at note-on; all other WDV targets are
         // refreshed by the voice-board control interrupt rather than by the
-        // host audio clock.
-        if (waveStartOffsetsPending)
+        // host audio clock. WDV 0xF92/0x1074 add the route to Startphase (sound
+        // byte 27/43, one full cycle at full scale) in 16-bit arithmetic, see
+        // startPhaseCode; a Startphase of 0 is a free start and ignores it.
+        if (startPhaseModPending)
         {
-            waveStartOffsets[0]
-                = 64.0f
-                  * wdvAmountDepth(
-                      parameters.modulationRoutes[parameters::wave1StartMod].amount)
-                  * routeValue(parameters::wave1StartMod, parameters, env,
-                               waveEnvelopeValue, currentLfoValues, modWheel,
-                               channelPressure, pitchBend);
-            waveStartOffsets[1]
-                = 64.0f
-                  * wdvAmountDepth(
-                      parameters.modulationRoutes[parameters::wave2StartMod].amount)
-                  * routeValue(parameters::wave2StartMod, parameters, env,
-                               waveEnvelopeValue, currentLfoValues, modWheel,
-                               channelPressure, pitchBend);
-            waveStartOffsetsPending = false;
+            constexpr std::array<parameters::ModulationRouteIndex, 2> startRoutes {
+                parameters::wave1StartMod, parameters::wave2StartMod
+            };
+            std::array<OscillatorChipProxy*, 2> oscillators { &oscillator1, &oscillator2 };
+            for (size_t i = 0; i < startRoutes.size(); ++i)
+            {
+                const auto& route = parameters.modulationRoutes[startRoutes[i]];
+                // ponytail: float sources map to words at 32768 full scale; the
+                // master's MIDI controller words are CC << 8 (max 0x7F00), so a
+                // controller-driven start can land one step off. Per-source word
+                // scales would fix every route, not just this one.
+                const auto source = juce::jlimit(
+                    -32768, 32767,
+                    juce::roundToInt(32768.0f
+                                     * routeValue(startRoutes[i], parameters, env,
+                                                  waveEnvelopeValue, currentLfoValues,
+                                                  modWheel, channelPressure, pitchBend)));
+                const auto code = startPhaseCode(juce::roundToInt(parameters.wavePhases[i]),
+                                                 juce::roundToInt(route.amount) + 64,
+                                                 source, i == 1);
+                // ponytail: the ASIC takes the code as 8 bits, but Startphase
+                // is documented 0..127 = one cycle; bit 7 is assumed ignored.
+                if (code != 0)
+                    oscillators[i]->reset(static_cast<double>(code & 127) / 128.0);
+            }
+            startPhaseModPending = false;
         }
 
         const auto bend1 = pitchBend * parameters.oscillatorBendRanges[0] / 2.0f;
@@ -962,8 +1010,8 @@ Cem3387::StereoSample WaldorfEngine::Voice::process(
             baseFrequency * performanceRatio
             * std::exp2((pitch2 + detune[1] / 100.0f) / 12.0f));
 
-        const auto wave1Mod = waveStartOffsets[0]
-            + 64.0f * wdvAmountDepth(
+        const auto wave1Mod
+            = 64.0f * wdvAmountDepth(
                           parameters.modulationRoutes[parameters::wave1Mod1].amount)
                   * routeValue(parameters::wave1Mod1, parameters, env,
                                waveEnvelopeValue, currentLfoValues, modWheel,
@@ -983,8 +1031,8 @@ Cem3387::StereoSample WaldorfEngine::Voice::process(
                 + 64.0f * wdvAmountDepth(parameters.waveKeytrackAmounts[0]) * keyPosition
                 + wave1Mod);
         currentWavePosition = controlWavePositions[0];
-        const auto wave2Mod = waveStartOffsets[1]
-            + 64.0f * wdvAmountDepth(
+        const auto wave2Mod
+            = 64.0f * wdvAmountDepth(
                           parameters.modulationRoutes[parameters::wave2Mod1].amount)
                   * routeValue(parameters::wave2Mod1, parameters, env,
                                waveEnvelopeValue, currentLfoValues, modWheel,
@@ -1641,7 +1689,8 @@ void WaldorfEngine::renderRangeChunk(juce::AudioBuffer<float>& output,
             continue;
         }
         const auto& layer = performance.layers[static_cast<size_t>(voice.layerIndex)];
-        const auto audible = layer.enabled && !layer.muted && layer.audioOutput == 0
+        const auto audible = layer.enabled && !layer.muted
+                             && layer.audioOutput == PerformanceLayer::mainAudioOut
                              && (!hasSoloedInstrument || layer.soloed);
         voice.currentFreeWheel
             = juce::jlimit(-1.0f, 1.0f,
@@ -1974,7 +2023,7 @@ WaldorfEngine::VoiceProbe WaldorfEngine::probeVoice(
     voice.start(midiNote, 1, velocity, order, order, layerIndex, layer,
                 tunedNote, tunedNote, 0.0f,
                 false, false, 0.0f, 0, 0.0f, 0.0f, 0.0f);
-    const auto performanceGain = layer.audioOutput == 0 ? layer.gain : 0.0f;
+    const auto performanceGain = layer.audioOutput == PerformanceLayer::mainAudioOut ? layer.gain : 0.0f;
     result.minimumCutoffHz = std::numeric_limits<float>::max();
     double energy = 0.0;
     const auto bank = wavetableBank.renderSnapshot();
