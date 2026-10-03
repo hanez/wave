@@ -817,6 +817,252 @@ void testPerformanceAudioOutRouting()
             "Aux-only and sub outputs reached the main mix");
 }
 
+void testStartPhaseCode()
+{
+    using Engine = wave::dsp::WaldorfEngine;
+    // Free start: Startphase 0 writes no phase load and ignores the route.
+    require(Engine::startPhaseCode(0, 127, 32767, false) == 0
+                && Engine::startPhaseCode(0, 0, -32768, true) == 0,
+            "A free start was modulated");
+    // Fixed phase: amount byte 64 (route off) or a zero source leaves it alone.
+    for (const auto phase : { 1, 64, 127 })
+        for (const auto second : { false, true })
+            require(Engine::startPhaseCode(phase, 64, 32767, second) == phase
+                        && Engine::startPhaseCode(phase, 120, 0, second) == phase,
+                    "An unmodulated fixed Startphase changed");
+    // Half-scale source, amount +7 steps (stored 120): 64 + 49, both waves.
+    require(Engine::startPhaseCode(64, 120, 16384, false) == 113
+                && Engine::startPhaseCode(64, 120, 16384, true) == 113
+                && Engine::startPhaseCode(64, 120, -16384, false) == 15,
+            "Positive/negative Startphase modulation differs from WDV 0xF92");
+
+    // Reference values executed on WDV 0xF92 (Wave 1) and 0x1074 (Wave 2) of OS
+    // 1.700 in the Musashi oracle. Outside 1..127 the two waves differ: Wave 1
+    // adds in 16-bit words and keeps 8 bits (signed compare), Wave 2 saturates
+    // at 127 (unsigned compare), so a negative result gives 127 there.
+    struct Row { int phase; int amount; int source; int wave1; int wave2; };
+    static constexpr Row rows[] = {
+        { 1, 0, -32768, 128, 127 },
+        { 1, 0, -16384, 64, 64 },
+        { 1, 0, 16384, 193, 127 },
+        { 1, 0, 32767, 129, 127 },
+        { 1, 40, -32768, 19, 19 },
+        { 1, 40, -16384, 10, 10 },
+        { 1, 40, 16384, 248, 127 },
+        { 1, 40, 32767, 239, 127 },
+        { 1, 88, -32768, 239, 127 },
+        { 1, 88, -16384, 248, 127 },
+        { 1, 88, 16384, 10, 10 },
+        { 1, 88, 32767, 18, 18 },
+        { 1, 127, -32768, 129, 127 },
+        { 1, 127, -16384, 193, 127 },
+        { 1, 127, 16384, 64, 64 },
+        { 1, 127, 32767, 128, 127 },
+        { 64, 0, -32768, 191, 127 },
+        { 64, 0, -16384, 127, 127 },
+        { 64, 0, 16384, 1, 1 },
+        { 64, 0, 32767, 192, 127 },
+        { 64, 40, -32768, 82, 82 },
+        { 64, 40, -16384, 73, 73 },
+        { 64, 40, 16384, 55, 55 },
+        { 64, 40, 32767, 46, 46 },
+        { 64, 88, -32768, 46, 46 },
+        { 64, 88, -16384, 55, 55 },
+        { 64, 88, 16384, 73, 73 },
+        { 64, 88, 32767, 81, 81 },
+        { 64, 127, -32768, 192, 127 },
+        { 64, 127, -16384, 1, 1 },
+        { 64, 127, 16384, 127, 127 },
+        { 64, 127, 32767, 191, 127 },
+        { 127, 0, -32768, 254, 127 },
+        { 127, 0, -16384, 190, 127 },
+        { 127, 0, 16384, 63, 63 },
+        { 127, 0, 32767, 255, 127 },
+        { 127, 40, -32768, 145, 127 },
+        { 127, 40, -16384, 136, 127 },
+        { 127, 40, 16384, 118, 118 },
+        { 127, 40, 32767, 109, 109 },
+        { 127, 88, -32768, 109, 109 },
+        { 127, 88, -16384, 118, 118 },
+        { 127, 88, 16384, 136, 127 },
+        { 127, 88, 32767, 144, 127 },
+        { 127, 127, -32768, 255, 127 },
+        { 127, 127, -16384, 63, 63 },
+        { 127, 127, 16384, 190, 127 },
+        { 127, 127, 32767, 254, 127 },
+    };
+    for (const auto& row : rows)
+        require(Engine::startPhaseCode(row.phase, row.amount, row.source, false) == row.wave1
+                    && Engine::startPhaseCode(row.phase, row.amount, row.source, true) == row.wave2,
+                "Startphase code differs from the WDV firmware");
+}
+
+void testStartPhaseCodeMatchesFirmwareWhenAvailable()
+{
+    // Runs the real WDV key-on path for every Startphase/route combination and
+    // compares the phase load it writes to the ASIC (reg 2 = n & 3, reg 4 =
+    // n >> 2, then a select write with bit 4 clear) with startPhaseCode().
+    const auto* path = std::getenv("WAVE_FIRMWARE_DIR");
+    if (path == nullptr)
+        return;
+    wave::firmware::Bundle bundle;
+    require(bundle.load(juce::File(path)).authenticity
+                == wave::firmware::Bundle::Authenticity::verifiedOs1700,
+            "WAVE_FIRMWARE_DIR does not contain the known OS 1.700 pair");
+
+    auto memoryStorage = std::make_unique<wave::firmware::SharedFirmwareMemory>();
+    auto& memory = *memoryStorage;
+    memory.clear();
+    wave::firmware::VoiceFirmwareRuntime runtime;
+    runtime.attachSharedMemory(memory);
+    require(runtime.setBoardIndex(0) && runtime.loadAndReset(bundle.getVoiceImage()),
+            "WDV image was rejected");
+
+    const auto poke = [&](uint32_t address, uint32_t value) {
+        (address >= 0x140000 ? memory.work[address - 0x140000]
+                             : memory.program[address - 0x100000])
+            = static_cast<uint8_t>(value);
+    };
+    const auto scan = [&] {
+        constexpr uint32_t alive = 0x10508e; // set after every full voice scan
+        poke(alive, 0);
+        for (int slice = 0; runtime.sharedByte(alive - 0x100000) == 0; ++slice)
+        {
+            require(slice < 5'000'000, "WDV voice scan did not finish");
+            runtime.runCycles(200);
+        }
+    };
+
+    // Same seed as the oracle gate: master-go preset, boot to the main loop,
+    // 0x40-centred tuning bytes, one voice record per voice.
+    constexpr uint32_t p2 = 0x130000, p3 = 0x131000, p4 = 0x132000, p5 = 0x133000;
+    poke(0x10508a, 1);
+    poke(0x105006, 0x5a);
+    poke(0x1050e7, 48);
+    for (int steps = 0; runtime.programCounter() != 0x516; ++steps)
+    {
+        require(steps < 50'000'000, "WDV did not reach its main loop");
+        runtime.runCycles(1);
+    }
+    poke(0x148812, 0x5a);
+    poke(0x148803, 1);
+    poke(0x148802, 0x80);
+    poke(0x148826, 0x40);
+    for (const auto offset : { 1u, 2u, 13u, 14u })
+        poke(p2 + offset, 0x40);
+    poke(p4 + 12, 2);
+    poke(p4 + 16, 1);
+    poke(p4 + 9, 0x40);
+    poke(p4 + 10, 0x80);
+    poke(p2 + 0xef, 0x55);
+    poke(p3 + 0x30, 0x55);
+    poke(p2 + 40, 1);
+    constexpr uint32_t voice = 3;
+    for (uint32_t v = 0; v < 16; ++v)
+    {
+        const auto record = 0x100000 + v * 0x100;
+        const auto pointer = [&](uint32_t offset, uint32_t value) {
+            for (uint32_t i = 0; i < 4; ++i)
+                poke(record + offset + i, value >> (24 - 8 * i));
+        };
+        pointer(0x2c, p5);
+        pointer(0x30, p4);
+        pointer(0x34, p3);
+        pointer(0x38, p2);
+        poke(record + 0x3d, 0x20 * (v % 3));
+        poke(record + 0x3c, v & 1);
+        poke(record + 0x0a, 48 + v);
+        poke(0x15a680 + 2 * v, 1);
+        poke(0x15a681 + 2 * v, 3 * v);
+    }
+    scan();
+
+    // Route source 0x16 is the modulation-wheel word at record + 0xAC.
+    struct Case { int phase; int amount; int source; };
+    for (const auto& c : { Case { 0, 127, 32767 }, Case { 64, 64, 32767 }, Case { 64, 120, 16384 },
+                           Case { 64, 120, -16384 }, Case { 2, 0, 32767 }, Case { 2, 0, -32768 },
+                           Case { 100, 127, 24000 }, Case { 127, 8, -8192 }, Case { 1, 127, -32768 },
+                           Case { 127, 127, 32767 }, Case { 64, 40, 32767 }, Case { 33, 100, -20000 } })
+    {
+        const auto record = 0x100000 + voice * 0x100;
+        const auto word = static_cast<uint16_t>(c.source);
+        poke(record + 0xac, word >> 8);
+        poke(record + 0xad, word & 0xff);
+        for (const auto base : { 0x1bu, 0x2bu })
+        {
+            poke(p2 + base, static_cast<uint32_t>(c.phase));
+            poke(p2 + base + 1, 0x16);
+            poke(p2 + base + 2, static_cast<uint32_t>(c.amount));
+            poke(p5 + base + 2, 0xff);
+        }
+        runtime.clearHardwareWrites();
+        poke(record + 6, 1);
+        scan();
+        scan();
+
+        // Pair the ASIC bytes into words, and catch the phase-load selects.
+        std::array<int, 2> loaded { -1, -1 };
+        int reg2 = 0, reg4 = 0;
+        const auto& writes = runtime.pendingHardwareWrites();
+        for (size_t i = 0; i + 1 < writes.size(); ++i)
+        {
+            if (writes[i].address < 0x980000 || writes[i].address >= 0x980200
+                || (writes[i].address & 1) != 0 || writes[i + 1].address != writes[i].address + 1)
+                continue;
+            const auto value = (writes[i].value << 8) | writes[i + 1].value;
+            const auto reg = writes[i].address & 0xfe;
+            if (reg == 2) reg2 = value;
+            else if (reg == 4) reg4 = value;
+            else if (reg == 0xe && (value & 0x1e) == (0x2 * (voice & 7)) && writes[i].address < 0x980100)
+                loaded[value & 1] = (reg4 << 2) | (reg2 & 3);
+        }
+        for (const auto second : { false, true })
+        {
+            const auto expected = wave::dsp::WaldorfEngine::startPhaseCode(
+                c.phase, c.amount, c.source, second);
+            require(loaded[second ? 1 : 0] == (expected == 0 ? -1 : expected),
+                    "startPhaseCode differs from the Startphase the WDV firmware loads");
+        }
+    }
+}
+
+void testStartModulationAtNoteOn()
+{
+    // The route is evaluated once at note-on and offsets Startphase, not the
+    // wave position. Source 38 x control 38 is a constant +1.
+    const auto render = [](float startphase, float amount) {
+        wave::dsp::WaldorfEngine engine;
+        engine.prepare(48000.0, 512);
+        wave::dsp::WaldorfEngine::PerformanceSnapshot performance;
+        auto& layer = performance.layers[0];
+        layer.enabled = true;
+        layer.source = 2;
+        layer.sound.attackSeconds = 0.001f;
+        for (const auto oscillator : { 0, 1 })
+            layer.sound.wavePhases[static_cast<size_t>(oscillator)] = startphase;
+        for (const auto route : { wave::parameters::wave1StartMod, wave::parameters::wave2StartMod })
+        {
+            auto& assignment = layer.sound.modulationRoutes[static_cast<size_t>(route)];
+            assignment.source = 38;
+            assignment.control = 38;
+            assignment.amount = amount;
+        }
+        juce::AudioBuffer<float> audio(2, 512);
+        juce::MidiBuffer noteOn;
+        noteOn.addEvent(juce::MidiMessage::noteOn(1, 60, 0.9f), 0);
+        engine.render(audio, noteOn, performance);
+        return std::vector<float>(audio.getReadPointer(0), audio.getReadPointer(0) + 512);
+    };
+    require(render(0.0f, 0.0f) == render(0.0f, 40.0f) && render(0.0f, 0.0f) == render(0.0f, -40.0f),
+            "A free start was modulated");
+    require(render(64.0f, 0.0f) != render(32.0f, 0.0f),
+            "Startphase does not change the note-on waveform");
+    require(render(64.0f, 40.0f) != render(64.0f, 0.0f)
+                && render(64.0f, -40.0f) != render(64.0f, 0.0f)
+                && render(64.0f, 40.0f) != render(64.0f, -40.0f),
+            "Start modulation did not move a fixed Startphase in both directions");
+}
+
 void testPerformanceTuningTables()
 {
     wave::dsp::WaldorfEngine engine;
@@ -3776,8 +4022,11 @@ int main()
         testWaveEnvelopeTraversal();
         testWaveLfo();
         testDspMathTables();
-        testPerformanceAudioOutRouting();
         testPerformanceTuningTables();
+        testPerformanceAudioOutRouting();
+        testStartPhaseCode();
+        testStartPhaseCodeMatchesFirmwareWhenAvailable();
+        testStartModulationAtNoteOn();
         testFreeRunningEngineLfo();
         testFactorySetWhenAvailable();
         testDamagedUserWavetableImport();
