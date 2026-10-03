@@ -406,7 +406,7 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
     };
     constexpr auto channels = wave::panel::performanceFaderAdcChannels;
     constexpr std::array<uint32_t, 8> offsets {
-        4u, 5u, 7u, 8u, 9u, 10u, 2u, 3u
+        4u, 5u, 7u, 12u, 9u, 10u, 2u, 3u
     };
     constexpr std::array<float, 8> positions {
         0.50f, 0.25f, 0.25f, 0.75f,
@@ -416,7 +416,7 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
         64, 32, 32, 2, 32, 95, 12, 1
     };
 
-    processor->setPanelFader(3, channels[3], 0.0f, false); // Main output.
+    processor->setPanelFader(3, channels[3], 1.0f / 3.0f, false); // Main output.
     processor->setPanelFader(7, channels[7], 1.0f, false); // Keys + MIDI.
     processor->setPanelFader(0, channels[0], 0.0f, false);
     processBlocks(*processor, audio, 32);
@@ -450,7 +450,7 @@ void testInstrumentEditPageOneFadersUpdatePerformance()
     }
 
     // Volume must reach the live layer, not just its LCD/record value.
-    processor->setPanelFader(3, channels[3], 0.0f, false); // Main output.
+    processor->setPanelFader(3, channels[3], 1.0f / 3.0f, false); // Main output.
     processor->setPanelFader(7, channels[7], 1.0f, false); // Keys + MIDI.
     processBlocks(*processor, audio, 32);
     const auto audible = processor->probeCurrentLayerVoice(

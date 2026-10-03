@@ -73,6 +73,11 @@ int main(int argc, char** argv)
     };
 
     std::ifstream script(argv[2]);
+    if (!script.is_open())
+    {
+        std::fprintf(stderr, "cannot read script %s\n", argv[2]);
+        return 2;
+    }
     std::string line;
     while (std::getline(script, line))
     {
