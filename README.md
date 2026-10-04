@@ -8,6 +8,7 @@ A JUCE C++ research instrument that recreates the documented Waldorf Wave signal
 
 | Platform | Download | Included formats |
 | --- | --- | --- |
+| Windows x64 — 0.1.13 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.13/Wave-Emulation-0.1.13-Windows-x64.zip) | Standalone EXE and VST3 |
 | macOS 13.0 or later, Apple Silicon and Intel — 0.1.13 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.13/DJW.Wave.Emulation.0.1.13.dmg) | Standalone app, AU, VST3 and AAX |
 
 See the [0.1.13 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.13)
@@ -44,10 +45,7 @@ To use your own artwork in the original layout, choose **System → Panel Skin �
 
 Create a larger-label skin by copying [the original panel SVG](media/WaldorfWaveUI_NOLOGO.svg) and editing its labels, colours, or decoration. Keep `width="2338"`, `height="1042"`, and `viewBox="0 0 2338 1042"`, and leave all control, LCD, LED, and keyboard positions unchanged. Only panel artwork is replaced; the moving controls, keyboard, LEDs, LCD, and interaction geometry retain their original layout. Export text as paths for consistent rendering across machines. Reload the SVG from the menu after editing it.
 
-## Installing Windows builds
-
-Windows builds are available from earlier releases or the CI artifacts described
-below. The 0.1.13 release download is the macOS DMG.
+## Installing the Windows release
 
 1. Download and extract the Windows ZIP. Run
    `Standalone/Wave Emulation.exe` to use the portable standalone application.
