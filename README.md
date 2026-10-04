@@ -8,13 +8,13 @@ A JUCE C++ research instrument that recreates the documented Waldorf Wave signal
 
 | Platform | Download | Included formats |
 | --- | --- | --- |
-| Windows x64 — 0.1.12 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.12/Wave-Emulation-0.1.12-Windows-x64.zip) | Standalone EXE and VST3 |
-| macOS 13.0 or later, Apple Silicon and Intel — 0.1.12 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.12/DJW.Wave.Emulation.0.1.12.dmg) | Standalone app, AU, VST3 and AAX |
+| Windows x64 — 0.1.13 | [Windows ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.13/Wave-Emulation-0.1.13-Windows-x64.zip) | Standalone EXE and VST3 |
+| macOS 13.0 or later, Apple Silicon and Intel — 0.1.13 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.13/DJW.Wave.Emulation.0.1.13.dmg) | Standalone app, AU, VST3 and AAX |
 
-See the [0.1.12 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.12)
-for release notes. The [corresponding source](https://github.com/mo0kid/wave/releases/download/v0.1.12/Wave-Emulation-0.1.12-Source.zip)
+See the [0.1.13 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.13)
+for release notes. The [corresponding source](https://github.com/mo0kid/wave/releases/download/v0.1.13/Wave-Emulation-0.1.13-Source.zip)
 includes the modified dependencies used for both platforms. The accompanying
-[SHA-256 checksums](https://github.com/mo0kid/wave/releases/download/v0.1.12/SHA256SUMS.txt)
+[SHA-256 checksums](https://github.com/mo0kid/wave/releases/download/v0.1.13/SHA256SUMS.txt)
 cover the installers, Windows ZIP, source archive and release documentation.
 
 Supply your own Wave OS 1.700 firmware and sound disks. Neither platform's
@@ -39,7 +39,9 @@ Use **Cmd/Ctrl + =** and **Cmd/Ctrl + -** to zoom the editor in and out, **Cmd/C
 
 Hover over any knob or fader to see its tooltip. Knob names follow the selected LFO and envelope page; hold Shift while dragging a knob for finer adjustment. Fader tips identify the numbered control and whether it uses a Performance assignment or the current LCD parameter.
 
-To use your own artwork, choose **System → Panel Skin → Load Alternative SVG Skin…**. Choose **Original** to return to the bundled panel. The selected file is remembered for future instances; keep it at the same path. Missing or invalid files fall back to the original skin.
+Choose **System → Panel Skin → Compact Skin** for the bundled 1693 × 768 layout, with the controls rearranged around the LCD and no keyboard, wheels, or transport controls. The selection is remembered for future instances. Choose **Original** to return to the full panel.
+
+To use your own artwork in the original layout, choose **System → Panel Skin → Load Alternative SVG Skin…**. The selected file is remembered for future instances; keep it at the same path. Missing or invalid files fall back to the original skin.
 
 Create a larger-label skin by copying [the original panel SVG](media/WaldorfWaveUI_NOLOGO.svg) and editing its labels, colours, or decoration. Keep `width="2338"`, `height="1042"`, and `viewBox="0 0 2338 1042"`, and leave all control, LCD, LED, and keyboard positions unchanged. Only panel artwork is replaced; the moving controls, keyboard, LEDs, LCD, and interaction geometry retain their original layout. Export text as paths for consistent rendering across machines. Reload the SVG from the menu after editing it.
 
@@ -74,6 +76,13 @@ Quit any older standalone instance, then launch `/Applications/Wave Emulation.ap
 Older development copies named **Wave Emulation Sample.app** are separate files
 and are not updated by this installer. Versions 0.1.0 and 0.1.1 installed only
 the plugins, so they did not update a standalone app you already had open.
+
+## What's new in 0.1.13
+
+New instances automatically mount the bundled blank INIT disk and load its SET,
+with Instrument 1 active and editable. The release also adds the compact panel
+skin, improves panel input and firmware-derived voice behavior, and refines
+the CEM3387 filter model. See [the release notes](docs/release-0.1.13.md).
 
 ## What's new in 0.1.12
 
@@ -200,8 +209,12 @@ These third-party banks are not bundled with this project; their contents
 remain subject to the original authors' terms and are not covered by this
 repository's licence.
 
-Fresh instances start with a mounted **Blank Wave.img** and one INIT
-performance. Performance -/+ cannot select another patch from that empty bank.
+Fresh instances mount a private, writable copy of the bundled **Blank Wave.img**
+and automatically load its SET. Both banks contain INIT Sounds and **MULTI INIT**
+Performances, with Instrument 1 active and selected, so the panel has an editable
+Sound immediately after system firmware is loaded. No Disk/Import confirmation
+is needed. The blank image is also included separately in the macOS DMG and
+Windows ZIP. Choosing **Create Blank Disk Image...** still creates an empty disk.
 Each plug-in instance has its own sound-bank state. Saving a DAW project embeds
 that instance's mounted disk image and bank, so reopening restores them even if
 the original image has moved. The standalone restores its last saved session.
@@ -246,7 +259,7 @@ This sample is honest about a hard distinction:
 - The oscillator ASIC is an undocumented black box. Its internal algorithms cannot be recovered or claimed from the available documentation. The DSP is explicitly an external behavioural proxy, using Waldorf's documented 250 kHz rate and ES2 eight-bit numerical mix-overflow boundary; its exact accumulator ordering and truncation remain to be validated against real-hardware measurements. Firmware register traces reveal only the external contract.
 - Loading the authenticated Wave OS 1.700 firmware installs all 64 original factory wavetables by executing its own 68000 table routines, including slot 60 and the original triangle/square/saw standards. Saved PPG paths cannot replace this bank during startup or project recall. Native Wave SET images supply their own 64 user tables and 1000-Wave pool. Without Wave firmware, the included lower 30 PPG tables and procedural upper tables remain a fallback. Explicit imports of signed-eight-bit 64/128-table banks, first-32-table banks and PPG EPROM images remain available for research. See [wavetable verification](docs/wavetable-authenticity.md) for provenance, hashes and limits.
 - The filter path implements all four sound-record modes: analogue 24 dB low-pass, digital 12 dB high-pass, linked serial band-pass with width, and Dual mode with independently modulated HP/LP cutoffs. The WDV frequency table establishes semitone-spaced cutoff values beginning at 20 Hz. The fixed CEM3387 three-pole 1 dB Chebyshev reconstruction section and nonlinear resonant four-pole low-pass are separate from the pre-analogue ASIC high-pass. Envelope selection, velocity, key tracking, both modulation routes, resonance modulation, and maximum-resonance self-oscillation are active. Unknown ASIC arithmetic and unmeasured component tolerances remain explicit calibration hypotheses.
-- The mixed-signal path explicitly models eight-bit multiplexed conversion, signed ES2 mixer wrap, sample-and-hold behaviour, three-pole reconstruction and AC coupling, the distinct VCF input saturation around 70% mixer output, AD7545-style 12-bit CV quantisation, nonlinear four-pole CEM3387 filtering, VCA bleed/noise, panning, output coupling, slew, and rails. Values without measurements remain documented calibration hypotheses.
+- The mixed-signal path explicitly models eight-bit multiplexed conversion, signed ES2 mixer wrap, sample-and-hold behaviour, three-pole reconstruction and AC coupling, estimated VCF input/output headroom, AD7545-style 12-bit CV quantisation, nonlinear four-pole CEM3387 filtering, VCA bleed/noise, panning, output coupling, slew, and rails. The [CEM3387 model notes](docs/cem3387-filter.md) document the datasheet-guided distortion estimate and assumed signal-voltage scale; hardware measurements are still needed to calibrate them.
 - MIDI bytes are delivered to the master UART at their host-sample offsets while the behavioural audio engine receives the same event timeline. This preserves a useful audible instrument during protocol research without falsely claiming that every high-level WDV voice-record field has already been named.
 - `ReferenceComparator` and `reference-captures/README.md` provide the real-hardware validation path: alignment, fitted gain, normalized correlation, RMS error, and peak error. Set `WAVE_REFERENCE_CAPTURE` when running tests to compare a capture.
 - The live LCD scanout is 480 x 64 at one bit per pixel. Before genuine firmware produces video writes, the same framebuffer shows the sound and firmware diagnostic pages.

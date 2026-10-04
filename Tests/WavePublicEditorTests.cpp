@@ -65,7 +65,7 @@ int main()
         snapshot(*editor, "editor-full");
         auto* panelEditor = dynamic_cast<WaveEmulationAudioProcessorEditor*>(editor.get());
         require(panelEditor != nullptr, "Unexpected editor type");
-        require(panelEditor->tooltipAt({ 222.0f, 81.0f }).contains("Wave 1 Detune"),
+        require(panelEditor->tooltipAt({ 222.0f, 81.0f }) == "Wave 1 Detune",
                 "Knob tooltip does not identify its control");
         for (const auto x : { 969.0f, 1025.0f, 1080.0f, 1136.0f,
                               1191.0f, 1248.0f, 1302.0f, 1358.0f })
@@ -84,7 +84,7 @@ int main()
         const auto skinImage = editor->createComponentSnapshot(editor->getLocalBounds());
         require(skinImage.getPixelAt(80, 20) == juce::Colours::lime,
                 "Alternative skin did not replace panel artwork");
-        require(panelEditor->tooltipAt({ 222.0f, 81.0f }).contains("Wave 1 Detune"),
+        require(panelEditor->tooltipAt({ 222.0f, 81.0f }) == "Wave 1 Detune",
                 "Skin replaced control geometry");
         {
             std::unique_ptr<juce::AudioProcessorEditor> reopened(processor->createEditor());
@@ -103,6 +103,93 @@ int main()
         panelEditor->useDefaultPanelSkin();
         require(processor->getRememberedPanelSkin() == juce::File{},
                 "Original skin did not clear the saved preference");
+        // Built-in compact artwork relocates live controls, and its preference
+        // survives a fresh processor without depending on an SVG file path.
+        panelEditor->useCompactPanelSkin();
+        require(editor->getWidth() == 1693 && editor->getHeight() == 768,
+                "Compact skin did not resize to the supplied artwork");
+        require(processor->getRememberedCompactPanelSkin(),
+                "Compact skin preference was not saved");
+        for (const auto& control : std::array<std::pair<juce::Point<float>, juce::String>, 8> {{
+                 { {207.0f, 122.5f}, "Wave 1 Detune" },
+                 { {207.0f, 388.5f}, "Wave 2 Detune" },
+                 { {677.0f, 202.0f}, "Wavetable/Data" },
+                 { {677.0f, 115.0f}, "System Volume" },
+                 { {568.0f, 556.0f}, "Glide Rate" },
+                 { {1328.0f, 192.0f}, "Cutoff" },
+                 { {1333.0f, 642.5f}, "Panning Mod 2 Amount" },
+                 { {885.0f, 564.0f}, "Wave Envelope Time 1" }
+             }})
+            require(panelEditor->tooltipAt(control.first) == control.second,
+                    "Compact knob is missing or bound to the wrong control");
+        for (const auto x : { 801.4f, 847.32f, 892.42f, 938.34f,
+                              983.44f, 1030.18f, 1074.46f, 1120.38f })
+            require(panelEditor->tooltipAt({x, 316.03f}).startsWith("Fader "),
+                    "Compact fader hit region is missing");
+        // Each visible fader must operate its corresponding performance
+        // parameter, including the final fader's distinct physical ADC channel.
+        int compactFader = 0;
+        for (const auto x : { 801.4f, 847.32f, 892.42f, 938.34f,
+                              983.44f, 1030.18f, 1074.46f, 1120.38f })
+        {
+            const auto initialValue = processor->getPanelFaderValue(compactFader);
+            const juce::Point<float> start {x, 316.03f};
+            const auto end = start.translated(0.0f, initialValue < 0.5f ? -50.0f : 50.0f);
+            const auto input = juce::Desktop::getInstance().getMainMouseSource();
+            const auto timestamp = juce::Time::getCurrentTime();
+            const juce::MouseEvent faderDown {
+                input, start, juce::ModifierKeys {juce::ModifierKeys::leftButtonModifier},
+                1.0f, 0.0f, 0.0f, 0.0f, 0.0f, panelEditor, panelEditor,
+                timestamp, start, timestamp, 1, false
+            };
+            const juce::MouseEvent faderDrag {
+                input, end, juce::ModifierKeys {juce::ModifierKeys::leftButtonModifier},
+                1.0f, 0.0f, 0.0f, 0.0f, 0.0f, panelEditor, panelEditor,
+                timestamp, start, timestamp, 1, true
+            };
+            panelEditor->mouseDown(faderDown);
+            panelEditor->mouseDrag(faderDrag);
+            panelEditor->mouseUp(faderDrag);
+            require(std::abs(processor->getPanelFaderValue(compactFader) - initialValue) > 0.4f,
+                    "Compact fader did not operate its corresponding parameter");
+            ++compactFader;
+        }
+        auto* compactLcd = static_cast<juce::Component*>(nullptr);
+        for (int index = 0; index < editor->getNumChildComponents(); ++index)
+            if (auto* child = editor->getChildComponent(index);
+                dynamic_cast<wave::ui::WaveLcdComponent*>(child) != nullptr)
+                compactLcd = child;
+        require(compactLcd != nullptr
+                    && compactLcd->getBounds() == juce::Rectangle<int>(777, 180, 367, 57),
+                "Compact LCD does not align with the SVG");
+        const auto compactCommand = [&](int key) {
+            return editor->keyPressed(juce::KeyPress(
+                key, juce::ModifierKeys { juce::ModifierKeys::commandModifier }, 0));
+        };
+        require(compactCommand('k') && editor->getWidth() == 1693 && editor->getHeight() == 768,
+                "Keyboard shortcut changed the compact layout");
+        snapshot(*editor, "editor-compact");
+        require(compactCommand('=') && editor->getWidth() == 1862 && editor->getHeight() == 845,
+                "Compact zoom did not retain the artwork aspect ratio");
+        require(panelEditor->tooltipAt({207.0f * 1.1f, 122.5f * 1.1f}).contains("Wave 1 Detune"),
+                "Compact zoom moved knob interaction away from the artwork");
+        require(compactCommand('0'), "Cannot reset compact zoom");
+        {
+            auto reopenedProcessor = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+            std::unique_ptr<juce::AudioProcessorEditor> reopened(reopenedProcessor->createEditor());
+            require(reopened->getWidth() == 1693 && reopened->getHeight() == 768,
+                    "Fresh processor did not remember Compact Skin");
+        }
+        require(panelEditor->loadPanelSkin(skin.getFile()).wasOk()
+                    && editor->getWidth() == 2338 && editor->getHeight() == 1042
+                    && !processor->getRememberedCompactPanelSkin(),
+                "Loading an original-layout skin did not leave compact mode");
+        panelEditor->useCompactPanelSkin();
+        panelEditor->useDefaultPanelSkin();
+        require(editor->getWidth() == 2338 && editor->getHeight() == 1042
+                    && !processor->getRememberedCompactPanelSkin(),
+                "Original skin did not restore layout and preference");
+        std::cout << "Compact skin layout, zoom, persistence and switching passed" << std::endl;
         preference.getFile().getSiblingFile(
             preference.getFile().getFileNameWithoutExtension() + "-panel-skin.txt").deleteFile();
         // A physical pot must move its visible artwork, even before firmware
@@ -168,34 +255,81 @@ int main()
                     audio.clear();
                     processor->processBlock(audio, midi);
                 }
+                require(processor->getNumPrograms() == 256
+                            && processor->getSelectedPerformanceInstrument() == 0
+                            && processor->isPerformanceInstrumentActive(0),
+                        "First firmware load did not retain the default INIT Instrument");
+                // Exercise the real Cutoff mouse handler before importing any
+                // user SET: rotating the artwork must also edit the live Sound.
+                const auto cutoffBefore
+                    = processor->getMasterFirmwareRuntime().currentSoundRecordByte(79);
+                const juce::Point<float> cutoffCentre { 1670.0f, 237.0f };
+                auto* cutoffKnob = editor->getComponentAt(cutoffCentre.roundToInt());
+                require(cutoffKnob != nullptr && cutoffKnob != editor.get(),
+                        "Default Cutoff knob has no input component");
+                const auto cutoffStart = cutoffKnob->getLocalPoint(editor.get(), cutoffCentre);
+                const auto cutoffTime = juce::Time::getCurrentTime();
+                const juce::MouseEvent cutoffDown {
+                    source, cutoffStart,
+                    juce::ModifierKeys { juce::ModifierKeys::leftButtonModifier },
+                    1.0f, 0.0f, 0.0f, 0.0f, 0.0f, cutoffKnob, cutoffKnob,
+                    cutoffTime, cutoffStart, cutoffTime, 1, false
+                };
+                const juce::MouseEvent cutoffDrag {
+                    source, cutoffStart.translated(0.0f, 80.0f),
+                    juce::ModifierKeys { juce::ModifierKeys::leftButtonModifier },
+                    1.0f, 0.0f, 0.0f, 0.0f, 0.0f, cutoffKnob, cutoffKnob,
+                    cutoffTime, cutoffStart, cutoffTime, 1, true
+                };
+                cutoffKnob->mouseDown(cutoffDown);
+                cutoffKnob->mouseDrag(cutoffDrag);
+                cutoffKnob->mouseUp(cutoffDrag);
+                for (int block = 0; block < 1000; ++block)
+                {
+                    audio.clear();
+                    processor->processBlock(audio, midi);
+                }
+                require(processor->getMasterFirmwareRuntime().currentSoundRecordByte(79)
+                            != cutoffBefore,
+                        "Default SET knob rotated without editing the INIT Sound");
+                std::cout << "Default INIT Instrument responds to editor knob dragging" << std::endl;
                 // Public builds must accept panel input after user-supplied firmware
                 // boots, without relying on an embedded factory sound bank.
                 auto* panel = dynamic_cast<WaveEmulationAudioProcessorEditor*>(editor.get());
                 require(panel != nullptr, "Unexpected editor type");
-                for (const auto y : { 494.0f, 553.0f })
+                for (const auto compact : { false, true })
                 {
-                    const auto before = processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
-                    const juce::Point<float> position { 1402.5f + 66.0f, y };
-                    require(panel->getComponentAt(position.roundToInt()) == panel,
-                            "Panel control is intercepted by a child component");
-                    const auto time = juce::Time::getCurrentTime();
-                    const auto source = juce::Desktop::getInstance().getMainMouseSource();
-                    const juce::MouseEvent down {
-                        source, position, juce::ModifierKeys { juce::ModifierKeys::leftButtonModifier },
-                        1.0f, 0.0f, 0.0f, 0.0f, 0.0f, panel, panel,
-                        time, position, time, 1, false
-                    };
-                    panel->mouseDown(down);
-                    panel->mouseUp(down);
-                    for (int block = 0; block < 1000; ++block)
+                    if (compact)
+                        panel->useCompactPanelSkin();
+                    for (const auto y : { 494.0f, 553.0f })
                     {
-                        audio.clear();
-                        processor->processBlock(audio, midi);
+                        const auto before = processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
+                        const juce::Point<float> position = compact
+                            ? juce::Point<float> {1196.99f, y < 500.0f ? 375.3f : 418.3f}
+                            : juce::Point<float> {1402.5f + 66.0f, y};
+                        require(panel->getComponentAt(position.roundToInt()) == panel,
+                                "Panel control is intercepted by a child component");
+                        const auto time = juce::Time::getCurrentTime();
+                        const auto source = juce::Desktop::getInstance().getMainMouseSource();
+                        const juce::MouseEvent down {
+                            source, position, juce::ModifierKeys { juce::ModifierKeys::leftButtonModifier },
+                            1.0f, 0.0f, 0.0f, 0.0f, 0.0f, panel, panel,
+                            time, position, time, 1, false
+                        };
+                        panel->mouseDown(down);
+                        panel->mouseUp(down);
+                        for (int block = 0; block < 1000; ++block)
+                        {
+                            audio.clear();
+                            processor->processBlock(audio, midi);
+                        }
+                        require(processor->getMasterFirmwareRuntime().lcdVideoSnapshot() != before,
+                                "Public firmware mode button did not change the LCD");
                     }
-                    require(processor->getMasterFirmwareRuntime().lcdVideoSnapshot() != before,
-                            "Public firmware mode button did not change the LCD");
                 }
-                std::cout << "Public firmware mode buttons passed" << std::endl;
+                snapshot(*editor, "editor-compact-firmware");
+                panel->useDefaultPanelSkin();
+                std::cout << "Original and compact firmware mode buttons passed" << std::endl;
                 std::cout << "Performance count before SET import: "
                           << processor->getNumPrograms() << std::endl;
                 if (const auto* setup = std::getenv("WAVE_FACTORY_SET"))

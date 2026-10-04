@@ -9,7 +9,7 @@ WaveLcdComponent::WaveLcdComponent(WaveEmulationAudioProcessor& processor)
 {
     setOpaque(false);
     setInterceptsMouseClicks(false, false);
-    setTooltip("480 x 64 Waldorf Wave firmware LCD");
+    setTooltip("LCD");
     static_cast<void>(copyFirmwareDisplay());
     startTimerHz(60);
 }

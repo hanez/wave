@@ -25,3 +25,18 @@ cmake --build build --target DecodePpgWavetables
 This third-party PPG-derived data is included at the maintainer's direction.
 The GPL-3.0-or-later grant for project-authored code and artwork does not
 relicense third-party sample data or assert ownership of it.
+
+## Blank startup disk
+
+`BlankWave.img` is the maintainer-supplied `wave-init-all2.img`, a 720 KB FAT12
+floppy containing a SET with 256 identical INIT SOUND records and 256 MULTI INIT
+Performances. Each Performance enables Instrument 1 and assigns INIT SOUND.
+The INIT records match the safe defaults in Wave OS 1.700. The image contains
+no executable firmware or factory sound presets.
+
+SHA-256: `a29a5926cd89275f231bb12d00ef70bfafbd77395b89bdb5ad9660b34b3a80d1`.
+
+New instances mount their own writable copy and load the default SET. Saved
+projects restore their own bank and disk instead. Release packages also include
+the image as `Blank Wave.img`. This native instrument data is included at the
+maintainer's direction; the project GPL grant does not relicense it.

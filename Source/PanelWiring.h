@@ -16,6 +16,7 @@ struct Switch
     float y;
     int diagnosticCode;
     int matrixIndex = -1;
+    const char* name = "";
 };
 
 // OS 1.700 applies this private dispatch permutation after the panel scanner
@@ -41,15 +42,15 @@ constexpr int diagnosticCodeForMatrixIndex(int matrixIndex) noexcept
     return matrixIndex >= 0 && matrixIndex < 128 ? matrixIndex : -1;
 }
 
-constexpr Switch button(float x, float y, int diagnosticCode) noexcept
+constexpr Switch button(float x, float y, int diagnosticCode, const char* name = "") noexcept
 {
     return { x, y, diagnosticCode,
-             matrixIndexForDiagnosticCode(diagnosticCode) };
+             matrixIndexForDiagnosticCode(diagnosticCode), name };
 }
 
-constexpr Switch specialButton(float x, float y, int matrixIndex) noexcept
+constexpr Switch specialButton(float x, float y, int matrixIndex, const char* name = "") noexcept
 {
-    return { x, y, -1, matrixIndex };
+    return { x, y, -1, matrixIndex, name };
 }
 
 constexpr int physicalMatrixIndex(const Switch& item) noexcept
@@ -60,81 +61,81 @@ constexpr int physicalMatrixIndex(const Switch& item) noexcept
 }
 
 inline constexpr std::array visibleSwitches {
-    button(98.0f, 160.0f, 0),    // Oscillator 1 Octave
-    button(39.0f, 358.0f, 16),   // Oscillator Link
-    button(98.0f, 358.0f, 1),    // Oscillator 2 Octave
-    button(392.0f, 358.0f, 15),  // Wave Link
-    button(39.0f, 555.0f, 2),    // LFO Select
-    button(98.0f, 555.0f, 5),    // LFO Shape
-    button(154.0f, 551.0f, 7),   // LFO Trigger
-    button(392.0f, 555.0f, 14),  // Wave-envelope Select
-    button(786.0f, 555.0f, 20),  // Knob Mode
+    button(98.0f, 160.0f, 0, "Oscillator 1 Octave"),
+    button(39.0f, 358.0f, 16, "Oscillator Link"),
+    button(98.0f, 358.0f, 1, "Oscillator 2 Octave"),
+    button(392.0f, 358.0f, 15, "Wave Link"),
+    button(39.0f, 555.0f, 2, "LFO Select"),
+    button(98.0f, 555.0f, 5, "LFO Shape"),
+    button(154.0f, 551.0f, 7, "LFO Trigger"),
+    button(392.0f, 555.0f, 14, "Wave Envelope Select"),
+    button(786.0f, 555.0f, 20, "Knob Mode"),
 
-    button(292.173f, 120.174f, 8),   // Oscillator 1 Edit
-    button(706.173f, 120.174f, 17),  // Wave 1 Edit
-    button(785.173f, 220.174f, 86),  // Oscillator Mixer Edit
-    button(292.173f, 318.174f, 9),   // Oscillator 2 Edit
-    button(706.173f, 318.174f, 18),  // Wave 2 Edit
-    button(292.173f, 514.174f, 10),  // LFO Edit
-    button(706.173f, 514.174f, 19),  // Wave/free-envelope Edit
+    button(292.173f, 120.174f, 8, "Oscillator 1 Edit"),
+    button(706.173f, 120.174f, 17, "Wave 1 Edit"),
+    button(785.173f, 220.174f, 86, "Oscillator Mixer Edit"),
+    button(292.173f, 318.174f, 9, "Oscillator 2 Edit"),
+    button(706.173f, 318.174f, 18, "Wave 2 Edit"),
+    button(292.173f, 514.174f, 10, "LFO Edit"),
+    button(706.173f, 514.174f, 19, "Wave / Free Envelope Edit"),
 
-    Switch { 903.0f, 139.0f, 24 },   // Mute
-    Switch { 959.0f, 139.0f, 78 },   // Solo
-    Switch { 1276.5f, 139.0f, 31 },  // Group Edit
-    Switch { 903.0f, 199.0f, 22 },   // Instrument 1
-    Switch { 959.0f, 199.0f, 25 },   // Instrument 2
-    Switch { 1014.0f, 199.0f, 26 },  // Instrument 3
-    Switch { 1070.0f, 199.0f, 27 },  // Instrument 4
-    Switch { 1125.0f, 199.0f, 79 },  // Instrument 5
-    Switch { 1181.0f, 199.0f, 28 },  // Instrument 6
-    Switch { 1236.0f, 199.0f, 29 },  // Instrument 7
-    Switch { 1292.0f, 199.0f, 30 },  // Instrument 8
-    Switch { 903.0f, 553.0f, 21 },   // Page left
-    Switch { 942.0f, 553.0f, 23 },   // Page right
-    specialButton(1078.0f, 553.0f, 71), // Cancel / ESC
-    specialButton(1117.0f, 553.0f, 70), // OK / Return
-    Switch { 1253.0f, 553.0f, 69 },  // Minus
-    Switch { 1292.0f, 553.0f, 72 },  // Plus
+    Switch { 903.0f, 139.0f, 24, -1, "Mute" },
+    Switch { 959.0f, 139.0f, 78, -1, "Solo" },
+    Switch { 1276.5f, 139.0f, 31, -1, "Group Edit" },
+    Switch { 903.0f, 199.0f, 22, -1, "Instrument 1" },
+    Switch { 959.0f, 199.0f, 25, -1, "Instrument 2" },
+    Switch { 1014.0f, 199.0f, 26, -1, "Instrument 3" },
+    Switch { 1070.0f, 199.0f, 27, -1, "Instrument 4" },
+    Switch { 1125.0f, 199.0f, 79, -1, "Instrument 5" },
+    Switch { 1181.0f, 199.0f, 28, -1, "Instrument 6" },
+    Switch { 1236.0f, 199.0f, 29, -1, "Instrument 7" },
+    Switch { 1292.0f, 199.0f, 30, -1, "Instrument 8" },
+    Switch { 903.0f, 553.0f, 21, -1, "Page Left" },
+    Switch { 942.0f, 553.0f, 23, -1, "Page Right" },
+    specialButton(1078.0f, 553.0f, 71, "Cancel"),
+    specialButton(1117.0f, 553.0f, 70, "OK"),
+    Switch { 1253.0f, 553.0f, 69, -1, "Minus" },
+    Switch { 1292.0f, 553.0f, 72, -1, "Plus" },
 
-    Switch { 1402.5f, 139.0f, 38 },  // Quick Edit
-    Switch { 1402.5f, 198.0f, 33 },  // Global Edit
-    Switch { 1402.5f, 257.0f, 35 },  // Sequencer
-    Switch { 1402.5f, 316.0f, 34 },  // Option
-    Switch { 1402.5f, 376.0f, 32 },  // Wave Edit
-    Switch { 1402.5f, 435.0f, 37 },  // External Edit
-    Switch { 1402.5f, 494.0f, 36 },  // Instrument Edit
-    Switch { 1402.5f, 553.0f, 39 },  // Performance
+    Switch { 1402.5f, 139.0f, 38, -1, "Quick Edit" },
+    Switch { 1402.5f, 198.0f, 33, -1, "Global Edit" },
+    Switch { 1402.5f, 257.0f, 35, -1, "Sequencer" },
+    Switch { 1402.5f, 316.0f, 34, -1, "Option" },
+    Switch { 1402.5f, 376.0f, 32, -1, "Wave Edit" },
+    Switch { 1402.5f, 435.0f, 37, -1, "External Edit" },
+    Switch { 1402.5f, 494.0f, 36, -1, "Instrument Edit" },
+    Switch { 1402.5f, 553.0f, 39, -1, "Performance" },
 
-    Switch { 1484.0f, 237.0f, 43 },  // Filter Type
-    Switch { 1543.0f, 237.0f, 75 },  // Filter Select
-    Switch { 1859.173f, 195.174f, 60 }, // Filter Edit
-    Switch { 2152.173f, 195.174f, 67 }, // Amplifier Edit
-    Switch { 1800.173f, 354.174f, 59 }, // Filter-envelope Edit
-    Switch { 2152.173f, 354.174f, 66 }, // Amplifier-envelope Edit
-    Switch { 1956.173f, 509.174f, 61 }, // Panning Edit
+    Switch { 1484.0f, 237.0f, 43, -1, "Filter Type" },
+    Switch { 1543.0f, 237.0f, 75, -1, "Filter Select" },
+    Switch { 1859.173f, 195.174f, 60, -1, "Filter Edit" },
+    Switch { 2152.173f, 195.174f, 67, -1, "Amplifier Edit" },
+    Switch { 1800.173f, 354.174f, 59, -1, "Filter Envelope Edit" },
+    Switch { 2152.173f, 354.174f, 66, -1, "Amplifier Envelope Edit" },
+    Switch { 1956.173f, 509.174f, 61, -1, "Panning Edit" },
 
-    Switch { 1484.0f, 435.0f, 42 },  // Copy
-    Switch { 1484.0f, 494.0f, 41 },  // Compare / Undo
-    Switch { 1484.0f, 553.0f, 40 },  // Recall / Init
-    Switch { 1543.0f, 553.0f, 44 },  // Bank
-    Switch { 1602.0f, 553.0f, 45 },  // 1__
-    Switch { 1680.0f, 553.0f, 47 },  // Hold
-    Switch { 1602.0f, 435.0f, 48 },  // 7
-    Switch { 1641.0f, 435.0f, 51 },  // 8
-    Switch { 1680.0f, 435.0f, 54 },  // 9
-    Switch { 1602.0f, 475.0f, 53 },  // 4
-    Switch { 1641.0f, 475.0f, 50 },  // 5
-    Switch { 1680.0f, 475.0f, 49 },  // 6
-    Switch { 1602.0f, 513.0f, 46 },  // 1
-    Switch { 1641.0f, 513.0f, 56 },  // 2
-    Switch { 1680.0f, 513.0f, 55 },  // 3
-    Switch { 1641.0f, 553.0f, 52 },  // 0
-    Switch { 1788.0f, 492.0f, 58 },  // Disk
-    Switch { 1789.5f, 553.0f, 57 },  // Store
-    Switch { 2103.0f, 473.0f, 62 },  // Aux
-    Switch { 2162.0f, 473.0f, 64 },  // Control Mixer / Comparator
-    Switch { 2103.0f, 551.0f, 65 },  // Control Delay / S&H
-    Switch { 2162.0f, 551.0f, 63 },  // Control Shaper / Ramp
+    Switch { 1484.0f, 435.0f, 42, -1, "Copy" },
+    Switch { 1484.0f, 494.0f, 41, -1, "Compare / Undo" },
+    Switch { 1484.0f, 553.0f, 40, -1, "Recall / Init" },
+    Switch { 1543.0f, 553.0f, 44, -1, "Bank" },
+    Switch { 1602.0f, 553.0f, 45, -1, "1__" },
+    Switch { 1680.0f, 553.0f, 47, -1, "Hold" },
+    Switch { 1602.0f, 435.0f, 48, -1, "7" },
+    Switch { 1641.0f, 435.0f, 51, -1, "8" },
+    Switch { 1680.0f, 435.0f, 54, -1, "9" },
+    Switch { 1602.0f, 475.0f, 53, -1, "4" },
+    Switch { 1641.0f, 475.0f, 50, -1, "5" },
+    Switch { 1680.0f, 475.0f, 49, -1, "6" },
+    Switch { 1602.0f, 513.0f, 46, -1, "1" },
+    Switch { 1641.0f, 513.0f, 56, -1, "2" },
+    Switch { 1680.0f, 513.0f, 55, -1, "3" },
+    Switch { 1641.0f, 553.0f, 52, -1, "0" },
+    Switch { 1788.0f, 492.0f, 58, -1, "Disk" },
+    Switch { 1789.5f, 553.0f, 57, -1, "Store" },
+    Switch { 2103.0f, 473.0f, 62, -1, "Aux" },
+    Switch { 2162.0f, 473.0f, 64, -1, "Control Mixer / Comparator" },
+    Switch { 2103.0f, 551.0f, 65, -1, "Control Delay / S&H" },
+    Switch { 2162.0f, 551.0f, 63, -1, "Control Shaper / Ramp" },
 };
 
 inline const Switch* switchAt(float x, float y, float tolerance = 1.5f) noexcept
@@ -150,12 +151,12 @@ inline const Switch* switchAt(float x, float y, float tolerance = 1.5f) noexcept
 // offset-local coordinate system. Their serials are the genuine BUTTON TEST
 // values from OS 1.700.
 inline constexpr std::array keyboardPanelSwitches {
-    button(110.0f, 766.5f, 3),     // Button 1
-    button(170.0f, 766.5f, 4),     // Button 2
-    button(228.0f, 751.0f, 6),     // Glide On/Off
-    button(366.173f, 753.174f, 11),// Glide Edit
-    button(288.0f, 849.0f, 12),    // Octave Up
-    button(288.0f, 927.0f, 73),    // Octave Down
+    button(110.0f, 766.5f, 3, "Button 1"),
+    button(170.0f, 766.5f, 4, "Button 2"),
+    button(228.0f, 751.0f, 6, "Glide On/Off"),
+    button(366.173f, 753.174f, 11, "Glide Edit"),
+    button(288.0f, 849.0f, 12, "Octave Up"),
+    button(288.0f, 927.0f, 73, "Octave Down"),
 };
 
 inline const Switch* keyboardPanelSwitchAt(float x, float y,
@@ -172,20 +173,21 @@ struct KeyboardControllerButton
     float x;
     float y;
     uint8_t asciiCode;
+    const char* name;
 };
 
 // These controls live on the Wave keyboard assembly rather than the upper
 // front-panel scanner. The values are the ASCII command bytes decoded by the
 // genuine OS 1.700 keyboard dispatcher.
 inline constexpr std::array keyboardControllerButtons {
-    KeyboardControllerButton { 982.0f, 678.0f, 0x27u },  // Rewind
-    KeyboardControllerButton { 1021.0f, 678.0f, 0x0du }, // Fast forward
-    KeyboardControllerButton { 1079.5f, 678.0f, 0x4cu }, // Stop
-    KeyboardControllerButton { 1145.5f, 678.0f, 0x4du }, // Play
-    KeyboardControllerButton { 1196.0f, 678.0f, 0x50u }, // Locator In
-    KeyboardControllerButton { 1261.0f, 678.0f, 0x54u }, // Record
-    KeyboardControllerButton { 1300.0f, 678.0f, 0x51u }, // Locator Out
-    KeyboardControllerButton { 1372.0f, 678.0f, 0x52u }  // Shift
+    KeyboardControllerButton { 982.0f, 678.0f, 0x27u, "Rewind" },
+    KeyboardControllerButton { 1021.0f, 678.0f, 0x0du, "Fast Forward" },
+    KeyboardControllerButton { 1079.5f, 678.0f, 0x4cu, "Stop" },
+    KeyboardControllerButton { 1145.5f, 678.0f, 0x4du, "Play" },
+    KeyboardControllerButton { 1196.0f, 678.0f, 0x50u, "Locator In" },
+    KeyboardControllerButton { 1261.0f, 678.0f, 0x54u, "Record" },
+    KeyboardControllerButton { 1300.0f, 678.0f, 0x51u, "Locator Out" },
+    KeyboardControllerButton { 1372.0f, 678.0f, 0x52u, "Shift" }
 };
 
 inline const KeyboardControllerButton* keyboardControllerButtonAt(
@@ -195,6 +197,27 @@ inline const KeyboardControllerButton* keyboardControllerButtonAt(
         if (std::abs(item.x - x) <= tolerance && std::abs(item.y - y) <= tolerance)
             return &item;
     return nullptr;
+}
+
+// Display names share the same physical IDs as the original and compact
+// layouts, so alternate artwork cannot change a button's tooltip identity.
+inline const char* buttonName(int matrixIndex) noexcept
+{
+    for (const auto& item : visibleSwitches)
+        if (physicalMatrixIndex(item) == matrixIndex)
+            return item.name;
+    for (const auto& item : keyboardPanelSwitches)
+        if (physicalMatrixIndex(item) == matrixIndex)
+            return item.name;
+    return "";
+}
+
+inline const char* keyboardControllerButtonName(int asciiCode) noexcept
+{
+    for (const auto& item : keyboardControllerButtons)
+        if (item.asciiCode == asciiCode)
+            return item.name;
+    return "";
 }
 
 struct Pot

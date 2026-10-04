@@ -1,4 +1,5 @@
 #include "WaldorfAsic.h"
+#include "Cem3387Transfer.h"
 #if WAVE_HAS_PRIVATE_UPPER_TABLES
 #include "FactoryUpperWavetables.h"
 #endif
@@ -802,10 +803,14 @@ void ReconstructionStage::updateCoefficients() noexcept
 {
     coefficientAge = age;
     // The DAC input is rounded to one of 255 signed levels. Cache the exact
-    // nonlinear transfer at those levels instead of calling tanh at 250 kHz.
+    // weak transconductor transfer at those levels instead of calling tanh
+    // at 250 kHz. The chip's reconstruction filter is a low-distortion stage,
+    // so a unity-drive waveshaper is inappropriate at normal DAC levels.
     for (int code = -127; code <= 127; ++code)
-        saturatedLevels[static_cast<size_t>(code + 127)] = std::tanh(
-            (static_cast<float>(code) / 127.0f) * (1.0f + age * 0.16f));
+        saturatedLevels[static_cast<size_t>(code + 127)]
+            = cem3387::linearisedTransconductor(
+                static_cast<float>(code) / 127.0f,
+                cem3387::linearityScale / (1.0f + age * 0.08f)).value;
     const auto cutoff = 15400.0f;
     firstPoleCoefficient = 1.0f
                            - std::exp(-juce::MathConstants<float>::twoPi * cutoff * 0.5f

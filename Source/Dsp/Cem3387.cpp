@@ -1,6 +1,8 @@
 #include "Cem3387.h"
+#include "Cem3387Transfer.h"
 
 #include <cmath>
+#include <limits>
 #include <mutex>
 #include <unordered_map>
 
@@ -88,6 +90,7 @@ void Cem3387::setControls(float cutoffHz, float resonance, float driveDb, float 
     if (limitedAge != lastAgeInput)
     {
         age = lastAgeInput = limitedAge;
+        transconductorScale = cem3387::linearityScale / (1.0f + age * 0.08f);
         constexpr auto settlingTimeSeconds = 0.00028f;
         const auto hostSampleRate = static_cast<float>(sampleRate * 0.5);
         const auto timeConstant = settlingTimeSeconds * (1.0f + age * 0.15f);
@@ -196,8 +199,10 @@ Cem3387::StereoSample Cem3387::process(float input, float vcaLevel) noexcept
     const auto vcaCurvature = vcaCv * vcaCv * (3.0f - 2.0f * vcaCv);
     const auto componentNoise = noise * (0.0000025f + age * 0.000008f);
     const auto vcaBleed = 0.000018f * (1.0f + age * 2.0f);
-    const auto rawOutput = std::tanh(filtered * (1.0f + age * 0.08f))
-                           * (vcaCurvature + vcaBleed) + componentNoise;
+    // Headroom is already limited at the VCF output, inside its feedback loop.
+    // A second unity-drive tanh here previously added substantial distortion
+    // even with the filter fully open and the VCA below its current limit.
+    const auto rawOutput = filtered * (vcaCurvature + vcaBleed) + componentNoise;
     const auto output = rawOutput - couplingInput
                         + couplingCoefficient * couplingOutput;
     couplingInput = rawOutput;
@@ -208,14 +213,10 @@ Cem3387::StereoSample Cem3387::process(float input, float vcaLevel) noexcept
 
 float Cem3387::saturateVcfInput(float input) noexcept
 {
-    // Waldorf specifies the original input circuit as beginning to saturate
-    // at about 70% of maximum oscillator mixer output (a level setting near
-    // 75). A normalised tanh with modest drive is essentially unity for small
-    // signals, is about 8% compressed at that boundary, and remains smooth
-    // beyond it. Do not normalise its full-scale result back to one: that
-    // would add makeup gain which is absent from the passive input network.
-    constexpr auto inputDriveAtKnee = 0.75f;
-    return std::tanh(input * inputDriveAtKnee) / inputDriveAtKnee;
+    // Interpret the datasheet's ~6.5 V signal-handling figure as Vpp and
+    // assume a nominal full-scale input of 5 Vpp. This voltage mapping and
+    // shoulder shape remain estimates; digital signed wrap stays separate.
+    return cem3387::limitHeadroom(input, cem3387::inputHeadroom).value;
 }
 
 void Cem3387::updateControlVoltages(float vcaLevel) noexcept
@@ -300,9 +301,10 @@ float Cem3387::runFilter(float input) noexcept
     // one-poles give that equivalent small-signal response. Close the
     // resonance loop around their *current outputs*, not their stored
     // integrator states: the latter adds artificial feedback phase delay.
-    const auto drivenInput = saturateVcfInput(input) * resonanceInputGain * inputDrive;
+    const auto drivenInput = saturateVcfInput(input * inputDrive) * resonanceInputGain;
     const auto feedback = resonanceAmount * 4.15f;
     std::array<float, 4> outputs{};
+    auto vcfOutput = 0.0f;
     const auto evaluate = [&](float stageInput) {
         auto derivative = 1.0f;
         for (size_t stage = 0; stage < outputs.size(); ++stage)
@@ -312,18 +314,26 @@ float Cem3387::runFilter(float input) noexcept
             derivative *= coefficient;
             if (stage + 1 < outputs.size())
             {
-                stageInput = std::tanh(outputs[stage]);
-                derivative *= 1.0f - stageInput * stageInput;
+                const auto transfer = cem3387::linearisedTransconductor(
+                    outputs[stage], transconductorScale);
+                stageInput = transfer.value;
+                derivative *= transfer.derivative;
             }
         }
-        return derivative;
+        const auto transfer = cem3387::limitHeadroom(
+            outputs[3], cem3387::outputHeadroom);
+        vcfOutput = transfer.value;
+        return derivative * transfer.derivative;
     };
 
     // The scalar feedback equation is monotone, with derivative >= 1.
     // A safeguarded Newton solve handles saturation without updating any
     // state until the whole loop has been evaluated. Drive acts on the
     // incoming signal only; multiplying feedback by it changes the chip's Q.
-    auto stageInput = std::tanh(drivenInput - feedback * integrators[3]);
+    auto stageInput = cem3387::linearisedTransconductor(
+        drivenInput - feedback * cem3387::limitHeadroom(
+            integrators[3], cem3387::outputHeadroom).value,
+        transconductorScale).value;
     if (feedback == 0.0f)
     {
         // With no feedback the first evaluation is already the solution.
@@ -331,16 +341,21 @@ float Cem3387::runFilter(float input) noexcept
         (void) evaluate(stageInput);
         for (size_t stage = 0; stage < outputs.size(); ++stage)
             integrators[stage] = 2.0f * outputs[stage] - integrators[stage];
-        return outputs[3];
+        return vcfOutput;
     }
-    auto lower = -1.0f;
-    auto upper = 1.0f;
+    auto lower = -transconductorScale;
+    auto upper = transconductorScale;
     for (int iteration = 0; iteration < 8; ++iteration)
     {
         const auto derivative = evaluate(stageInput);
-        const auto feedbackInput = std::tanh(drivenInput - feedback * outputs[3]);
-        const auto residual = stageInput - feedbackInput;
-        if (std::abs(residual) < 1.0e-7f * std::abs(stageInput) + 1.0e-12f
+        const auto feedbackInput = cem3387::linearisedTransconductor(
+            drivenInput - feedback * vcfOutput, transconductorScale);
+        const auto residual = stageInput - feedbackInput.value;
+        // Four float stages and the feedback subtraction have several ULPs
+        // of rounding noise. Chasing it adds Newton iterations without
+        // improving the signal, especially in the nearly linear regime.
+        constexpr auto relativeTolerance = 4.0f * std::numeric_limits<float>::epsilon();
+        if (std::abs(residual) < relativeTolerance * std::abs(stageInput) + 1.0e-12f
             || iteration == 7)
             break;
         if (residual < 0.0f)
@@ -348,14 +363,14 @@ float Cem3387::runFilter(float input) noexcept
         else
             upper = stageInput;
         const auto next = stageInput - residual
-            / (1.0f + feedback * (1.0f - feedbackInput * feedbackInput) * derivative);
+            / (1.0f + feedback * feedbackInput.derivative * derivative);
         if (next == stageInput)
             break;
         stageInput = next > lower && next < upper ? next : 0.5f * (lower + upper);
     }
     for (size_t stage = 0; stage < outputs.size(); ++stage)
         integrators[stage] = 2.0f * outputs[stage] - integrators[stage];
-    return outputs[3];
+    return vcfOutput;
 }
 
 float Cem3387::quantiseCv(float normalised) noexcept

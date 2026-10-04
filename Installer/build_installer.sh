@@ -7,7 +7,7 @@
 # are stored in this script.
 #
 # Common overrides:
-#   VERSION=0.1.12
+#   VERSION=0.1.13
 #   BUILD_JOBS=8
 #   SKIP_PLUGIN_BUILD=1
 #   SKIP_WRAP=1
@@ -45,7 +45,7 @@ PACKAGES_DIR="$WORK_DIR/packages"
 RESOURCES_DIR="$WORK_DIR/resources"
 DMG_STAGING_DIR="$WORK_DIR/dmg"
 
-VERSION="${VERSION:-0.1.12}"
+VERSION="${VERSION:-0.1.13}"
 TEAM_ID="${TEAM_ID:-}"
 BUILD_CONFIG="${BUILD_CONFIG:-Release}"
 CMAKE_BUILD_TYPE="${CMAKE_BUILD_TYPE:-$BUILD_CONFIG}"
@@ -279,6 +279,8 @@ stage_plugins() {
 
   local notices="$STAGING_DIR/standalone/Library/Application Support/DJW/Wave Emulation"
   mkdir -p "$notices"
+  /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/data/BlankWave.img" \
+    "$notices/Blank Wave.img"
   for file in LICENSE THIRD_PARTY_NOTICES.md; do
     /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/$file" "$notices/$file"
   done
@@ -287,7 +289,7 @@ stage_plugins() {
 Wave Emulation $VERSION — macOS universal arm64/x86_64
 Source repository: https://github.com/mo0kid/wave
 Corresponding source archive: Wave-Emulation-$VERSION-Source.zip
-Instrument firmware and disk images are supplied separately by the user.
+The default Blank Wave.img is included. Instrument firmware and other sound disks are supplied by the user.
 BUILD
 }
 
@@ -449,6 +451,8 @@ build_dmg() {
   mkdir -p "$DMG_STAGING_DIR"
   /usr/bin/ditto --noextattr --norsrc "$FINAL_PKG" \
     "$DMG_STAGING_DIR/$FINAL_PKG_NAME"
+  /usr/bin/ditto --noextattr --norsrc "$PROJECT_ROOT/data/BlankWave.img" \
+    "$DMG_STAGING_DIR/Blank Wave.img"
   /usr/bin/ditto --noextattr --norsrc \
     "$STAGING_DIR/standalone/Library/Application Support/DJW/Wave Emulation" \
     "$DMG_STAGING_DIR/License and Source Information"

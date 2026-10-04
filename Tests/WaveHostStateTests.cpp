@@ -67,6 +67,26 @@ int main(int argc, char** argv)
                 return processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
             };
             processor->setStateInformation(state.getData(), static_cast<int>(state.getSize()));
+            if (std::getenv("WAVE_TEST_STARTUP_RECALL") != nullptr)
+            {
+                renderAndCheck();
+                const auto capture = [&] {
+                    std::array<uint8_t, 256> sound {};
+                    for (size_t i = 0; i < sound.size(); ++i)
+                        sound[i] = processor->getMasterFirmwareRuntime()
+                            .currentSoundRecordByte(static_cast<uint32_t>(i));
+                    return sound;
+                };
+                const auto initial = capture();
+                processor->stepFactoryPerformance(1);
+                renderAndCheck();
+                processor->stepFactoryPerformance(-1);
+                renderAndCheck();
+                if (initial != capture())
+                    throw std::runtime_error("Startup Sound differs from its Performance recall");
+                std::cout << "Startup and returned Performance have identical native Sound records\n";
+                return 0;
+            }
             const auto referenceScreen = renderAndCheck();
             if (std::getenv("WAVE_TEST_PATCH_STEPS") != nullptr)
             {
@@ -189,15 +209,90 @@ int main(int argc, char** argv)
         {
             if (!processor->hasMountedDiskImage()
                 || processor->getMountedDiskImageFile().getFileName() != "Blank Wave.img"
-                || processor->getNumPrograms() != 1)
-                throw std::runtime_error("Fresh instance did not start with an empty bank and blank disk");
+                || processor->getNumPrograms() != 256
+                || processor->getProgramName(0) != "MULTI INIT"
+                || processor->getProgramName(255) != "MULTI INIT"
+                || processor->getSelectedPerformanceInstrument() != 0
+                || !processor->isPerformanceInstrumentActive(0))
+                throw std::runtime_error("Fresh instance did not load the default INIT bank and Instrument");
+            for (int instrument = 1; instrument < 8; ++instrument)
+                if (processor->isPerformanceInstrumentActive(instrument))
+                    throw std::runtime_error("Default INIT bank enabled an unintended Instrument");
+            wave::firmware::DosFloppyImage::SetupFile startupSetup;
+            if (!processor->mountedDiskImageIsWritable()
+                || wave::firmware::DosFloppyImage::readWaveSetup(
+                       processor->getMountedDiskImageFile(), startupSetup).failed())
+                throw std::runtime_error("Default mounted disk did not contain a writable SET");
             if (directory != nullptr
                 && !processor->loadFirmware(juce::File(directory)).hasBothImages())
                 throw std::runtime_error("Unable to load the supplied test firmware");
             processor->prepareToPlay(48000.0, 128);
         }
+        if (first->getMountedDiskImageFile() == second->getMountedDiskImageFile())
+            throw std::runtime_error("Fresh instances share the same writable startup disk");
         if (directory != nullptr)
         {
+            juce::AudioBuffer<float> startupAudio(2, 128);
+            const auto renderStartup = [&] {
+                for (int block = 0; block < 1000; ++block)
+                {
+                    juce::MidiBuffer midi;
+                    first->processBlock(startupAudio, midi);
+                }
+            };
+            renderStartup();
+            const auto& runtime = first->getMasterFirmwareRuntime();
+            if (runtime.currentPerformanceId() != 0
+                || runtime.currentPerformanceInstrument() != 0
+                || first->getPanelSelectedMode() != 39
+                || first->isPanelModeDisplayTransitionActive())
+                throw std::runtime_error("Default SET did not finish on its editable Performance page");
+            const auto cutoffBefore = runtime.currentSoundRecordByte(79);
+            first->setPanelPotValue(wave::parameters::cutoff, 0.9f);
+            renderStartup();
+            first->setPanelPotValue(wave::parameters::cutoff, 0.1f);
+            renderStartup();
+            if (runtime.currentSoundRecordByte(79) == cutoffBefore)
+                throw std::runtime_error("Startup knob movement did not edit the INIT Sound");
+            juce::MidiBuffer startupNote;
+            startupNote.addEvent(juce::MidiMessage::noteOn(1, 60, 0.8f), 0);
+            first->processBlock(startupAudio, startupNote);
+            if (first->getActiveVoiceCount() == 0)
+                throw std::runtime_error("Default INIT Instrument could not play a note");
+            juce::MidiBuffer releaseStartupNote;
+            releaseStartupNote.addEvent(juce::MidiMessage::allSoundOff(1), 0);
+            first->processBlock(startupAudio, releaseStartupNote);
+
+            // A nonzero wavetable makes phantom startup encoder steps audible.
+            // Preserve an Instrument-local edit through a fresh instance.
+            auto& editableRuntime = const_cast<wave::firmware::MasterFirmwareRuntime&>(runtime);
+            if (!editableRuntime.writeCurrentSoundRecordByte(25, 42))
+                throw std::runtime_error("Cannot install startup wavetable regression edit");
+            renderStartup();
+            juce::MemoryBlock startupState;
+            first->getStateInformation(startupState);
+            juce::TemporaryFile startupPreference(".txt");
+            auto startupReopened = std::make_unique<WaveEmulationAudioProcessor>(startupPreference.getFile());
+            startupReopened->prepareToPlay(96000.0, 512);
+            startupReopened->setStateInformation(startupState.getData(), static_cast<int>(startupState.getSize()));
+            juce::AudioBuffer<float> recalledAudio(2, 512);
+            const auto renderRecalled = [&] {
+                for (int block = 0; block < 1000; ++block)
+                {
+                    juce::MidiBuffer midi;
+                    startupReopened->processBlock(recalledAudio, midi);
+                }
+            };
+            renderRecalled();
+            auto& recalledRuntime = const_cast<wave::firmware::MasterFirmwareRuntime&>(
+                startupReopened->getMasterFirmwareRuntime());
+            if (recalledRuntime.currentSoundRecordByte(25) != 42)
+                throw std::runtime_error("Fresh project recall changed the saved wavetable selector");
+            startupReopened->turnPanelEncoder(8, -1);
+            renderRecalled();
+            if (recalledRuntime.currentSoundRecordByte(25) != 41)
+                throw std::runtime_error("A genuine wavetable decrement was undone after startup");
+
             const auto remembered = preference.getFile().loadFileAsString();
             juce::TemporaryFile emptyFolder(".dir");
             emptyFolder.getFile().createDirectory();

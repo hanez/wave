@@ -27,14 +27,16 @@ git commit -m "Initial public source release"
 
 The exporter includes current working-tree edits and approved source directories.
 It excludes the old logo artwork, factory-table payload header, firmware,
-Wave sound libraries, ROM archives, disk images, installers, build directories,
+Wave sound libraries, ROM archives, other disk images, installers, build directories,
 and all existing Git history. It refuses to overwrite a destination.
 Review new source files before exporting; a file allowlist is not a substitute
 for reviewing newly added data or secrets.
 
 Public builds default to `WAVE_EMBED_PRIVATE_ASSETS=OFF` and
 `WAVE_SIGN_RELEASE_ARTIFACTS=OFF`, even if private assets are present locally.
-The approved decoded PPG sample bank in `data/` is included.
+The approved decoded PPG sample bank and maintainer-supplied blank INIT disk
+in `data/` are included. The blank disk is embedded for new-instance startup
+and included separately in release packages.
 Loading the authenticated Wave OS 1.700 firmware supplied by the user generates
 all 64 original factory tables by executing the firmware's own routines. Before
 Wave firmware is loaded, the public build uses its PPG/procedural fallback.

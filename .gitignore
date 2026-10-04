@@ -12,6 +12,7 @@
 *.pkg
 *.rom
 *.img
+!/data/BlankWave.img
 *.zip
 *.log
 *.jucer

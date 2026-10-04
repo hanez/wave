@@ -102,14 +102,20 @@ void MasterFirmwareRuntime::Acia6850::pushReceive(uint8_t value) noexcept
 bool MasterFirmwareRuntime::loadAndStart(const juce::MemoryBlock& masterImage)
 {
     loaded = false;
+    pendingPanelEventCount = 0;
     if (sharedMemory == &ownedSharedMemory)
         sharedMemory->clear();
     else
         sharedMemory->mainRam.fill(0);
     for (auto& byte : lcdVideoRam)
         byte.store(0, std::memory_order_relaxed);
-    for (auto& word : panelSwitchWords)
-        word.store(0xffffu, std::memory_order_relaxed);
+    // The first six banks are active-low switches. The last two are
+    // quadrature encoder inputs, whose idle phase must match the firmware's
+    // zero-initialised previous-phase words at $5520C. Starting those banks
+    // high makes the scanner generate a -1 step for every encoder at boot.
+    for (size_t bank = 0; bank < panelSwitchWords.size(); ++bank)
+        panelSwitchWords[bank].store(bank < 6 ? 0xffffu : 0x0000u,
+                                    std::memory_order_relaxed);
     for (auto& cycle : panelReleaseCycles)
         cycle.store(0, std::memory_order_relaxed);
     for (auto& pending : panelReleasePending)
@@ -349,7 +355,34 @@ bool MasterFirmwareRuntime::redrawCurrentScreenWithFirmware()
         displayCpu.execute(*this, 50000);
     displayRefreshActive = false;
     std::copy(savedStack.begin(), savedStack.end(), ram.begin() + temporaryStackBottom);
+    if (displayRefreshComplete)
+        prepareNumericPanelInput();
     return displayRefreshComplete;
+}
+
+void MasterFirmwareRuntime::prepareNumericPanelInput() noexcept
+{
+    if (!loaded || sharedMemory == nullptr)
+        return;
+    auto& ram = sharedMemory->mainRam;
+    const auto readLong = [&ram](uint32_t address) {
+        return bigEndian32(ram.data() + address);
+    };
+    if (ram[0x56f4au] != 0 && readLong(0x56bb0u) == 0x0189c4u
+        && readLong(0x57030u) == 0x01ce84u
+        && readLong(0x56728u) == 0x01ce84u
+        && readLong(0x56738u) == 0x01ce84u)
+    {
+        // Performance has restored the OS's inert Manager and response
+        // callbacks, but a preceding disk workspace can leave its active flag
+        // behind. $1CBDC then sends completed numbers to the inert callback.
+        // Retire that orphaned ownership and any entry made into it. Genuine
+        // numeric entry and requesters install other callbacks and stay intact.
+        ram[0x56f4au] = 0;
+        ram[0x58f73u] = 0;
+        ram[0x58f74u] = 0;
+        ram[0x58f76u] = 0;
+    }
 }
 
 bool MasterFirmwareRuntime::navigatePageWithFirmware(bool forwards) noexcept
@@ -593,6 +626,20 @@ bool MasterFirmwareRuntime::runOs1700InitialisationFileLoad()
 bool MasterFirmwareRuntime::interceptInstruction(M68000& activeCpu,
                                                  uint32_t programCounter) noexcept
 {
+    // Both switch and ADC scanners hold their producer cursor in A5 while
+    // running. Appending while the CPU is paused inside a scanner lets its
+    // final stale cursor overwrite the host event. Deliver only at the native
+    // consumer entry, after the producer has committed its cursor.
+    if (programCounter == 0x00468eu && pendingPanelEventCount != 0)
+    {
+        size_t delivered = 0;
+        while (delivered < pendingPanelEventCount
+               && appendPanelEventToFirmwareRing(pendingPanelEvents[delivered]))
+            ++delivered;
+        for (size_t i = delivered; i < pendingPanelEventCount; ++i)
+            pendingPanelEvents[i - delivered] = pendingPanelEvents[i];
+        pendingPanelEventCount -= delivered;
+    }
     constexpr uint32_t displayRefreshReturnSentinel = 0x0f0000u;
     // The MIDI parser copies the packet to $514D0 before dispatch, but A2
     // retains its input-ring cursor just past the consumed data byte. Only
@@ -1514,8 +1561,15 @@ void MasterFirmwareRuntime::setPerformanceFaderValue(int faderIndex,
 void MasterFirmwareRuntime::pushPanelEvent(uint8_t status, uint8_t data1,
                                            uint8_t data2) noexcept
 {
+    if (loaded && pendingPanelEventCount < pendingPanelEvents.size())
+        pendingPanelEvents[pendingPanelEventCount++] = { status, data1, data2 };
+}
+
+bool MasterFirmwareRuntime::appendPanelEventToFirmwareRing(
+    const std::array<uint8_t, 3>& event) noexcept
+{
     if (sharedMemory == nullptr)
-        return;
+        return false;
 
     // The panel scanner writes fixed three-byte records into this genuine OS
     // ring. $468E consumes them as status, control number and value/delta.
@@ -1540,7 +1594,7 @@ void MasterFirmwareRuntime::pushPanelEvent(uint8_t status, uint8_t data1,
     const auto consumer = readPointer(readPointerAddress);
     if (producer < ringBegin || producer >= ringEnd
         || consumer < ringBegin || consumer >= ringEnd)
-        return;
+        return false;
 
     const auto advance = [](uint32_t pointer) {
         ++pointer;
@@ -1551,20 +1605,33 @@ void MasterFirmwareRuntime::pushPanelEvent(uint8_t status, uint8_t data1,
     {
         end = advance(end);
         if (end == consumer)
-            return;
+            return false;
     }
-    for (const auto value : { status, data1, data2 })
+    for (const auto value : event)
     {
         ram[producer] = value;
         producer = advance(producer);
     }
     writePointer(writePointerAddress, producer);
+    return true;
 }
 
 int MasterFirmwareRuntime::discardPendingPanelButtonEvents(int buttonId) noexcept
 {
     if (sharedMemory == nullptr || buttonId < 0 || buttonId >= 128)
         return 0;
+
+    int queuedRemoved = 0;
+    size_t retainedCount = 0;
+    for (size_t i = 0; i < pendingPanelEventCount; ++i)
+    {
+        const auto& event = pendingPanelEvents[i];
+        if (event[0] == 0x80u && event[1] == static_cast<uint8_t>(buttonId))
+            ++queuedRemoved;
+        else
+            pendingPanelEvents[retainedCount++] = event;
+    }
+    pendingPanelEventCount = retainedCount;
 
     constexpr uint32_t readPointerAddress = 0x551f0u;
     constexpr uint32_t writePointerAddress = 0x551f4u;
@@ -1592,11 +1659,11 @@ int MasterFirmwareRuntime::discardPendingPanelButtonEvents(int buttonId) noexcep
     const auto producer = readPointer(writePointerAddress);
     if (consumer < ringBegin || consumer >= ringEnd
         || producer < ringBegin || producer >= ringEnd)
-        return 0;
+        return queuedRemoved;
 
     std::array<uint8_t, ringEnd - ringBegin> retained{};
     auto retainedBytes = size_t{};
-    auto removed = 0;
+    auto removed = queuedRemoved;
     auto cursor = consumer;
     while (cursor != producer)
     {
@@ -1604,11 +1671,11 @@ int MasterFirmwareRuntime::discardPendingPanelButtonEvents(int buttonId) noexcep
         for (auto& byte : event)
         {
             if (cursor == producer)
-                return 0; // The controller ring must contain complete records.
+                return queuedRemoved; // The controller ring must contain complete records.
             byte = ram[cursor];
             cursor = advance(cursor);
         }
-        if ((event[0] & 0x80u) != 0u
+        if (event[0] == 0x80u
             && event[1] == static_cast<uint8_t>(buttonId))
         {
             ++removed;
@@ -1631,6 +1698,9 @@ int MasterFirmwareRuntime::discardPendingPanelButtonEvents(int buttonId) noexcep
 bool MasterFirmwareRuntime::panelEventPending(uint8_t status, uint8_t data1,
                                                uint8_t data2) const noexcept
 {
+    for (size_t i = 0; i < pendingPanelEventCount; ++i)
+        if (pendingPanelEvents[i] == std::array<uint8_t, 3> { status, data1, data2 })
+            return true;
     if (sharedMemory == nullptr)
         return false;
     constexpr uint32_t readPointerAddress = 0x551f0u;

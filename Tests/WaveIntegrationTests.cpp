@@ -2259,6 +2259,27 @@ void testDiskSetSerialSelectionUpdatesDsp(bool checkColdStart = true,
     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
     require(processor->getCurrentProgram() == 0, "DSP recall did not reach the message thread");
 #endif
+    clickAndSettle(52); // 0.
+    clickAndSettle(56); // 2: A002, using the keypad after importing the bank.
+    require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 1,
+            "Keypad did not select A002 after SET import");
+    require(processor->getMasterFirmwareRuntime().localByte(0x56f4au) == 0,
+            "SET import left the Manager owning keypad input");
+#if JUCE_MAC
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+    // Only the native load transfers and activates the mounted SET. The
+    // synthetic Option fixture leaves it as a candidate until host recall.
+    if (nativeDiskLoad)
+        require(processor->getCurrentProgram() == 1,
+                "Keypad selection after SET import did not reach the DSP");
+#endif
+    clickAndSettle(52); // 0.
+    clickAndSettle(46); // 1: restore A001 for the increment checks below.
+    require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 0,
+            "Keypad did not return to A001 after SET import");
+#if JUCE_MAC
+    CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.01, false);
+#endif
     constexpr uint32_t storedSoundBank = 0x18000u;
     constexpr uint32_t bankBSound1Name = storedSoundBank + 128u * 256u + 240u;
     require(processor->getMasterFirmwareRuntime().sharedProgramByte(
@@ -2595,7 +2616,9 @@ void testPerformanceInstrumentSelection()
     require(restoredFilterMod != nullptr
                 && std::abs(restoredFilterMod->load()
                             - confirmedOriginalFilterMod) < 0.002f,
-            "A modulation knob edit was lost when switching away and back");
+            ("A modulation knob edit was lost when switching away and back: "
+             + std::to_string(restoredFilterMod->load()) + " vs "
+             + std::to_string(confirmedOriginalFilterMod)).c_str());
     require(processor->getMasterFirmwareRuntime().panelAnalogByte(62)
                 == physicalResonance,
             "Returning to an Instrument moved a physical potentiometer");
@@ -4169,7 +4192,8 @@ void testWavetableSelectorSurvivesSoundStore(int selector = 17)
         processor->turnPanelEncoder(8, selector - static_cast<int>(runtime.currentSoundRecordByte(25)));
         process(128);
         require(runtime.currentSoundRecordByte(25) == selector,
-                "The native Data dial did not select the requested wavetable");
+                ("The native Data dial selected " + std::to_string(runtime.currentSoundRecordByte(25))
+                    + " instead of wavetable " + std::to_string(selector)).c_str());
     }
     const auto editedSelector = renderedSelector(*processor);
     require(editedSelector == (selector < 0 ? 95 : selector),
@@ -4701,7 +4725,18 @@ void testPlusTapAfterDataDialAdvancesOneStep()
 
 void testWaveLinkUsesFirmwareLatch()
 {
-    auto processor = makeFactoryProcessor();
+    // Exercise a remembered firmware path as well as embedded factory boot;
+    // a redundant startup recall must not swallow the first Link click.
+    juce::TemporaryFile preference(".txt");
+    const auto firmwareDirectory = juce::File(__FILE__).getParentDirectory()
+                                       .getParentDirectory()
+                                       .getChildFile("Firmware/wave_sys1_700");
+    require(firmwareDirectory.getChildFile("w2sys.bin").existsAsFile()
+                && firmwareDirectory.getChildFile("wdv.sys").existsAsFile(),
+            "Remembered firmware regression fixture is missing");
+    require(preference.getFile().replaceWithText(firmwareDirectory.getFullPathName()),
+            "Could not prepare remembered firmware preference");
+    auto processor = makeFactoryProcessor(preference.getFile());
     processor->prepareToPlay(48000.0, 512);
     juce::AudioBuffer<float> audio(2, 512);
     const auto process = [&](int blocks) {
@@ -6499,6 +6534,12 @@ int main(int argc, char** argv)
             testStoreModeButtonExitAfterSave(true, 33);
             testRepeatedSoundStoreCursor();
             std::cout << "Store mode exit regression passed\n";
+            return 0;
+        }
+        if (argc > 1 && std::string_view(argv[1]) == "--instrument-selection")
+        {
+            testPerformanceInstrumentSelection();
+            std::cout << "Instrument selection regression passed\n";
             return 0;
         }
         if (argc > 1 && std::string_view(argv[1]) == "--stored-octave")

@@ -68,6 +68,7 @@ if(WAVE_HAS_PRIVATE_ROMS)
             juce::juce_recommended_warning_flags)
     add_test(NAME WaveEditorTests COMMAND WaveEditorTests)
     add_test(NAME WaveKeyboardButtonEditorTests COMMAND WaveEditorTests --keyboard-buttons)
+    add_test(NAME WaveNumericKeypadEditorTests COMMAND WaveEditorTests --keypad)
 
     add_executable(WavePerformanceBenchmark WavePerformanceBenchmark.cpp)
     target_include_directories(WavePerformanceBenchmark PRIVATE ${CMAKE_SOURCE_DIR}/Source)
@@ -84,7 +85,7 @@ if(WAVE_HAS_PRIVATE_ROMS)
     set_tests_properties(WaveIntegrationTests WaveFactoryWavetableTests WaveLcdBrowsingTests WaveWtbDiskImageTests WaveDamagedUserWavetableTests WaveVoiceAllocationTests WaveDiskTotalRecallTests WaveDiskWriteThroughTests WaveDamagedDiskLcdTests WavePerformanceSelectionTests WaveStoreModeLampTests WaveStoredWavetableTests WaveKeyboardButtonTests WaveReopenBankTests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         ENVIRONMENT "WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
-    set_tests_properties(WaveEditorTests WaveKeyboardButtonEditorTests PROPERTIES
+    set_tests_properties(WaveEditorTests WaveKeyboardButtonEditorTests WaveNumericKeypadEditorTests PROPERTIES
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         ENVIRONMENT "WAVE_FACTORY_SET=${CMAKE_SOURCE_DIR}/wave.set")
 endif()

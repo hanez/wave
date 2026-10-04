@@ -21,6 +21,7 @@ public:
     [[nodiscard]] juce::String tooltipAt(juce::Point<float> editorPoint) const;
     juce::Result loadPanelSkin(const juce::File& file, bool remember = true);
     void useDefaultPanelSkin();
+    void useCompactPanelSkin();
 
     void paint(juce::Graphics&) override;
     void resized() override;
@@ -59,6 +60,7 @@ private:
         int faderIndex = -1;
         float faderTrackTop = 0.0f;
         float faderTrackBottom = 0.0f;
+        float artworkScale = 1.0f;
     };
 
     struct PanelLed
@@ -66,6 +68,7 @@ private:
         juce::Point<float> centre;
         int redSerialCode = -1;
         int greenSerialCode = -1;
+        float size = 6.0f;
     };
 
     ParameterKnob& addKnob(const juce::String& parameterId, const juce::String& displayName,
@@ -75,6 +78,10 @@ private:
     void updateLfoKnobBindings();
     void updateWaveEnvelopeKnobBindings();
     void initialisePanelRegions(const juce::XmlElement& svg);
+    void initialiseCompactPanelRegions(const juce::XmlElement& svg);
+    void applyPanelLayout(bool compact, float scale);
+    [[nodiscard]] float panelDesignWidth() const noexcept;
+    [[nodiscard]] float panelDesignHeight() const noexcept;
     void synchroniseFaderValues() noexcept;
     void rebuildPanelImage();
     bool handlePerformanceControl(juce::Point<float> designPoint);
@@ -157,6 +164,7 @@ private:
     std::array<bool, 13> keyboardNotes{};
     bool computerShiftDown = false;
     bool keyboardVisible = true;
+    bool compactSkin = false;
     bool performanceMode = true;
     int selectedLfo = 0;
     int waveEnvelopePage = 0;

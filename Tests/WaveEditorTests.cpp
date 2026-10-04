@@ -13,8 +13,12 @@ namespace
 {
 std::unique_ptr<WaveEmulationAudioProcessor> makeFactoryProcessor(const juce::File& preference = {})
 {
+    // Layout tests must not inherit the developer's remembered panel skin or
+    // firmware folder. Explicit test preferences still exercise persistence.
+    juce::TemporaryFile isolatedPreference(".txt");
     return std::make_unique<WaveEmulationAudioProcessor>(
-        preference, WaveEmulationAudioProcessor::InitialBank::embeddedFactory);
+        preference == juce::File{} ? isolatedPreference.getFile() : preference,
+        WaveEmulationAudioProcessor::InitialBank::embeddedFactory);
 }
 
 void require(bool condition, const char* message)
@@ -949,6 +953,21 @@ void testEveryLowerControllerButtonReachesItsSerialInput()
                 && !processor->getPanelLed(58)
                 && !processor->getPanelLed(27),
             "The visible lower Octave Down did not reach firmware serial 73");
+
+    editor.useCompactPanelSkin();
+    require(editor.tooltipAt({ 639.5f, 707.5f }) == "Octave Down"
+                && editor.tooltipAt({ 714.5f, 707.5f }) == "Octave Up",
+            "Compact octave tooltips do not match the revised SVG");
+    clickPanelControl(editor, *processor, audio, 639.5f - offset, 707.5f, 16);
+    processBlocks(*processor, audio, 48);
+    require(processor->getKeyboardOctaveShift() == -1
+                && processor->getPanelLed(27) && !processor->getPanelLed(58),
+            "Compact left Octave Down did not lower the keyboard octave");
+    clickPanelControl(editor, *processor, audio, 714.5f - offset, 707.5f, 16);
+    processBlocks(*processor, audio, 48);
+    require(processor->getKeyboardOctaveShift() == 0
+                && !processor->getPanelLed(27) && !processor->getPanelLed(58),
+            "Compact right Octave Up did not restore the keyboard octave");
 }
 
 void testWaveEnvelopeSelectorRemainsStable()
@@ -1332,6 +1351,69 @@ void testModifierEditButtonsOpenFirmwarePages()
     }
 }
 
+void testNumericKeypadUi()
+{
+    for (int skin = 0; skin < 3; ++skin)
+    {
+        juce::TemporaryFile preference(".txt");
+        auto processor = std::make_unique<WaveEmulationAudioProcessor>(preference.getFile());
+        processor->prepareToPlay(48000.0, 512);
+        juce::AudioBuffer<float> audio(2, 512);
+        processBlocks(*processor, audio, 160);
+        WaveEmulationAudioProcessorEditor editor(*processor);
+        editor.setVisible(true);
+        const auto compact = skin == 1;
+        if (compact)
+            editor.useCompactPanelSkin();
+        else if (skin == 2)
+            require(editor.loadPanelSkin(juce::File::getCurrentWorkingDirectory()
+                        .getChildFile("media/WaldorfWaveUI_NOLOGO.svg")).wasOk(),
+                    "Could not load the alternative keypad test skin");
+        const auto clickDigit = [&](float originalX, float originalY, float compactX, float compactY) {
+            clickPanelControl(editor, *processor, audio,
+                              compact ? compactX - 66.0f : originalX,
+                              compact ? compactY : originalY, 0);
+            processBlocks(*processor, audio, 64);
+        };
+        const auto before = processor->getMasterFirmwareRuntime().lcdVideoSnapshot();
+        clickDigit(1641.0f, 553.0f, 676.5f, 439.5f); // 0.
+        require(processor->getMasterFirmwareRuntime().lcdVideoSnapshot() != before,
+                "First keypad digit did not open number entry on the LCD");
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2: A002.
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 1,
+                "Keypad did not select A002");
+        // Exercise every digit through its painted hit area.
+        for (const auto& digit : std::array<std::array<float, 4>, 6> {{
+                 {1680.0f,513.0f,714.5f,401.5f}, // 3.
+                 {1602.0f,475.0f,638.5f,363.5f}, // 4: A034.
+                 {1641.0f,475.0f,676.5f,363.5f}, // 5.
+                 {1680.0f,475.0f,714.5f,363.5f}, // 6: A056.
+                 {1602.0f,435.0f,638.5f,325.5f}, // 7.
+                 {1641.0f,435.0f,676.5f,325.5f}  // 8: A078.
+             }})
+            clickDigit(digit[0], digit[1], digit[2], digit[3]);
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 77,
+                "Keypad digit sequence did not select A078");
+        clickDigit(1641.0f, 553.0f, 676.5f, 439.5f); // 0.
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2: restore A002.
+        clickDigit(1602.0f, 553.0f, 638.5f, 439.5f); // 1__: hundreds prefix.
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2.
+        clickDigit(1680.0f, 435.0f, 714.5f, 325.5f); // 9: A129 is invalid.
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 1,
+                "Invalid keypad number changed Performance");
+        clickDigit(1602.0f, 553.0f, 638.5f, 439.5f); // 1__.
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2.
+        clickDigit(1641.0f, 435.0f, 676.5f, 325.5f); // 8: A128.
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 127,
+                "Keypad hundreds prefix did not select A128");
+        clickDigit(1543.0f, 553.0f, 638.5f, 583.5f); // Bank B.
+        clickDigit(1641.0f, 553.0f, 676.5f, 439.5f); // 0.
+        clickDigit(1641.0f, 513.0f, 676.5f, 401.5f); // 2: B002.
+        require(processor->getMasterFirmwareRuntime().currentPerformanceId() == 129,
+                "Keypad did not select a Performance in Bank B");
+    }
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -1339,6 +1421,12 @@ int main(int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI initialiseGui;
     try
     {
+        if (argc == 2 && std::string_view(argv[1]) == "--keypad")
+        {
+            testNumericKeypadUi();
+            std::cout << "Numeric keypad UI checks passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--keyboard-buttons")
         {
             testEveryLowerControllerButtonReachesItsSerialInput();

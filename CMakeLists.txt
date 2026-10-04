@@ -6,7 +6,7 @@ if(CMAKE_HOST_APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
         "Minimum supported macOS version" FORCE)
 endif()
 
-project(WaveEmulationSample VERSION 0.1.12 LANGUAGES C CXX)
+project(WaveEmulationSample VERSION 0.1.13 LANGUAGES C CXX)
 
 include(FetchContent)
 
@@ -92,7 +92,9 @@ target_compile_definitions(WaveM68k PRIVATE
     M68K_INSTRUCTION_HOOK=1)
 
 set(WAVE_ASSET_SOURCES
+    data/BlankWave.img
     media/WaldorfWaveUI_NOLOGO.svg
+    media/WaldorfWaveUI_Compact.svg
     media/Slider.svg
     media/Knob1.svg
     media/Knob_red1.svg
@@ -147,6 +149,7 @@ set(WAVE_CORE_SOURCES
     Source/Dsp/DspMath.h
     Source/Dsp/Cem3387.cpp
     Source/Dsp/Cem3387.h
+    Source/Dsp/Cem3387Transfer.h
     Source/Dsp/ReferenceComparator.cpp
     Source/Dsp/ReferenceComparator.h
     Source/Dsp/PpgWaveRom.cpp
@@ -219,6 +222,9 @@ target_include_directories(DecodePpgWavetables PRIVATE Source)
 
 add_executable(CreateWaveDisk EXCLUDE_FROM_ALL Tools/CreateWaveDisk.cpp)
 target_link_libraries(CreateWaveDisk PRIVATE WaveCore juce::juce_recommended_config_flags)
+
+add_executable(ProbeWaveFilter EXCLUDE_FROM_ALL Tools/ProbeWaveFilter.cpp)
+target_link_libraries(ProbeWaveFilter PRIVATE WaveCore juce::juce_recommended_config_flags)
 
 add_executable(DecodeWaveFactoryWavetables EXCLUDE_FROM_ALL Tools/DecodeWaveFactoryWavetables.cpp)
 target_link_libraries(DecodeWaveFactoryWavetables PRIVATE WaveCore juce::juce_recommended_config_flags)

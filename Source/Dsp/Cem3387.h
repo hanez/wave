@@ -24,8 +24,8 @@ public:
     void setCutoffCalibrationCode(uint16_t code) noexcept;
     [[nodiscard]] StereoSample process(float input, float vcaLevel) noexcept;
 
-    // The Wave/Microwave voice input begins compressing at roughly 70% of
-    // maximum mixer output. This is separate from the ES2 digital mix wrap.
+    // Estimated input headroom, assuming full scale = 5 Vpp at the chip.
+    // This behavioral voltage mapping is separate from ES2 digital mix wrap.
     [[nodiscard]] static float saturateVcfInput(float input) noexcept;
 
     // Exposed for mixed-signal regression tests. These are the voltages after
@@ -62,6 +62,7 @@ private:
     float resonanceAmount = 0.0f;
     float resonanceInputGain = 1.0f;
     float inputDrive = 1.0f;
+    float transconductorScale = 26.0f;
     float panPosition = 0.0f;
     float targetCutoffCv = 0.0f;
     float targetResonanceCv = 0.0f;

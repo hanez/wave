@@ -38,6 +38,8 @@ public:
     bool installPerformanceBank(std::span<const uint8_t> performances) noexcept;
     bool installSoundBank(std::span<const uint8_t> sounds) noexcept;
     bool requestPerformanceSelection(int programIndex) noexcept;
+    // Audio-thread preparation before the native keypad scanner runs.
+    void prepareNumericPanelInput() noexcept;
     bool refreshCurrentScreenFromFirmware()
     {
         return loaded && redrawCurrentScreenWithFirmware();
@@ -186,6 +188,7 @@ public:
 
 private:
     bool runPanelCallbacksWithFirmware(uint32_t callbackTable) noexcept;
+    bool appendPanelEventToFirmwareRing(const std::array<uint8_t, 3>& event) noexcept;
     struct VirtualInitialisationFile
     {
         bool open = false;
@@ -218,7 +221,7 @@ private:
     void write8(uint32_t address, uint8_t value) noexcept override;
     [[nodiscard]] bool usesInstructionInterception() const noexcept override
     {
-        return initialisationLoaderActive || startupContinuationActive
+        return pendingPanelEventCount != 0 || initialisationLoaderActive || startupContinuationActive
                || displayRefreshActive || pendingPerformanceRefresh >= 0
                || internalPerformanceDispatch;
     }
@@ -235,6 +238,8 @@ private:
     std::array<std::atomic<uint8_t>, lcdVideoWindowSize> lcdVideoRam{};
     std::atomic<uint64_t> lcdPresentationRevision{ 0 };
     std::array<std::atomic<uint16_t>, 8> panelSwitchWords{};
+    std::array<std::array<uint8_t, 3>, 256> pendingPanelEvents {};
+    size_t pendingPanelEventCount = 0;
     std::array<std::atomic<uint64_t>, 128> panelReleaseCycles{};
     std::array<std::atomic<bool>, 128> panelReleasePending{};
     std::array<std::atomic<bool>, 128> panelButtonRequested{};

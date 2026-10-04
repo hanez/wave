@@ -47,9 +47,11 @@ Distributors must retain applicable dependency notices with their artifacts.
 
 ## External instrument data
 
-Waldorf/PPG executable firmware, ROM archives, Wave factory banks, disk images, and recordings are not
+Waldorf/PPG executable firmware, ROM archives, Wave factory banks, other disk images, and recordings are not
 part of the public source distribution or its license. The PPG-derived decoded
 waveform sample bank is included separately; see `data/README.md` for provenance.
+The maintainer-supplied blank INIT disk is also included; its native INIT records
+retain their original provenance and are not relicensed by the project GPL grant.
 The project GPL license does not assert ownership of that third-party data.
 Import tools operate on
 user-supplied files or separately downloaded firmware. Public availability of

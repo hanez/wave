@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Configure without private data
-        run: cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 -DWAVE_EMBED_PRIVATE_ASSETS=OFF -DWAVE_BUILD_TESTS=ON
+        run: cmake -S . -B build-windows -G "Visual Studio 17 2022" -A x64 -T ClangCL -DWAVE_EMBED_PRIVATE_ASSETS=OFF -DWAVE_BUILD_TESTS=ON
       - name: Build
         run: cmake --build build-windows --config Release --parallel 3
       - name: Check embedded Windows manifests
@@ -87,6 +87,7 @@ jobs:
           Copy-Item "build-windows/WaveEmulation_artefacts/Release/Standalone/Wave Emulation.exe" "$package/Standalone/"
           Copy-Item "build-windows/WaveEmulation_artefacts/Release/VST3/Wave Emulation.vst3" "$package/VST3/" -Recurse
           Copy-Item LICENSE, THIRD_PARTY_NOTICES.md, README.md $package
+          Copy-Item "data/BlankWave.img" "$package/Blank Wave.img"
           Copy-Item LICENSES "$package/LICENSES" -Recurse
           "Source: https://github.com/${{ github.repository }}/tree/${{ github.sha }}`nBuild: Windows x64 Release, private assets disabled" | Set-Content "$package/BUILD.txt"
       - name: Upload Windows app and VST3

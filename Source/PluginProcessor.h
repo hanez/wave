@@ -29,9 +29,9 @@ public:
         solo
     };
 
-    enum class InitialBank { empty, embeddedFactory };
+    enum class InitialBank { empty, initialised, embeddedFactory };
     explicit WaveEmulationAudioProcessor(const juce::File& firmwarePreferenceFile = {},
-                                        InitialBank initialBank = InitialBank::empty);
+                                        InitialBank initialBank = InitialBank::initialised);
     ~WaveEmulationAudioProcessor() override;
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
@@ -205,7 +205,8 @@ public:
         return keyboardOctaveShift.load(std::memory_order_acquire);
     }
     [[nodiscard]] juce::File getRememberedPanelSkin() const;
-    juce::Result rememberPanelSkin(const juce::File& file);
+    [[nodiscard]] bool getRememberedCompactPanelSkin() const;
+    juce::Result rememberPanelSkin(const juce::File& file, bool compact = false);
     bool setPanelButton(int buttonId, bool pressed) noexcept;
     void setKeyboardControllerButton(uint8_t asciiCode, bool pressed) noexcept;
     [[nodiscard]] int getFirmwareOscillatorOctave(int oscillator) const noexcept;
@@ -301,7 +302,6 @@ private:
     std::array<std::array<uint8_t, wave::presets::WaveFactorySet::soundSize>, 8>
         activeInstrumentSoundRecords {};
     std::array<bool, 8> activeInstrumentSoundRecordValid {};
-    std::array<bool, 8> activeInstrumentSoundRecordReconciled {};
     int activeInstrumentSoundPerformance = -1;
     uint64_t lastPublishedFirmwareSoundHash = 0;
     uint64_t lastPublishedHostMachineHash = 0;
@@ -329,6 +329,7 @@ private:
     int scheduledInstrumentPageSelection = -1;
     int scheduledInstrumentPageDelayBlocks = 0;
     std::atomic<int> pendingFirmwareSoftButton { -1 };
+    std::atomic<bool> pendingNumericPanelInput { false };
     std::atomic<bool> pendingPanelCancel { false };
     std::atomic<bool> cancelFirmwareSoftButtonEvents { false };
     int activeSoftButtonDiagnosticCode = -1;
@@ -541,6 +542,7 @@ private:
         const wave::firmware::Bundle::Report& report, bool rememberDirectory);
     void loadEmbeddedPrivateRoms();
     void loadEmbeddedFactorySet();
+    juce::Result loadDefaultBank(const juce::File& image);
     bool installFactoryEditRecords(int programIndex) noexcept;
     void applyFactoryProgram(int index, bool notifyFirmware);
 

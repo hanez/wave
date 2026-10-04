@@ -1,6 +1,7 @@
 #include "PluginEditor.h"
 
 #include "PanelWiring.h"
+#include "UI/CompactPanelLayout.h"
 
 #include <BinaryData.h>
 
@@ -53,6 +54,16 @@ constexpr auto loadPanelSkinMenuItem = 0x470c;
 constexpr auto defaultPanelSkinMenuItem = 0x470d;
 constexpr auto reloadDiskBankMenuItem = 0x470e;
 constexpr auto createDiskFromWavetableMenuItem = 0x470f;
+constexpr auto compactPanelSkinMenuItem = 0x4710;
+
+const wave::ui::compact::Knob* compactKnobAt(juce::Point<float> originalPanelCentre)
+{
+    for (const auto& knob : wave::ui::compact::knobs)
+        if (std::abs(knob.originalX - originalPanelCentre.x - panelHorizontalOffset) < 0.1f
+            && std::abs(knob.originalY - originalPanelCentre.y) < 0.1f)
+            return &knob;
+    return nullptr;
+}
 
 bool hitCircle(juce::Point<float> point, float x, float y) noexcept
 {
@@ -234,7 +245,7 @@ public:
         if (attachedParameter != nullptr)
             slider.setDoubleClickReturnValue(true, attachedParameter->convertFrom0to1(
                                                        attachedParameter->getDefaultValue()));
-        setTooltip(displayName + "\nDrag up/down to adjust. Hold Shift for fine adjustment.");
+        setTooltip(displayName);
         if (endlessRelative)
             attachment = std::make_unique<Attachment>(parameterState, parameterId, slider);
         else if (!physicalPositionInitialised && attachedParameter != nullptr)
@@ -254,9 +265,12 @@ public:
         encoderPixelsPerStep = juce::jmax(1.0f, pixels);
     }
 
-    void setPhysicalPotCallback(std::function<void(const juce::String&, float)> callback)
+    void setPhysicalPotCallbacks(
+        std::function<void(const juce::String&, float)> callback,
+        std::function<std::optional<float>(const juce::String&)> positionCallback)
     {
         physicalPotCallback = std::move(callback);
+        physicalPotPositionCallback = std::move(positionCallback);
     }
 
     void synchronisePhysicalPosition(float normalised) noexcept
@@ -279,6 +293,11 @@ public:
 
         if (!endlessRelative)
         {
+            // Firmware boot/recall can reset the ADC before the next editor
+            // timer tick. Begin this gesture from the current physical value.
+            if (physicalPotPositionCallback != nullptr)
+                if (const auto physical = physicalPotPositionCallback(boundParameterId))
+                    synchronisePhysicalPosition(*physical);
             boundedDragging = true;
             lastDragOffsetY = 0;
             attachedParameter->beginChangeGesture();
@@ -414,6 +433,7 @@ private:
     std::unique_ptr<Attachment> attachment;
     std::function<void(int)> encoderTurnCallback;
     std::function<void(const juce::String&, float)> physicalPotCallback;
+    std::function<std::optional<float>(const juce::String&)> physicalPotPositionCallback;
     juce::RangedAudioParameter* attachedParameter = nullptr;
     juce::String boundParameterId;
     int lastDragOffsetY = 0;
@@ -469,7 +489,7 @@ class WaveEmulationAudioProcessorEditor::SystemMenuButton final : public juce::B
 public:
     SystemMenuButton() : juce::Button("Disk image menu")
     {
-        setTooltip("System / Disk images");
+        setTooltip("System");
         setMouseClickGrabsKeyboardFocus(false);
     }
 
@@ -524,12 +544,12 @@ WaveEmulationAudioProcessorEditor::WaveEmulationAudioProcessorEditor(
     addAndMakeVisible(*systemMenuButton);
     setResizable(true, true);
     setResizeLimits(
-        juce::roundToInt(designWidth * minimumEditorScale),
+        juce::roundToInt(panelDesignWidth() * minimumEditorScale),
         juce::roundToInt(designHeight * minimumEditorScale),
-        juce::roundToInt(designWidth * maximumEditorScale),
+        juce::roundToInt(panelDesignWidth() * maximumEditorScale),
         juce::roundToInt(designHeight * maximumEditorScale));
     if (auto* constrainer = getConstrainer())
-        constrainer->setFixedAspectRatio(static_cast<double>(designWidth / designHeight));
+        constrainer->setFixedAspectRatio(static_cast<double>(panelDesignWidth() / designHeight));
 
     const auto svg = juce::String::fromUTF8(WaveAssets::WaldorfWaveUI_NOLOGO_svg,
                                             WaveAssets::WaldorfWaveUI_NOLOGO_svgSize);
@@ -538,9 +558,6 @@ WaveEmulationAudioProcessorEditor::WaveEmulationAudioProcessorEditor(
         panelArtwork = juce::Drawable::createFromSVG(*xml);
         initialisePanelRegions(*xml);
     }
-    const auto rememberedSkin = ownerProcessor.getRememberedPanelSkin();
-    if (rememberedSkin != juce::File{})
-        loadPanelSkin(rememberedSkin, false); // Missing/invalid artwork falls back to the bundled panel.
     const auto sliderSvg = juce::String::fromUTF8(WaveAssets::Slider_svg,
                                                   WaveAssets::Slider_svgSize);
     if (const auto sliderXml = juce::XmlDocument::parse(sliderSvg))
@@ -591,6 +608,7 @@ WaveEmulationAudioProcessorEditor::WaveEmulationAudioProcessorEditor(
         auto button = std::make_unique<ArtworkButton>(editButtonArtwork.get());
         auto* buttonPointer = button.get();
         const auto hardwareId = editButtonHardwareIds[index];
+        button->setTooltip(wave::panel::buttonName(hardwareId));
         button->setTriggeredOnMouseDown(true);
         button->onStateChange = [this, buttonPointer, hardwareId] {
             const auto down = buttonPointer->getState() == juce::Button::buttonDown;
@@ -712,8 +730,13 @@ WaveEmulationAudioProcessorEditor::WaveEmulationAudioProcessorEditor(
     lcd->setPanelEmbedded(true);
     addAndMakeVisible(*lcd);
 
-    setSize(juce::roundToInt(designWidth * defaultEditorScale),
+    setSize(juce::roundToInt(panelDesignWidth() * defaultEditorScale),
             juce::roundToInt(designHeight * defaultEditorScale));
+    if (ownerProcessor.getRememberedCompactPanelSkin())
+        applyPanelLayout(true, defaultEditorScale);
+    else if (const auto rememberedSkin = ownerProcessor.getRememberedPanelSkin();
+             rememberedSkin != juce::File{})
+        loadPanelSkin(rememberedSkin, false);
     startTimerHz(60);
     juce::MessageManager::callAsync([safe = juce::Component::SafePointer(this)] {
         if (safe != nullptr)
@@ -775,10 +798,12 @@ juce::PopupMenu WaveEmulationAudioProcessorEditor::getMenuForIndex(
     menu.addItem(resetZoomMenuItem, "Actual Size (Cmd/Ctrl + 0)");
     menu.addItem(toggleKeyboardMenuItem,
                  keyboardVisible ? "Hide Lower Keyboard Area (Cmd/Ctrl + K)"
-                                 : "Show Lower Keyboard Area (Cmd/Ctrl + K)");
+                                 : "Show Lower Keyboard Area (Cmd/Ctrl + K)", !compactSkin);
     menu.addSeparator();
     juce::PopupMenu skins;
-    skins.addItem(defaultPanelSkinMenuItem, "Original", true, panelSkinFile == juce::File{});
+    skins.addItem(defaultPanelSkinMenuItem, "Original", true,
+                  !compactSkin && panelSkinFile == juce::File{});
+    skins.addItem(compactPanelSkinMenuItem, "Compact Skin", true, compactSkin);
     skins.addItem(loadPanelSkinMenuItem, "Load Alternative SVG Skin...");
     if (panelSkinFile != juce::File{})
         skins.addItem(-2, "Current: " + panelSkinFile.getFileName(), false);
@@ -813,6 +838,11 @@ void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
         showPanelSkinChooser();
         return;
     }
+    if (menuItemId == compactPanelSkinMenuItem)
+    {
+        useCompactPanelSkin();
+        return;
+    }
     if (menuItemId == defaultPanelSkinMenuItem)
     {
         useDefaultPanelSkin();
@@ -820,7 +850,7 @@ void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
     }
     if (menuItemId == zoomInMenuItem || menuItemId == zoomOutMenuItem)
     {
-        const auto currentScale = static_cast<float>(getWidth()) / designWidth;
+        const auto currentScale = static_cast<float>(getWidth()) / panelDesignWidth();
         const auto direction = menuItemId == zoomInMenuItem ? 1.0f : -1.0f;
         setWindowScale(std::round(currentScale * 10.0f + direction) / 10.0f);
         return;
@@ -885,23 +915,24 @@ void WaveEmulationAudioProcessorEditor::menuItemSelected(int menuItemId, int)
 void WaveEmulationAudioProcessorEditor::setWindowScale(float scale)
 {
     scale = juce::jlimit(minimumEditorScale, maximumEditorScale, scale);
-    const auto activeHeight = keyboardVisible ? designHeight : panelOnlyHeight;
+    const auto activeHeight = compactSkin ? panelDesignHeight()
+                                          : keyboardVisible ? designHeight : panelOnlyHeight;
     if (auto* constrainer = getConstrainer())
-        constrainer->setFixedAspectRatio(static_cast<double>(designWidth / activeHeight));
-    setResizeLimits(juce::roundToInt(designWidth * minimumEditorScale),
+        constrainer->setFixedAspectRatio(static_cast<double>(panelDesignWidth() / activeHeight));
+    setResizeLimits(juce::roundToInt(panelDesignWidth() * minimumEditorScale),
                     juce::roundToInt(activeHeight * minimumEditorScale),
-                    juce::roundToInt(designWidth * maximumEditorScale),
+                    juce::roundToInt(panelDesignWidth() * maximumEditorScale),
                     juce::roundToInt(activeHeight * maximumEditorScale));
-    setSize(juce::roundToInt(designWidth * scale),
+    setSize(juce::roundToInt(panelDesignWidth() * scale),
             juce::roundToInt(activeHeight * scale));
 }
 
 void WaveEmulationAudioProcessorEditor::setKeyboardVisible(bool visible)
 {
-    if (keyboardVisible == visible)
+    if (compactSkin || keyboardVisible == visible)
         return;
     releaseActivePointerInteractions(false);
-    const auto currentScale = static_cast<float>(getWidth()) / designWidth;
+    const auto currentScale = static_cast<float>(getWidth()) / panelDesignWidth();
     keyboardVisible = visible;
     setWindowScale(currentScale);
     menuItemsChanged();
@@ -1201,9 +1232,9 @@ void WaveEmulationAudioProcessorEditor::focusLost(FocusChangeType)
 void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
 {
     graphics.fillAll(juce::Colours::black);
-    const auto scaleX = static_cast<float>(getWidth()) / designWidth;
+    const auto scaleX = static_cast<float>(getWidth()) / panelDesignWidth();
     const auto fullPanelBounds = juce::Rectangle<float> {
-        0.0f, 0.0f, static_cast<float>(getWidth()), designHeight * scaleX
+        0.0f, 0.0f, static_cast<float>(getWidth()), panelDesignHeight() * scaleX
     };
     if (panelImage.isValid())
     {
@@ -1224,115 +1255,121 @@ void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
         };
     };
 
-    // Draw the keyboard at runtime so it remains visible even when the panel
-    // SVG is re-exported with only the empty black keyboard bed. The keybed
-    // deliberately occupies the complete 1671 x 278 black rectangle.
-    const auto whiteKeys = scaledKeyboardBounds(
-        { keyboardLeft, keyboardTop, keyboardWidth, keyboardWhiteKeyHeight });
-
-    juce::ColourGradient whiteKeyGradient(
-        juce::Colour(0xfff8f8f5), whiteKeys.getX(), whiteKeys.getY(),
-        juce::Colour(0xffd3d3cf), whiteKeys.getX(), whiteKeys.getBottom(), false);
-    whiteKeyGradient.addColour(0.78, juce::Colour(0xffe9e9e5));
-    graphics.setGradientFill(whiteKeyGradient);
-    graphics.fillRect(whiteKeys);
-
-    graphics.setColour(juce::Colour(0xff27282c));
-    for (auto whiteKey = 1; whiteKey < 36; ++whiteKey)
+    if (!compactSkin)
     {
-        const auto x = (keyboardLeft
-                        + static_cast<float>(whiteKey) * keyboardWhiteKeyWidth) * scaleX;
-        graphics.drawLine(x, whiteKeys.getY(), x, whiteKeys.getBottom(),
-                          juce::jmax(1.5f, 2.0f * minScale));
-    }
+        // Draw the keyboard at runtime so it remains visible even when the panel
+        // SVG is re-exported with only the empty black keyboard bed. The keybed
+        // deliberately occupies the complete 1671 x 278 black rectangle.
+        const auto whiteKeys = scaledKeyboardBounds(
+            { keyboardLeft, keyboardTop, keyboardWidth, keyboardWhiteKeyHeight });
 
-    const auto feedbackIsVisible = recentMidiNote >= 0
-                                   && juce::Time::getMillisecondCounterHiRes()
-                                          < recentMidiNoteHighlightUntil;
-    const auto drawMidiKeyFeedback = [&](int midiNote, bool blackKeys) {
-        if (midiNote < keyboardLowestMidiNote || midiNote > keyboardHighestMidiNote
-            || isBlackMidiNote(midiNote) != blackKeys)
-            return;
-        const auto bounds = scaledKeyboardBounds(midiKeyBounds(midiNote));
-        graphics.setColour(juce::Colour(0xffda2e2e).withAlpha(0.25f));
-        if (blackKeys)
-            graphics.fillRoundedRectangle(bounds, 2.0f * minScale);
-        else
-            graphics.fillRect(bounds);
-    };
-    const auto drawFeedbackForKeyType = [&](bool blackKeys) {
+        juce::ColourGradient whiteKeyGradient(
+            juce::Colour(0xfff8f8f5), whiteKeys.getX(), whiteKeys.getY(),
+            juce::Colour(0xffd3d3cf), whiteKeys.getX(), whiteKeys.getBottom(), false);
+        whiteKeyGradient.addColour(0.78, juce::Colour(0xffe9e9e5));
+        graphics.setGradientFill(whiteKeyGradient);
+        graphics.fillRect(whiteKeys);
+
+        graphics.setColour(juce::Colour(0xff27282c));
+        for (auto whiteKey = 1; whiteKey < 36; ++whiteKey)
+        {
+            const auto x = (keyboardLeft
+                            + static_cast<float>(whiteKey) * keyboardWhiteKeyWidth) * scaleX;
+            graphics.drawLine(x, whiteKeys.getY(), x, whiteKeys.getBottom(),
+                              juce::jmax(1.5f, 2.0f * minScale));
+        }
+
+        const auto feedbackIsVisible = recentMidiNote >= 0
+                                       && juce::Time::getMillisecondCounterHiRes()
+                                              < recentMidiNoteHighlightUntil;
+        const auto drawMidiKeyFeedback = [&](int midiNote, bool blackKeys) {
+            if (midiNote < keyboardLowestMidiNote || midiNote > keyboardHighestMidiNote
+                || isBlackMidiNote(midiNote) != blackKeys)
+                return;
+            const auto bounds = scaledKeyboardBounds(midiKeyBounds(midiNote));
+            graphics.setColour(juce::Colour(0xffda2e2e).withAlpha(0.25f));
+            if (blackKeys)
+                graphics.fillRoundedRectangle(bounds, 2.0f * minScale);
+            else
+                graphics.fillRect(bounds);
+        };
+        const auto drawFeedbackForKeyType = [&](bool blackKeys) {
+            for (auto midiNote = keyboardLowestMidiNote;
+                 midiNote <= keyboardHighestMidiNote; ++midiNote)
+                if (ownerProcessor.isMidiNoteActive(midiNote))
+                    drawMidiKeyFeedback(midiNote, blackKeys);
+            for (size_t index = 0; index < keyboardNotes.size(); ++index)
+                if (keyboardNotes[index])
+                    drawMidiKeyFeedback(60 + static_cast<int>(index), blackKeys);
+            if (feedbackIsVisible)
+                drawMidiKeyFeedback(recentMidiNote, blackKeys);
+            if (activeMidiNote >= 0)
+                drawMidiKeyFeedback(activeMidiNote, blackKeys);
+        };
+
+        // White-key feedback is painted before the raised black keys so adjacent
+        // black keys retain their physical overlap and remain easy to read.
+        drawFeedbackForKeyType(false);
+
+        juce::ColourGradient blackKeyGradient(
+            juce::Colour(0xff383a42), 0.0f, keyboardTop * scaleY,
+            juce::Colour(0xff050506), 0.0f,
+            (keyboardTop + keyboardBlackKeyHeight) * scaleY, false);
+        blackKeyGradient.addColour(0.18, juce::Colour(0xff202127));
+        blackKeyGradient.addColour(0.82, juce::Colour(0xff111216));
         for (auto midiNote = keyboardLowestMidiNote;
              midiNote <= keyboardHighestMidiNote; ++midiNote)
-            if (ownerProcessor.isMidiNoteActive(midiNote))
-                drawMidiKeyFeedback(midiNote, blackKeys);
-        for (size_t index = 0; index < keyboardNotes.size(); ++index)
-            if (keyboardNotes[index])
-                drawMidiKeyFeedback(60 + static_cast<int>(index), blackKeys);
-        if (feedbackIsVisible)
-            drawMidiKeyFeedback(recentMidiNote, blackKeys);
-        if (activeMidiNote >= 0)
-            drawMidiKeyFeedback(activeMidiNote, blackKeys);
-    };
-
-    // White-key feedback is painted before the raised black keys so adjacent
-    // black keys retain their physical overlap and remain easy to read.
-    drawFeedbackForKeyType(false);
-
-    juce::ColourGradient blackKeyGradient(
-        juce::Colour(0xff383a42), 0.0f, keyboardTop * scaleY,
-        juce::Colour(0xff050506), 0.0f,
-        (keyboardTop + keyboardBlackKeyHeight) * scaleY, false);
-    blackKeyGradient.addColour(0.18, juce::Colour(0xff202127));
-    blackKeyGradient.addColour(0.82, juce::Colour(0xff111216));
-    for (auto midiNote = keyboardLowestMidiNote;
-         midiNote <= keyboardHighestMidiNote; ++midiNote)
-    {
-        if (!isBlackMidiNote(midiNote))
-            continue;
-        const auto bounds = scaledKeyboardBounds(midiKeyBounds(midiNote));
-        graphics.setGradientFill(blackKeyGradient);
-        graphics.fillRoundedRectangle(bounds, 2.0f * minScale);
-        graphics.setColour(juce::Colour(0xff050506));
-        graphics.drawRoundedRectangle(bounds, 2.0f * minScale,
-                                      juce::jmax(1.0f, 2.0f * minScale));
-    }
-    drawFeedbackForKeyType(true);
-
-    // The SVG supplies the three exact black wheel recesses. Draw only the
-    // black wheel bodies inside those bounds, preserving the Figma layout and
-    // adjacent position markings unchanged.
-    for (size_t wheel = 0; wheel < performanceWheelSlots.size(); ++wheel)
-    {
-        const auto slot = scaledKeyboardBounds(performanceWheelSlots[wheel]);
-        const auto centreY = juce::jmap(
-            performanceWheelValues[wheel], slot.getBottom() - 13.0f * scaleY,
-            slot.getY() + 13.0f * scaleY);
-        const auto body = juce::Rectangle<float> {
-            slot.getWidth() - 2.0f * scaleX, 34.0f * scaleY
-        }.withCentre({ slot.getCentreX(), centreY });
-        juce::Graphics::ScopedSaveState clipped(graphics);
-        graphics.reduceClipRegion(slot.toNearestInt());
-        juce::ColourGradient wheelGradient(
-            juce::Colour(0xff050506), body.getX(), body.getY(),
-            juce::Colour(0xff202126), body.getRight(), body.getY(), false);
-        wheelGradient.addColour(0.5, juce::Colour(0xff0b0c0f));
-        graphics.setGradientFill(wheelGradient);
-        graphics.fillRoundedRectangle(body, 3.0f * minScale);
-        graphics.setColour(juce::Colour(0xff363840));
-        for (auto rib = 1; rib < 6; ++rib)
         {
-            const auto y = body.getY()
-                           + static_cast<float>(rib) * body.getHeight() / 6.0f;
-            graphics.drawLine(body.getX() + 2.0f * scaleX, y,
-                              body.getRight() - 2.0f * scaleX, y,
-                              juce::jmax(0.6f, 0.8f * minScale));
+            if (!isBlackMidiNote(midiNote))
+                continue;
+            const auto bounds = scaledKeyboardBounds(midiKeyBounds(midiNote));
+            graphics.setGradientFill(blackKeyGradient);
+            graphics.fillRoundedRectangle(bounds, 2.0f * minScale);
+            graphics.setColour(juce::Colour(0xff050506));
+            graphics.drawRoundedRectangle(bounds, 2.0f * minScale,
+                                          juce::jmax(1.0f, 2.0f * minScale));
         }
-        graphics.setColour(juce::Colours::black);
-        graphics.drawRoundedRectangle(body, 3.0f * minScale,
-                                      juce::jmax(1.0f, minScale));
+        drawFeedbackForKeyType(true);
+
+        // The SVG supplies the three exact black wheel recesses. Draw only the
+        // black wheel bodies inside those bounds, preserving the Figma layout and
+        // adjacent position markings unchanged.
+        for (size_t wheel = 0; wheel < performanceWheelSlots.size(); ++wheel)
+        {
+            const auto slot = scaledKeyboardBounds(performanceWheelSlots[wheel]);
+            const auto centreY = juce::jmap(
+                performanceWheelValues[wheel], slot.getBottom() - 13.0f * scaleY,
+                slot.getY() + 13.0f * scaleY);
+            const auto body = juce::Rectangle<float> {
+                slot.getWidth() - 2.0f * scaleX, 34.0f * scaleY
+            }.withCentre({ slot.getCentreX(), centreY });
+            juce::Graphics::ScopedSaveState clipped(graphics);
+            graphics.reduceClipRegion(slot.toNearestInt());
+            juce::ColourGradient wheelGradient(
+                juce::Colour(0xff050506), body.getX(), body.getY(),
+                juce::Colour(0xff202126), body.getRight(), body.getY(), false);
+            wheelGradient.addColour(0.5, juce::Colour(0xff0b0c0f));
+            graphics.setGradientFill(wheelGradient);
+            graphics.fillRoundedRectangle(body, 3.0f * minScale);
+            graphics.setColour(juce::Colour(0xff363840));
+            for (auto rib = 1; rib < 6; ++rib)
+            {
+                const auto y = body.getY()
+                               + static_cast<float>(rib) * body.getHeight() / 6.0f;
+                graphics.drawLine(body.getX() + 2.0f * scaleX, y,
+                                  body.getRight() - 2.0f * scaleX, y,
+                                  juce::jmax(0.6f, 0.8f * minScale));
+            }
+            graphics.setColour(juce::Colours::black);
+            graphics.drawRoundedRectangle(body, 3.0f * minScale,
+                                          juce::jmax(1.0f, minScale));
+        }
+
     }
 
-    if (roundButtonArtwork != nullptr)
+    // Compact switches are already complete SVG paths, including the numeric
+    // keypad glyphs. Painting the generic round asset would cover those labels.
+    if (!compactSkin && roundButtonArtwork != nullptr)
     {
         for (const auto& region : panelRegions)
         {
@@ -1340,7 +1377,8 @@ void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
                 continue;
             roundButtonArtwork->drawWithin(
                 graphics,
-                juce::Rectangle<float> { 30.0f * scaleX, 30.0f * scaleY }
+                juce::Rectangle<float> { 30.0f * region.artworkScale * scaleX,
+                                         30.0f * region.artworkScale * scaleY }
                     .withCentre({ region.centre.x * scaleX, region.centre.y * scaleY }),
                 juce::RectanglePlacement::stretchToFit, 1.0f);
         }
@@ -1353,7 +1391,8 @@ void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
                 continue;
             verticalButtonArtwork->drawWithin(
                 graphics,
-                juce::Rectangle<float> { 30.0f * scaleX, 61.0f * scaleY }
+                juce::Rectangle<float> { 30.0f * region.artworkScale * scaleX,
+                                         61.0f * region.artworkScale * scaleY }
                     .withCentre({ region.centre.x * scaleX, region.centre.y * scaleY }),
                 juce::RectanglePlacement::stretchToFit, 1.0f);
         }
@@ -1367,14 +1406,15 @@ void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
             if (!region.fader)
                 continue;
             const auto value = panelAnalogValues[static_cast<size_t>(region.hardwareId)];
-            const auto handleX = region.centre.x - handleWidth * 0.5f;
+            const auto handleX = region.centre.x - handleWidth * region.artworkScale * 0.5f;
             const auto handleCentreY = juce::jmap(value, region.faderTrackBottom,
                                                   region.faderTrackTop);
-            const auto handleY = handleCentreY - handleHeight * 0.5f;
+            const auto handleY = handleCentreY - handleHeight * region.artworkScale * 0.5f;
             sliderArtwork->drawWithin(
                 graphics,
                 { handleX * scaleX, handleY * scaleY,
-                  handleWidth * scaleX, handleHeight * scaleY },
+                  handleWidth * region.artworkScale * scaleX,
+                  handleHeight * region.artworkScale * scaleY },
                 juce::RectanglePlacement::stretchToFit, 1.0f);
         }
     }
@@ -1385,6 +1425,8 @@ void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
         constexpr auto rotationExtent = juce::MathConstants<float>::pi * 0.75f;
         for (size_t index = 0; index < knobs.size(); ++index)
         {
+            if (!knobs[index]->isVisible())
+                continue;
             const auto bounds = knobs[index]->getBounds().toFloat();
             const auto centre = bounds.getCentre();
             auto* artwork = knobArtwork.get();
@@ -1401,6 +1443,15 @@ void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
             }
             if (artwork == nullptr)
                 continue;
+            if (compactSkin)
+                if (const auto* placement = compactKnobAt(knobDesignCentres[index]))
+                {
+                    artworkSize = placement->artworkSize;
+                    if ((placement->originalX == 516.0f
+                         && (placement->originalY == 160.0f || placement->originalY == 357.0f))
+                        || (placement->originalX == 1670.0f && placement->originalY == 237.0f))
+                        artwork = redKnobArtwork.get();
+                }
             const auto artworkBounds = juce::Rectangle<float> {
                 artworkSize * scaleX, artworkSize * scaleY
             }.withCentre(centre);
@@ -1422,7 +1473,7 @@ void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
             artwork = ledOnRedArtwork.get();
         else if (colour == juce::Colours::yellow && ledOnYellowArtwork != nullptr)
             artwork = ledOnYellowArtwork.get();
-        const auto bounds = juce::Rectangle<float> { 6.0f * scaleX, 6.0f * scaleY }
+        const auto bounds = juce::Rectangle<float> { led.size * scaleX, led.size * scaleY }
                                 .withCentre({ led.centre.x * scaleX,
                                               led.centre.y * scaleY });
         if (artwork != nullptr)
@@ -1434,10 +1485,10 @@ void WaveEmulationAudioProcessorEditor::paint(juce::Graphics& graphics)
 void WaveEmulationAudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
 {
     const auto designPoint = juce::Point<float> {
-        event.position.x * designWidth / static_cast<float>(getWidth()),
-        event.position.y * designWidth / static_cast<float>(getWidth())
+        event.position.x * panelDesignWidth() / static_cast<float>(getWidth()),
+        event.position.y * panelDesignWidth() / static_cast<float>(getWidth())
     };
-    if (const auto midiNote = midiNoteAt(designPoint); midiNote >= 0)
+    if (const auto midiNote = compactSkin ? -1 : midiNoteAt(designPoint); midiNote >= 0)
     {
         midiKeyboardDragging = true;
         recentMidiNote = -1;
@@ -1447,7 +1498,7 @@ void WaveEmulationAudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
         return;
     }
 
-    for (size_t wheel = 0; wheel < performanceWheelSlots.size(); ++wheel)
+    for (size_t wheel = 0; !compactSkin && wheel < performanceWheelSlots.size(); ++wheel)
     {
         if (!performanceWheelSlots[wheel].contains(designPoint))
             continue;
@@ -1455,32 +1506,36 @@ void WaveEmulationAudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
         analogDragStartY = event.position.y;
         analogDragStartValue = performanceWheelValues[wheel];
         analogDragRangePixels = performanceWheelSlots[wheel].getHeight()
-                                * static_cast<float>(getWidth()) / designWidth;
+                                * static_cast<float>(getWidth()) / panelDesignWidth();
         return;
     }
 
-    const auto panelPoint = designPoint.translated(-panelHorizontalOffset, 0.0f);
-    if (hitCircle(panelPoint, 39.0f, 555.0f))
+    if (!compactSkin)
     {
-        pressPanelButton(wave::panel::matrixIndexForDiagnosticCode(2));
-        updateLfoKnobBindings();
-        repaint();
-        return;
-    }
-    if (hitCircle(panelPoint, 392.0f, 555.0f))
-    {
-        pressPanelButton(wave::panel::matrixIndexForDiagnosticCode(14));
-        updateWaveEnvelopeKnobBindings();
-        repaint();
-        return;
-    }
-    if (handlePerformanceControl(panelPoint))
-        return;
+        const auto panelPoint = designPoint.translated(-panelHorizontalOffset, 0.0f);
+        if (hitCircle(panelPoint, 39.0f, 555.0f))
+        {
+            pressPanelButton(wave::panel::matrixIndexForDiagnosticCode(2));
+            updateLfoKnobBindings();
+            repaint();
+            return;
+        }
+        if (hitCircle(panelPoint, 392.0f, 555.0f))
+        {
+            pressPanelButton(wave::panel::matrixIndexForDiagnosticCode(14));
+            updateWaveEnvelopeKnobBindings();
+            repaint();
+            return;
+        }
+        if (handlePerformanceControl(panelPoint))
+            return;
 
-    // The seven blue edit-mode selectors above Performance leave Performance
-    // mode. Their normal firmware button handling remains unchanged below.
-    if (hitRectangle(panelPoint, 1372.0f, 124.0f, 61.0f, 385.0f))
-        performanceMode = false;
+        // The seven blue edit-mode selectors above Performance leave Performance
+        // mode. Their normal firmware button handling remains unchanged below.
+        if (hitRectangle(panelPoint, 1372.0f, 124.0f, 61.0f, 385.0f))
+            performanceMode = false;
+
+    }
 
     for (auto region = panelRegions.rbegin(); region != panelRegions.rend(); ++region)
     {
@@ -1499,7 +1554,7 @@ void WaveEmulationAudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
                                                   (region->faderTrackBottom
                                                    - region->faderTrackTop)
                                                       * static_cast<float>(getWidth())
-                                                      / designWidth)
+                                                      / panelDesignWidth())
                                             : 160.0f;
                 if (region->fader)
                 {
@@ -1522,6 +1577,10 @@ void WaveEmulationAudioProcessorEditor::mouseDown(const juce::MouseEvent& event)
                 return;
             }
             pressPanelButton(region->hardwareId);
+            if (region->hardwareId == 2)
+                updateLfoKnobBindings();
+            else if (region->hardwareId == 14)
+                updateWaveEnvelopeKnobBindings();
             return;
         }
     }
@@ -1691,8 +1750,8 @@ void WaveEmulationAudioProcessorEditor::mouseDrag(const juce::MouseEvent& event)
     if (midiKeyboardDragging)
     {
         const auto designPoint = juce::Point<float> {
-            event.position.x * designWidth / static_cast<float>(getWidth()),
-            event.position.y * designWidth / static_cast<float>(getWidth())
+            event.position.x * panelDesignWidth() / static_cast<float>(getWidth()),
+            event.position.y * panelDesignWidth() / static_cast<float>(getWidth())
         };
         const auto midiNote = midiNoteAt(designPoint);
         if (midiNote != activeMidiNote)
@@ -2080,7 +2139,7 @@ void WaveEmulationAudioProcessorEditor::timerCallback()
 void WaveEmulationAudioProcessorEditor::resized()
 {
     rebuildPanelImage();
-    const auto scaleX = static_cast<float>(getWidth()) / designWidth;
+    const auto scaleX = static_cast<float>(getWidth()) / panelDesignWidth();
     const auto scaleY = scaleX;
     const auto scaled = [scaleX, scaleY](juce::Rectangle<float> rectangle) {
         return juce::Rectangle<float>(rectangle.getX() * scaleX, rectangle.getY() * scaleY,
@@ -2094,13 +2153,16 @@ void WaveEmulationAudioProcessorEditor::resized()
         // The supplied artwork leaves this narrow chassis rail free of panel
         // controls. Keeping the host-side menu here makes it available in AU,
         // VST3, and standalone builds without moving or covering the Wave UI.
-        systemMenuButton->setBounds(scaled({ 16.0f, 4.0f, 36.0f, 28.0f }));
+        // Compact's left rail is 48 px wide, versus 66 px on the original.
+        systemMenuButton->setBounds(scaled({ compactSkin ? 6.0f : 16.0f,
+                                            4.0f, 36.0f, 28.0f }));
         systemMenuButton->toFront(false);
     }
 
     if (lcd != nullptr)
-        lcd->setBounds(scaled({ 873.0f + panelHorizontalOffset, 237.0f,
-                                448.0f, 70.0f }));
+        lcd->setBounds(scaled(compactSkin
+            ? juce::Rectangle<float> { 776.8f, 179.92f, 367.36f, 57.4f }
+            : juce::Rectangle<float> { 873.0f + panelHorizontalOffset, 237.0f, 448.0f, 70.0f }));
 
     if (knobDesignCentres.size() == knobs.size()
         && knobArtworkTypes.size() == knobs.size())
@@ -2109,10 +2171,15 @@ void WaveEmulationAudioProcessorEditor::resized()
         {
             const auto hitSize = knobArtworkTypes[index] == KnobArtworkType::largeRed
                                      ? 104.0f : 60.0f;
+            const auto* placement = compactKnobAt(knobDesignCentres[index]);
+            knobs[index]->setVisible(!compactSkin || placement != nullptr);
+            const auto centre = compactSkin && placement != nullptr
+                                    ? juce::Point<float> { placement->x, placement->y }
+                                    : knobDesignCentres[index].translated(panelHorizontalOffset, 0.0f);
+            const auto size = compactSkin && placement != nullptr
+                                 && placement->artworkSize > 90.0f ? 120.0f : hitSize;
             knobs[index]->setBounds(scaled(
-                juce::Rectangle<float>(hitSize, hitSize)
-                    .withCentre(knobDesignCentres[index].translated(
-                        panelHorizontalOffset, 0.0f))));
+                juce::Rectangle<float>(size, size).withCentre(centre)));
         }
     }
 
@@ -2120,9 +2187,16 @@ void WaveEmulationAudioProcessorEditor::resized()
     {
         for (size_t index = 0; index < editButtons.size(); ++index)
         {
-            editButtons[index]->setBounds(scaled(
-                juce::Rectangle<float>(65.0f, 65.0f)
-                    .withCentre(editButtonDesignCentres[index])));
+            const auto region = std::find_if(panelRegions.begin(), panelRegions.end(),
+                [this, index](const auto& item) {
+                    return item.editButton && item.hardwareId == editButtonHardwareIds[index];
+                });
+            editButtons[index]->setVisible(region != panelRegions.end());
+            if (region != panelRegions.end())
+                editButtons[index]->setBounds(scaled(
+                    juce::Rectangle<float>(65.0f * region->artworkScale,
+                                           65.0f * region->artworkScale)
+                        .withCentre(region->centre)));
             // Parameter knobs are constructed later and would otherwise sit
             // above the small overlapping edge of a diagonal Edit switch.
             // Only the exact pill path accepts a click, so its transparent
@@ -2146,7 +2220,7 @@ void WaveEmulationAudioProcessorEditor::rebuildPanelImage()
     // every LED, fader, or LCD refresh.
     constexpr auto artworkScale = 2;
     const auto fullArtworkHeight
-        = juce::roundToInt(designHeight * static_cast<float>(getWidth()) / designWidth);
+        = juce::roundToInt(panelDesignHeight() * static_cast<float>(getWidth()) / panelDesignWidth());
     panelImage = juce::Image(juce::Image::RGB, getWidth() * artworkScale,
                              fullArtworkHeight * artworkScale, true);
     juce::Graphics imageGraphics(panelImage);
@@ -2167,9 +2241,12 @@ WaveEmulationAudioProcessorEditor::addKnob(const juce::String& parameterId,
     auto& result = *knob;
     if (!endlessRelative)
     {
-        result.setPhysicalPotCallback(
+        result.setPhysicalPotCallbacks(
             [this](const juce::String& boundParameterId, float normalised) {
                 ownerProcessor.setPanelPotValue(boundParameterId, normalised);
+            },
+            [this](const juce::String& boundParameterId) {
+                return ownerProcessor.getPanelPotValue(boundParameterId);
             });
         if (const auto physical = ownerProcessor.getPanelPotValue(parameterId))
             result.synchronisePhysicalPosition(*physical);
@@ -2261,19 +2338,146 @@ juce::String WaveEmulationAudioProcessorEditor::tooltipAt(juce::Point<float> poi
 {
     if (getWidth() <= 0)
         return {};
+    const auto designPoint = point * (panelDesignWidth() / static_cast<float>(getWidth()));
+    for (auto region = panelRegions.rbegin(); region != panelRegions.rend(); ++region)
+        if (region->path.contains(designPoint.x, designPoint.y))
+        {
+            if (region->fader && region->faderIndex >= 0)
+                return "Fader " + juce::String(region->faderIndex + 1);
+            if (region->keyboardCode >= 0)
+                return wave::panel::keyboardControllerButtonName(region->keyboardCode);
+            if (!region->analog && region->hardwareId >= 0)
+                return wave::panel::buttonName(region->hardwareId);
+        }
     for (const auto& knob : knobs)
-        if (knob->getBounds().toFloat().contains(point))
+        if (knob->isVisible() && knob->getBounds().toFloat().contains(point))
             return knob->getTooltip();
-    const auto designPoint = point * (designWidth / static_cast<float>(getWidth()));
-    for (const auto& region : panelRegions)
-        if (region.fader && region.faderIndex >= 0
-            && region.path.contains(designPoint.x, designPoint.y))
-            return "Fader " + juce::String(region.faderIndex + 1)
-                   + (performanceMode && selectedEditSwitch < 0
-                          ? " - assigned performance control"
-                          : " - parameter shown above on the LCD")
-                   + "\nDrag up/down to adjust.";
     return {};
+}
+
+float WaveEmulationAudioProcessorEditor::panelDesignWidth() const noexcept
+{
+    return compactSkin ? wave::ui::compact::width : designWidth;
+}
+
+float WaveEmulationAudioProcessorEditor::panelDesignHeight() const noexcept
+{
+    return compactSkin ? wave::ui::compact::height : designHeight;
+}
+
+void WaveEmulationAudioProcessorEditor::applyPanelLayout(bool compact, float scale)
+{
+    const auto original = juce::XmlDocument::parse(juce::String::fromUTF8(
+        WaveAssets::WaldorfWaveUI_NOLOGO_svg, WaveAssets::WaldorfWaveUI_NOLOGO_svgSize));
+    const auto artworkXml = compact
+        ? juce::XmlDocument::parse(juce::String::fromUTF8(
+              WaveAssets::WaldorfWaveUI_Compact_svg, WaveAssets::WaldorfWaveUI_Compact_svgSize))
+        : nullptr;
+    if (original == nullptr || (compact && artworkXml == nullptr))
+        return;
+    auto artwork = juce::Drawable::createFromSVG(compact ? *artworkXml : *original);
+    if (artwork == nullptr)
+        return;
+    releaseActivePointerInteractions(false);
+    // Restore the wiring contract before translating its controls to the
+    // compact artwork. Never derive electrical IDs from SVG element order.
+    initialisePanelRegions(*original);
+    if (compact)
+        initialiseCompactPanelRegions(*artworkXml);
+    compactSkin = compact;
+    panelSkinFile = juce::File{};
+    panelArtwork = std::move(artwork);
+    synchroniseFaderValues();
+    setWindowScale(scale);
+    resized(); // Also refresh child controls when selecting the current skin.
+    menuItemsChanged();
+    repaint();
+}
+
+void WaveEmulationAudioProcessorEditor::useCompactPanelSkin()
+{
+    const auto result = ownerProcessor.rememberPanelSkin({}, true);
+    if (result.failed())
+    {
+        showDiskError("Panel Skin", result);
+        return;
+    }
+    applyPanelLayout(true, static_cast<float>(getWidth()) / panelDesignWidth());
+}
+
+void WaveEmulationAudioProcessorEditor::initialiseCompactPanelRegions(const juce::XmlElement& svg)
+{
+    struct ArtworkPath
+    {
+        juce::String fill;
+        juce::Path path;
+    };
+    std::vector<ArtworkPath> paths;
+    for (const auto* element : svg.getChildIterator())
+        if (element->hasTagName("path"))
+            paths.push_back({ element->getStringAttribute("fill"),
+                             juce::Drawable::parseSVGPath(element->getStringAttribute("d")) });
+    const auto pathAt = [&paths](juce::Point<float> centre, bool led) -> const juce::Path* {
+        for (const auto& item : paths)
+            if ((led ? item.fill == "#6C0455"
+                     : item.fill == "#676767" || item.fill == "#DA2E2E"
+                       || item.fill == "#607EA7")
+                && item.path.getBounds().getCentre().getDistanceFrom(centre) < 0.1f)
+                return &item.path;
+        return nullptr;
+    };
+    std::vector<PanelRegion> compactRegions;
+    for (const auto& button : wave::ui::compact::buttons)
+    {
+        const auto original = std::find_if(panelRegions.begin(), panelRegions.end(),
+            [&button](const auto& region) {
+                return !region.analog && region.hardwareId == button.serial;
+            });
+        const juce::Point<float> centre { button.x, button.y };
+        if (original == panelRegions.end())
+            continue;
+        if (const auto* path = pathAt(centre, false))
+        {
+            auto region = *original;
+            region.artworkScale = path->getBounds().getWidth()
+                                   / original->path.getBounds().getWidth();
+            region.path = *path;
+            region.centre = centre;
+            compactRegions.push_back(std::move(region));
+        }
+    }
+    // The LCD bank is scaled to 82% in this SVG. Read the recess paths and
+    // retain the physical left-to-right ADC routing from PanelWiring.h.
+    std::vector<juce::Path> faders;
+    for (const auto& item : paths)
+        if (item.fill == "#3C3953" && item.path.getBounds().getHeight() > 100.0f)
+            faders.push_back(item.path);
+    std::sort(faders.begin(), faders.end(), [](const auto& left, const auto& right) {
+        return left.getBounds().getCentreX() < right.getBounds().getCentreX();
+    });
+    for (size_t index = 0; index < faders.size()
+                           && index < wave::panel::performanceFaderAdcChannels.size(); ++index)
+    {
+        PanelRegion region;
+        region.path = faders[index];
+        region.centre = region.path.getBounds().getCentre();
+        region.analog = region.fader = true;
+        region.faderIndex = static_cast<int>(index);
+        region.hardwareId = wave::panel::performanceFaderAdcChannels[index];
+        region.artworkScale = 0.82f;
+        region.faderTrackTop = 265.6f;
+        region.faderTrackBottom = 366.46f;
+        compactRegions.push_back(std::move(region));
+    }
+    panelRegions = std::move(compactRegions);
+    panelLeds.clear();
+    for (const auto& led : wave::ui::compact::leds)
+    {
+        const juce::Point<float> centre { led.x, led.y };
+        if (const auto* path = pathAt(centre, true))
+            panelLeds.push_back({ centre, led.redSerial, led.greenSerial,
+                                 path->getBounds().getWidth() });
+    }
 }
 
 juce::Result WaveEmulationAudioProcessorEditor::loadPanelSkin(const juce::File& file,
@@ -2300,9 +2504,11 @@ juce::Result WaveEmulationAudioProcessorEditor::loadPanelSkin(const juce::File& 
         if (result.failed())
             return result;
     }
+    const auto scale = static_cast<float>(getWidth()) / panelDesignWidth();
+    applyPanelLayout(false, scale);
     panelArtwork = std::move(artwork);
     panelSkinFile = file;
-    // Interaction geometry always comes from the original panel, so changing
+    // External skin geometry comes from the original panel, so changing
     // label paths/groups cannot change firmware wiring or fader destinations.
     rebuildPanelImage();
     repaint();
@@ -2321,10 +2527,7 @@ void WaveEmulationAudioProcessorEditor::useDefaultPanelSkin()
         showDiskError("Panel Skin", result);
         return;
     }
-    panelArtwork = juce::Drawable::createFromSVG(*xml);
-    panelSkinFile = juce::File{};
-    rebuildPanelImage();
-    repaint();
+    applyPanelLayout(false, static_cast<float>(getWidth()) / panelDesignWidth());
 }
 
 void WaveEmulationAudioProcessorEditor::showPanelSkinChooser()

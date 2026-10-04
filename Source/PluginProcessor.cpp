@@ -492,6 +492,7 @@ bool applyFirmwareModifierRouting(
         if (!initialSource && hostSourceChanged)
         {
             storedSource = juce::jlimit(0, 39, hostSource);
+            effectiveSources[routeIndex] = storedSource;
             firmware.writeCurrentSoundRecordByte(
                 static_cast<uint32_t>(layout.sourceOffset),
                 static_cast<uint8_t>(storedSource));
@@ -527,6 +528,7 @@ bool applyFirmwareModifierRouting(
         if (layout.controlOffset >= 0 && !initialControl && hostControlChanged)
         {
             storedControl = juce::jlimit(0, 39, hostControl);
+            effectiveControls[routeIndex] = storedControl;
             firmware.writeCurrentSoundRecordByte(
                 static_cast<uint32_t>(layout.controlOffset),
                 static_cast<uint8_t>(storedControl));
@@ -579,6 +581,13 @@ bool applyFirmwareModifierRouting(
                                         ? (juce::roundToInt(hostAmount) + 8) * 8
                                         : juce::roundToInt(hostAmount) + 64;
             effectiveStoredAmount = juce::jlimit(0, 127, effectiveStoredAmount);
+            // A host write can coincide with an ADC edit. Since that write
+            // wins in the native record, it must also win in the published
+            // Sound; otherwise Instrument switching restores the older ADC
+            // amount even though the live record contains the host value.
+            effectiveAmounts[routeIndex] = layout.volumeAmount
+                ? static_cast<float>(effectiveStoredAmount / 8 - 8)
+                : static_cast<float>(effectiveStoredAmount - 64);
             firmware.writeCurrentSoundRecordByte(
                 static_cast<uint32_t>(layout.amountOffset),
                 static_cast<uint8_t>(effectiveStoredAmount));
@@ -653,16 +662,49 @@ WaveEmulationAudioProcessor::WaveEmulationAudioProcessor(const juce::File& prefe
     if (initialBank == InitialBank::embeddedFactory)
         applyFactoryProgram(0, false);
     loadRememberedFirmware();
-    if (initialBank == InitialBank::empty)
+    if (initialBank == InitialBank::embeddedFactory)
+        // The factory boot already installs Performance 0. A second recall
+        // from loading remembered firmware can discard early panel events.
+        pendingFirmwareProgram.store(-1, std::memory_order_release);
+    if (initialBank != InitialBank::embeddedFactory)
     {
         resetToColdStart();
-        // A fresh instance inserts an empty disk, with no imported sound bank.
+        // Each instance gets writable media independent of the bundled image.
         // Host/session recall subsequently replaces this with its own image.
         restoredHostStateDirectory = juce::File::getSpecialLocation(juce::File::tempDirectory)
             .getChildFile(hostStateDirectoryName).getChildFile(hostStateInstanceId);
         if (restoredHostStateDirectory.createDirectory().wasOk())
-            (void) createBlankDiskImage(restoredHostStateDirectory.getChildFile("Blank Wave.img"));
+        {
+            const auto image = restoredHostStateDirectory.getChildFile("Blank Wave.img");
+            if (initialBank == InitialBank::initialised)
+                (void) loadDefaultBank(image);
+            else
+                (void) createBlankDiskImage(image);
+        }
     }
+}
+
+juce::Result WaveEmulationAudioProcessor::loadDefaultBank(const juce::File& image)
+{
+    if (!image.replaceWithData(WaveAssets::BlankWave_img,
+                               static_cast<size_t>(WaveAssets::BlankWave_imgSize)))
+        return juce::Result::fail("The default blank disk image could not be created.");
+    const auto mounted = mountDiskImage(image);
+    if (mounted.failed())
+        return mounted;
+    const auto set = currentPerformanceSet();
+    if (set == nullptr || !set->isLoaded())
+        return juce::Result::fail("The default disk image contains no valid Wave SET.");
+
+    // Startup loads the SET directly into native SRAM; it does not leave a
+    // Disk/Import confirmation or depend on a later user-triggered disk read.
+    pendingDiskSetActivation.store(false, std::memory_order_release);
+    pendingDiskSetBytes.store(0, std::memory_order_release);
+    diskSetImportConfirmationPending.store(false, std::memory_order_release);
+    masterFirmware.installSoundBank(set->soundBank());
+    masterFirmware.installPerformanceBank(set->performanceBank());
+    setCurrentProgram(0);
+    return juce::Result::ok();
 }
 
 WaveEmulationAudioProcessor::~WaveEmulationAudioProcessor()
@@ -1656,40 +1698,6 @@ void WaveEmulationAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer,
         for (size_t offset = 0; offset < liveRecord.size(); ++offset)
             liveRecord[offset] = masterFirmware.currentSoundRecordByte(
                 static_cast<uint32_t>(offset));
-        // During the initial SET import, OS 1.700 copies a nonzero Wavetable
-        // selector into its live edit buffer one count lower than the original
-        // Instrument-local record. Once that record is installed directly in
-        // the cache (or edited from the panel), it uses the normal selector.
-        // Reconcile that one import edge in the native record itself, exactly
-        // once per Instrument. Keeping an adjusted DSP-only copy makes Store
-        // save the unadjusted byte and recall an adjacent table. The native
-        // record, private edits, DSP and Store must share the same selector.
-        const auto selectedIndex = static_cast<size_t>(*firmwareInstrument);
-        if (!activeInstrumentSoundRecordReconciled[selectedIndex]
-            && activeInstrumentSoundPerformance == *firmwarePerformance
-            && activeInstrumentSoundRecordValid[selectedIndex])
-        {
-            const auto seededSelector
-                = activeInstrumentSoundRecords[selectedIndex][25];
-            if (liveRecord[25] < 0x7fu
-                && static_cast<uint8_t>(liveRecord[25] + 1u)
-                       == seededSelector)
-            {
-                liveRecord[25] = seededSelector;
-                masterFirmware.writeCurrentSoundRecordByte(25u, seededSelector);
-                activeInstrumentSoundRecordReconciled[selectedIndex] = true;
-            }
-            else if (liveRecord[25] != seededSelector)
-            {
-                // A value other than the seed or its import encoding is a
-                // genuine edit, so this record is already in the live/cache
-                // representation from now on.
-                activeInstrumentSoundRecordReconciled[selectedIndex] = true;
-            }
-            // Equality can be observed briefly before the OS completes its
-            // import conversion. Keep waiting instead of prematurely marking
-            // this Instrument reconciled.
-        }
         publishHostMachineSnapshot(*firmwarePerformance, *firmwareInstrument,
                                    liveRecord);
         firmwareSelectedSound = decodeFactorySound(liveRecord);
@@ -1958,8 +1966,12 @@ void WaveEmulationAudioProcessor::advanceFirmware(int samples)
             refreshSelectedPerformancePage = true;
         }
         if (refreshSelectedPerformancePage
-            && !storeMenuActive.load(std::memory_order_acquire))
+            && !storeMenuActive.load(std::memory_order_acquire)
+            && pendingManagerExitProgram.load(std::memory_order_acquire) < 0)
         {
+            // Total Recall still needs the Disk Manager's Cancel callbacks
+            // until its exit transaction finishes. The subsequent program
+            // recall supplies the Performance redraw after that release.
             installFactoryEditRecords(selected);
             masterFirmware.refreshCurrentScreenFromFirmware();
         }
@@ -2168,7 +2180,6 @@ void WaveEmulationAudioProcessor::synchroniseInstrumentSoundSeed() noexcept
                 std::memory_order_release);
         }
     }
-    activeInstrumentSoundRecordReconciled.fill(false);
     appliedInstrumentSoundSeed = seed;
 }
 
@@ -2249,10 +2260,6 @@ void WaveEmulationAudioProcessor::applyPendingHostMachineRestore() noexcept
     activeInstrumentSoundPerformance = pending->performance;
     activeInstrumentSoundRecords = pending->soundRecords;
     activeInstrumentSoundRecordValid = pending->soundRecordValid;
-    // The running recall can still perform its initial selector conversion
-    // after the host edit buffers are installed. Keep the same one-time
-    // native-record reconciliation used by a normal Performance recall.
-    activeInstrumentSoundRecordReconciled.fill(false);
     masterFirmware.refreshCurrentScreenFromFirmware();
     suspendFirmwareSoundFeedback();
     modulationRoutingResetPending.store(true, std::memory_order_release);
@@ -2283,17 +2290,10 @@ void WaveEmulationAudioProcessor::stageFirmwareInstrumentSound(
     {
         const auto currentIndex = static_cast<size_t>(*currentInstrument);
         auto& currentRecord = activeInstrumentSoundRecords[currentIndex];
-        const auto previousPersistentSelector = currentRecord[25];
         for (size_t offset = 0;
              offset < wave::presets::WaveFactorySet::soundSize; ++offset)
             currentRecord[offset] = masterFirmware.currentSoundRecordByte(
                 static_cast<uint32_t>(offset));
-        if (!activeInstrumentSoundRecordReconciled[currentIndex]
-            && currentRecord[25] < 0x7fu
-            && static_cast<uint8_t>(currentRecord[25] + 1u)
-                   == previousPersistentSelector)
-            currentRecord[25] = previousPersistentSelector;
-        activeInstrumentSoundRecordReconciled[currentIndex] = true;
     }
 
     // Two Instruments may intentionally assign the same stored Sound number
@@ -2304,8 +2304,6 @@ void WaveEmulationAudioProcessor::stageFirmwareInstrumentSound(
     masterFirmware.installPerformanceInstrumentSoundRecord(
         targetInstrument,
         activeInstrumentSoundRecords[static_cast<size_t>(targetInstrument)]);
-    activeInstrumentSoundRecordReconciled[static_cast<size_t>(targetInstrument)]
-        = true;
     suspendFirmwareSoundFeedback();
     modulationRoutingResetPending.store(true, std::memory_order_release);
 }
@@ -2313,6 +2311,8 @@ void WaveEmulationAudioProcessor::stageFirmwareInstrumentSound(
 void WaveEmulationAudioProcessor::runFirmwareTimeline(const juce::MidiBuffer& midi,
                                                        int sampleCount)
 {
+    if (pendingNumericPanelInput.exchange(false, std::memory_order_acq_rel))
+        masterFirmware.prepareNumericPanelInput();
     // The lower keyboard switches send serial press=1/release=0 events.
     // Keep each edge until the genuine callback has applied its state: OS
     // background work can consume a packet without dispatching it.
@@ -4092,6 +4092,10 @@ bool WaveEmulationAudioProcessor::setPanelButton(int buttonId, bool pressed) noe
     if (buttonId >= 0 && buttonId < static_cast<int>(panelButtonDown.size()))
         panelButtonDown[static_cast<size_t>(buttonId)].store(
             pressed, std::memory_order_release);
+    if (pressed && diagnosticCode >= 45 && diagnosticCode <= 56)
+        // Repair abandoned Manager ownership on the audio thread, before the
+        // native scanner consumes this contact. Never modify OS RAM here.
+        pendingNumericPanelInput.store(true, std::memory_order_release);
     if (diagnosticCode == 6)
     {
         // The audio-thread transaction owns both edges. Queue on mouse-down;
@@ -5525,6 +5529,9 @@ wave::firmware::Bundle::Report WaveEmulationAudioProcessor::loadFirmware(
         return report;
     firmware = std::move(candidate);
     report = startLoadedFirmware(report, true);
+    if (currentPerformanceSet() != nullptr)
+        pendingFirmwareProgram.store(currentProgram.load(std::memory_order_acquire),
+                                     std::memory_order_release);
     if (rememberForNewInstances)
     {
         const auto created = firmwarePreferenceFile.getParentDirectory().createDirectory();
@@ -6109,14 +6116,24 @@ juce::File WaveEmulationAudioProcessor::getRememberedPanelSkin() const
     return juce::File::isAbsolutePath(path) ? juce::File(path) : juce::File{};
 }
 
-juce::Result WaveEmulationAudioProcessor::rememberPanelSkin(const juce::File& file)
+bool WaveEmulationAudioProcessor::getRememberedCompactPanelSkin() const
+{
+    return firmwarePreferenceFile.getSiblingFile(
+        firmwarePreferenceFile.getFileNameWithoutExtension() + "-panel-skin.txt")
+        .loadFileAsString().trim() == "compact";
+}
+
+juce::Result WaveEmulationAudioProcessor::rememberPanelSkin(const juce::File& file,
+                                                           bool compact)
 {
     const auto preference = firmwarePreferenceFile.getSiblingFile(
         firmwarePreferenceFile.getFileNameWithoutExtension() + "-panel-skin.txt");
     const auto created = preference.getParentDirectory().createDirectory();
     if (created.failed())
         return created;
-    if (!preference.replaceWithText(file == juce::File{} ? juce::String{} : file.getFullPathName()))
+    if (!preference.replaceWithText(compact ? juce::String("compact")
+                                           : file == juce::File{} ? juce::String{}
+                                                                  : file.getFullPathName()))
         return juce::Result::fail("Could not save the panel skin preference.");
     return juce::Result::ok();
 }

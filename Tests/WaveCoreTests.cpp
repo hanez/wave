@@ -1,4 +1,5 @@
 #include "Dsp/Cem3387.h"
+#include "Dsp/Cem3387Transfer.h"
 #include "Dsp/PpgWaveRom.h"
 #include "Dsp/ReferenceComparator.h"
 #include "Dsp/WaldorfAsic.h"
@@ -522,11 +523,12 @@ void testAsicClockMixOverflowAndVcfSaturation()
     const auto knee = wave::dsp::Cem3387::saturateVcfInput(0.7f);
     const auto full = wave::dsp::Cem3387::saturateVcfInput(1.0f);
     require(std::abs(small - 0.1f) < 0.001f
-                && knee > 0.60f && knee < 0.67f
-                && full > knee && full < 0.90f
+                && std::abs(knee - 0.7f) < 0.001f
+                && full > knee && full > 0.995f && full <= 1.0f
+                && wave::dsp::Cem3387::saturateVcfInput(8.0f) < 1.301f
                 && std::abs(wave::dsp::Cem3387::saturateVcfInput(-0.7f) + knee)
                        < 1.0e-6f,
-            "VCF input saturation is not a mild symmetric compression near 70% level");
+            "VCF input headroom compresses nominal levels or fails to limit overload");
 }
 
 void testAsicResampling(double clockRate = 250000.0)
@@ -2030,7 +2032,7 @@ void testAllVoiceFiltersAreCalibrated()
 void testReconstructionCachedTransfer()
 {
     // Independent, uncached signal path: exercise every DAC code, rounding
-    // boundary, clipping, reset, and live age changes against the original math.
+    // boundary, clipping, reset, and live age changes against the exact curve.
     for (const auto rate : { 44100.0, 48000.0, 96000.0, 250000.0 })
     {
         wave::dsp::ReconstructionStage reconstruction;
@@ -2055,7 +2057,8 @@ void testReconstructionCachedTransfer()
                     const auto input = (static_cast<float>(code) + offset) / 127.0f;
                     const auto quantised = std::round(
                         juce::jlimit(-1.0f, 1.0f, input) * 127.0f) / 127.0f;
-                    const auto saturated = std::tanh(quantised * (1.0f + age * 0.16f));
+                    const auto linearity = 26.0f / (1.0f + age * 0.08f);
+                    const auto saturated = linearity * std::tanh(quantised / linearity);
                     state += firstPole * (saturated - state);
                     const auto v3 = state - thirdState;
                     const auto v1 = a1 * secondState + a2 * v3;
@@ -2065,8 +2068,7 @@ void testReconstructionCachedTransfer()
                     const auto dc = v2 + highpass * (dcState - v2);
                     const auto expected = v2 - dc;
                     dcState = dc;
-                    require(std::bit_cast<uint32_t>(reconstruction.process(input))
-                                == std::bit_cast<uint32_t>(expected),
+                    require(std::abs(reconstruction.process(input) - expected) < 0.000002f,
                             "Cached reconstruction differs from the uncached transfer");
                 }
             reconstruction.reset();
@@ -2318,6 +2320,89 @@ void testCemSmallSignalResonanceResponse()
         require(std::abs(ratio / expectedRatio - 1.0) < 0.03,
                 "CEM resonance peak does not match the analogue four-pole response");
     }
+}
+
+void testCemEstimatedLinearityAndHeadroom()
+{
+    // Validate fast evaluation independently against the exact mathematical
+    // curves, including the polynomial boundaries and severe overloads.
+    for (int step = -1600; step <= 1600; ++step)
+    {
+        const auto input = static_cast<float>(step) * 0.01f;
+        const auto transfer = wave::dsp::cem3387::linearisedTransconductor(input);
+        const auto exactUnit = std::tanh(static_cast<double>(input) / 26.0);
+        require(std::abs(transfer.value - 26.0 * exactUnit) < 0.000003
+                    && std::abs(transfer.derivative - (1.0 - exactUnit * exactUnit)) < 0.0000002,
+                "Fast CEM transconductor differs from the reference curve");
+        const auto headroom = wave::dsp::cem3387::limitHeadroom(input, 1.4f);
+        const auto term = 1.0 + std::pow(static_cast<double>(input) / 1.4f, 16.0);
+        const auto exactGain = std::pow(term, -1.0 / 16.0);
+        require(std::abs(headroom.value - input * exactGain) < 0.0000004
+                    && std::abs(headroom.derivative - exactGain / term) < 0.0000004,
+                "Fast CEM headroom differs from the reference curve");
+    }
+    // This constrains our datasheet-guided estimate, not measured Wave THD.
+    // Nominal peak 1 is assumed to represent the specified 5 Vpp input.
+    const auto thd = [](double rate, float peak, float drive) {
+        wave::dsp::Cem3387 filter;
+        filter.prepare(rate, 0.0f);
+        filter.setControls(wave::parameters::cutoffFrequencyForStep(100.0f),
+                           0.0f, drive, 0.0f, 0.0f);
+        std::array<double, 10> sine {}, cosine {};
+        for (int sample = 0; sample < static_cast<int>(rate * 2.0); ++sample)
+        {
+            const auto phase = juce::MathConstants<double>::twoPi * 100.0 * sample / rate;
+            const auto output = filter.process(peak * static_cast<float>(std::sin(phase)),
+                                               1.0f).left;
+            if (sample >= static_cast<int>(rate))
+                for (size_t harmonic = 0; harmonic < sine.size(); ++harmonic)
+                {
+                    const auto angle = phase * static_cast<double>(harmonic + 1);
+                    sine[harmonic] += output * std::sin(angle);
+                    cosine[harmonic] += output * std::cos(angle);
+                }
+        }
+        double harmonicEnergy = 0.0;
+        for (size_t harmonic = 1; harmonic < sine.size(); ++harmonic)
+            harmonicEnergy += sine[harmonic] * sine[harmonic]
+                              + cosine[harmonic] * cosine[harmonic];
+        return std::sqrt(harmonicEnergy / (sine[0] * sine[0] + cosine[0] * cosine[0]));
+    };
+    require(thd(48000.0, 0.1f, 0.0f) < 0.00005,
+            "CEM nominal low-level input is excessively distorted");
+    auto referenceThd = 0.0;
+    for (const auto rate : { 44100.0, 48000.0, 96000.0 })
+    {
+        const auto nominalThd = thd(rate, 1.0f, 0.0f);
+        require(nominalThd > 0.0006 && nominalThd < 0.0016,
+                "CEM nominal distortion no longer follows the datasheet-guided estimate");
+        if (referenceThd == 0.0)
+            referenceThd = nominalThd;
+        require(std::abs(nominalThd / referenceThd - 1.0) < 0.02,
+                "CEM nominal distortion changes substantially with sample rate");
+
+        wave::dsp::Cem3387 filter;
+        filter.prepare(rate, 0.0f);
+        filter.setControls(wave::parameters::cutoffFrequencyForStep(62.0f),
+                           1.0f, 0.0f, 0.0f, 0.0f);
+        double energy = 0.0;
+        auto peak = 0.0f;
+        for (int sample = 0; sample < static_cast<int>(rate * 4.0); ++sample)
+        {
+            // No impulse: the model must start from its internal device noise.
+            const auto output = filter.process(0.0f, 1.0f).left;
+            if (sample >= static_cast<int>(rate * 3.0))
+            {
+                energy += static_cast<double>(output) * output;
+                peak = juce::jmax(peak, std::abs(output));
+            }
+        }
+        const auto rms = std::sqrt(energy / rate);
+        require(rms > 0.6 && rms < 0.75 && peak < 1.01f,
+                "CEM noise-seeded self-oscillation fails to reach bounded estimated headroom");
+    }
+    require(thd(48000.0, 1.0f, 18.0f) > 0.03,
+            "CEM input drive no longer produces overload distortion");
 }
 
 void testIndependentFilterEnvelope()
@@ -3489,6 +3574,12 @@ void testOfficialFirmwareWhenAvailable()
         masterRuntime.runCycles(50000);
         voiceRuntime.runCycles(100000);
     }
+    // OS 1.700 samples two quadrature banks separately from its six
+    // active-low switch banks. An all-high reset formerly produced sixteen
+    // unsolicited negative encoder steps, changing a recalled Sound at boot.
+    for (uint32_t address = 0x5520cu; address < 0x55220u; ++address)
+        require(masterRuntime.localByte(address) == 0,
+                "Idle panel encoders generated a phase transition at startup");
     require(masterRuntime.timerTickCount() > 0,
             "Main-board 6522 timer did not advance after OS hardware setup");
     require(masterRuntime.installedSyntheticInitialisationRecords(),
@@ -4049,6 +4140,7 @@ int main()
         testCemSelfOscillation();
         testCemResonanceAcrossSampleRates();
         testCemSmallSignalResonanceResponse();
+        testCemEstimatedLinearityAndHeadroom();
         testMeasuredFastAmplifierAttackScaling();
         testAmplifierEnvelopeStages();
         testShortVcaReleaseDrainsAnalogueControl();

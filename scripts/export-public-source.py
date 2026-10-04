@@ -11,7 +11,7 @@ ALLOWED_ROOTS = {"Source", "Tests", "Tools", "cmake", "media", "scripts",
 ALLOWED_FILES = {".gitignore", "CMakeLists.txt", "README.md", "LICENSE",
                  "THIRD_PARTY_NOTICES.md", "CONTRIBUTING.md", "PUBLIC_RELEASE.md",
                  "waldorf-wave-firmware-reverse-engineering.md",
-                 "data/ppg-v6-wavetables.bin", "data/README.md",
+                 "data/ppg-v6-wavetables.bin", "data/BlankWave.img", "data/README.md",
                  "media/wave-emulation-screenshot.png"}
 EXCLUDED = {"Source/Dsp/FactoryUpperWavetables.h", "media/WaldorfWaveUI.svg"}
 SOURCE_SUFFIXES = {".cpp", ".h", ".cmake", ".svg", ".sh", ".py", ".md", ".txt", ".yml"}
@@ -39,7 +39,7 @@ def export(destination):
         if relative.parts[0] == 'Installer' and name != 'Installer/build_installer.sh':
             continue
         selected.append(relative)
-    for required in ('LICENSE', 'CMakeLists.txt', 'media/WaldorfWaveUI_NOLOGO.svg', 'data/ppg-v6-wavetables.bin'):
+    for required in ('LICENSE', 'CMakeLists.txt', 'media/WaldorfWaveUI_NOLOGO.svg', 'data/ppg-v6-wavetables.bin', 'data/BlankWave.img'):
         if Path(required) not in selected:
             raise SystemExit(f"Required public source missing: {required}")
     destination.mkdir(parents=True)
