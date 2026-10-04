@@ -11,10 +11,10 @@ A JUCE C++ research instrument that recreates the documented Waldorf Wave signal
 | macOS 13.0 or later, Apple Silicon and Intel — 0.1.13 | [macOS installer DMG](https://github.com/mo0kid/wave/releases/download/v0.1.13/DJW.Wave.Emulation.0.1.13.dmg) | Standalone app, AU, VST3 and AAX |
 
 See the [0.1.13 release page](https://github.com/mo0kid/wave/releases/tag/v0.1.13)
-for release notes. The DMG is the only download and contains the installer,
-Blank Wave.img, and the corresponding source archive with its modified dependencies
-inside **License and Source Information**. The public source is also available
-[in the repository](https://github.com/mo0kid/wave/tree/v0.1.13).
+for release notes. The DMG contains the installer and Blank Wave.img.
+The [corresponding source ZIP](https://github.com/mo0kid/wave/releases/download/v0.1.13/Wave-Emulation-0.1.13-Source.zip)
+is a separate download and includes the modified dependencies used for the build.
+The public source is also available [in the repository](https://github.com/mo0kid/wave/tree/v0.1.13).
 
 Supply your own Wave OS 1.700 firmware and sound disks. The release contains
 no firmware, ROM archives or Wave factory sound SETs.

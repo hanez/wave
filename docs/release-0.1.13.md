@@ -8,7 +8,7 @@
 - Incorporates firmware-derived oscillator, modulation, voice-control and Instrument audio-output routing corrections.
 - Refines the CEM3387 transfer model and nonlinear filter behavior. The filter model remains an approximation; its measurements and validation are documented in docs/cem3387-filter.md.
 
-The release download is one macOS DMG, targeting macOS 13.0 or later. Its installer contains universal Apple Silicon and Intel standalone, AU, VST3 and PACE-wrapped AAX formats. The corresponding source archive and dependency notices are inside the DMG’s License and Source Information folder.
+The binary download is one macOS DMG, targeting macOS 13.0 or later. Its installer contains universal Apple Silicon and Intel standalone, AU, VST3 and PACE-wrapped AAX formats. Dependency notices are inside the DMG’s License and Source Information folder. The corresponding source ZIP is available as a separate release download.
 
 Supply your own supported Wave OS 1.700 firmware. The bundled blank disk provides an initialized working bank; other sound libraries and wavetables can be loaded through the existing Disk controls.
 
