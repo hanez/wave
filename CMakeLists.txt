@@ -193,6 +193,8 @@ set(WAVE_CORE_SOURCES
     Source/WaveParameters.h)
 
 add_library(WaveCore STATIC ${WAVE_CORE_SOURCES})
+# Both libraries contain thread-local state and are linked into shared plugins.
+set_target_properties(WaveCore WaveM68k PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(WaveCore PUBLIC Source)
 target_link_libraries(WaveCore
     PUBLIC

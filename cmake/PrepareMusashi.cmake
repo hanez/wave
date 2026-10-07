@@ -14,6 +14,16 @@ function(wave_prepare_musashi source destination)
         default_pc_changed_callback_data default_set_fc_callback_data)
     foreach(filename m68kcpu.c m68kcpu.h)
         file(READ "${source}/${filename}" contents)
+        if(filename STREQUAL "m68kcpu.c")
+            # Upstream repeats this tentative definition in an indented block.
+            # Thread-local definitions cannot be repeated with GCC 16; retain
+            # the first definition and make the later declarations extern.
+            foreach(trap_type sigjmp_buf jmp_buf)
+                string(REPLACE "\t${trap_type} m68ki_aerr_trap;"
+                               "\textern ${trap_type} m68ki_aerr_trap;"
+                       contents "${contents}")
+            endforeach()
+        endif()
         foreach(symbol IN LISTS execution_state)
             # Capture the whole prefix, which always participates in the match.
             # CMake < 4.1 rejects a backreference to an unmatched optional group.
